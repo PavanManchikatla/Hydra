@@ -1,0 +1,16 @@
+[package]
+name = "hydra-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hydra coordinator commit stream + control WAL: append/fsync/checksum, partial-tail discard, replay (implements WAL-FORMAT.md exactly)."
+
+[dependencies]
+hydra-proto = { path = "../hydra-proto" }
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+flatbuffers.workspace = true

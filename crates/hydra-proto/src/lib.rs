@@ -14,8 +14,10 @@ pub mod generated;
 pub mod limits;
 pub mod framing;
 pub mod pos;
+pub mod validate;
 
 pub use pos::{InputPos, OutputPos};
+pub use validate::validate_generation_commit_i19;
 
 /// Generated wire schema (`hydra.proto`): `Frame`, `Fence`, `Body` union, enums, error codes.
 pub use generated::hydra_proto_generated::hydra::proto;
