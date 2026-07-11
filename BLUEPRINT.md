@@ -1,5 +1,16 @@
-# HYDRA — Master Implementation Blueprint (v0.10.1)
+# HYDRA — Master Implementation Blueprint (v0.10.2)
 ## For an autonomous coding agent. Read this file first; it is the root of the package.
+
+> **Changelog v0.10.1 → v0.10.2** (design-authority review after M−1 passed): (1) §1.3 —
+> boundary activation payload precision is now an explicit per-session config `{f32|f16|int8_blockq}`
+> with production default `f16`; **golden-token / exact-token-equality tests must run over `f32`
+> boundaries, never `f16`**. (2) §1.2 — the v1 supported model family is pinned to the arch families
+> whose graph builders carry the M−1 layer-window patch (`llama` + `qwen2`); the patch must be
+> re-validated by the spike sweep on every llama.cpp submodule bump, as part of the M2 golden-token
+> gate. (3) M−1 DoD text rewritten to state the ratified reading (1e‑3 tests the split mechanism at
+> `f32`; payload precisions are characterized separately under item (f)). Rationale: the M−1 FP16
+> finding (0.04 logit drift, stable argmax/top‑10 — within spec I8) changed a package default, so it
+> paused for ratification per the standing process rule before this amendment.
 
 **What Hydra is:** an open-source, trusted-LAN inference runtime that runs a single large open-weight LLM (70B-class dense, later MoE) by pipeline-sharding it across 2–3 heterogeneous desktop-class machines (CUDA desktop, Apple Silicon Macs, CPU nodes), with crash-safe sessions, exactly-once token semantics, and recoverable generation streams. Phones are **not** workers in v1.
 
@@ -21,8 +32,8 @@
 ## 1. Fixed decisions (do not re-decide)
 
 1. **Parallelism:** pipeline/layer sharding across machines. Tensor parallelism only *inside* a machine (GPU+CPU co-execution) — never across the LAN. Contiguous layer ranges per stage. Rationale: report Part 2.1.
-2. **Compute engine:** `llama.cpp`/`ggml` (MIT), vendored as a git submodule, used as a library. Use `ggml-backend` for the device abstraction (CUDA, Metal, CPU in v1; Vulkan later). Study **prima.cpp** (MIT, arXiv:2504.08791) for its pipelined-ring execution and Halda placement solver; port ideas, and code where license-compatible and clean.
-3. **Control plane & networking:** new code, in **Rust** (tokio). Transport behind a trait with two impls: **TCP+mTLS** (default, build first) and **QUIC via quinn** (second); selection per link by measured p95 frame latency. Framing: **FlatBuffers**. Activation payloads: FP16 default, int8 (blockwise scales) as an option, chosen per session.
+2. **Compute engine:** `llama.cpp`/`ggml` (MIT), vendored as a git submodule, used as a library. Use `ggml-backend` for the device abstraction (CUDA, Metal, CPU in v1; Vulkan later). Study **prima.cpp** (MIT, arXiv:2504.08791) for its pipelined-ring execution and Halda placement solver; port ideas, and code where license-compatible and clean. **Supported model family (v1, amended v0.10.2):** the dense arch families whose per-arch graph builders carry the M−1 layer-window patch — currently **`llama`** (`src/models/llama.cpp`) and **`qwen2`** (`src/models/qwen2.cpp`). Adding a family means porting the ~47-line window patch to that arch's builder and re-running the spike sweep. **The patch is submodule-version-coupled: every `vendor/llama.cpp` bump MUST re-run the M−1 spike sweep (`spike/shard_split`, all split×prompt combinations) as part of the M2 golden-token gate before the bump is accepted.**
+3. **Control plane & networking:** new code, in **Rust** (tokio). Transport behind a trait with two impls: **TCP+mTLS** (default, build first) and **QUIC via quinn** (second); selection per link by measured p95 frame latency. Framing: **FlatBuffers**. **Boundary activation payload precision (amended v0.10.2)** is a per-session config `{f32 | f16 | int8_blockq}`; **production default `f16`** (M−1 measured ~0.04 logit drift with stable argmax/top‑10 — within spec I8 semantic continuity). **`f32` is mandatory for the M2 exact-token-equality test tier: golden-token tests MUST NOT run over `f16` (or `int8`) boundaries.** `int8_blockq` MUST NOT be used anywhere until its boundary drift is characterized (M2 prep; see `spike/FINDINGS.md`).
 4. **FFI boundary:** Rust worker embeds the C/C++ engine through a narrow `hydra-engine-sys` FFI: `load_shard`, `apply_tokens(range, activations_in) -> activations_out`, `logits()`, `kv_truncate(pos)`, `kv_snapshot/restore` hooks. Keep ALL protocol logic in Rust; the engine only computes.
 5. **Topology (v1):** fixed coordinator (best machine, user-designated), 2–3 stage workers, one active session per model instance (spec §1.4 Option A). Client API: OpenAI-compatible HTTP + SSE served by the coordinator.
 6. **Durability:** coordinator-local append-only **commit stream** (spec §2.6a: `INITIAL_COMMIT` / `SEGMENT_COMMIT` / `GENERATION_COMMIT` records, BLAKE3-checksummed, partial-tail-discard on open) + control WAL (may share one file with typed records). Durability modes D0/D1 per spec §7; D2 out of v1.
@@ -70,11 +81,15 @@ first layer of a range and extract them after the last; (c) KV allocated only fo
 layers; (d) truncate KV at an input position and replay; (e) run the final range to logits
 WITHOUT sampling and retain them; (f) round-trip FP16 (and int8+scales) boundary tensors
 between backends; (g) tokenizer/RoPE/config metadata identical across both shard loads.
-**DoD:** prompt applied through shard A → shard B produces final logits matching unsplit
-llama.cpp on the same (CPU) backend within 1e-3 max-abs; KV truncate+replay reproduces
-them; a one-page findings note records any FFI-boundary changes needed. A failed spike may
-reshape `hydra-engine-sys`; it must NOT change the protocol. Only after this note exists
-may M2 be scheduled.
+**DoD (ratified reading, v0.10.2):** the 1e‑3 max-abs bar tests the **split mechanism** on a
+single backend with the boundary passed at that backend's native precision (**`f32`**): a prompt
+applied through shard A → shard B must reproduce unsplit llama.cpp's final logits within 1e‑3
+(achieved: **bit-exact, 0.0**, all split×prompt combinations), and KV truncate+replay must
+reproduce them (achieved: exact). **Payload precisions (`f16`, `int8`) are characterized
+*separately* under feasibility item (f), not gated to 1e‑3** — cross-precision drift is documented
+semantic-continuity behavior (spec I8). A one-page findings note records any FFI-boundary changes
+needed (`spike/FINDINGS.md`). A failed spike may reshape `hydra-engine-sys`; it must NOT change the
+protocol. Only after this note exists may M2 be scheduled. **Status: PASS (ratified).**
 
 ### M0 — Skeleton + protocol types (≈ agent-week 1)
 Build: workspace; `hydra-proto` by **compiling the provided `hydra-proto.fbs`** (flatc-generated Rust is authoritative — wrap positions in `InputPos`/`OutputPos` newtypes at the API layer so I13 violations don't compile; enforce the schema's hard limits pre-parse); `hydra-wal` implementing **`WAL-FORMAT.md` exactly**, including its §5 torn-write test contract; `hydra-transport` TCP+mTLS with cluster-CA pairing using the schema's framing header.
