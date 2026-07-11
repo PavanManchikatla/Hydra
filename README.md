@@ -15,12 +15,17 @@ passes. **Do not proceed past a milestone until its DoD passes.**
 
 | Milestone | Description | Status |
 |---|---|---|
-| **M−1** | Engine feasibility spike (shard-style llama.cpp execution) | 🚧 in progress |
-| M0 | Skeleton + protocol types (`hydra-proto`, `hydra-wal`, `hydra-transport`) | ⏳ blocked on M−1 note |
+| **M−1** | Engine feasibility spike (shard-style llama.cpp execution) | ✅ **PASS** — [`spike/FINDINGS.md`](spike/FINDINGS.md) |
+| M0 | Skeleton + protocol types (`hydra-proto`, `hydra-wal`, `hydra-transport`) | ⏳ next |
 | M1 | State machines + deterministic simulation (correctness heart) | ⏳ |
-| M2 | Two-node real pipeline (first tokens) | ⏳ (schedulable only after M−1 note) |
+| M2 | Two-node real pipeline (first tokens) | ⏳ (now schedulable — M−1 note exists) |
 | M3 | Heterogeneity, scheduler, hardening | ⏳ |
 | M4 | Product hardening | ⏳ |
+
+**M−1 result:** shard A → shard B reproduces unsplit llama.cpp logits **bit-exactly** on CPU
+(F32 boundary, 0.0 max-abs across k ∈ {1,4,12,18,23} × 3 prompts); KV truncate+replay exact;
+FP16 boundary payload costs ~0.04 logit max-abs with stable argmax (spec I8). Engine delta is a
+47-line per-arch layer-window patch (`spike/llama-cpp-layer-window.patch`).
 
 ## Layout (BLUEPRINT §2)
 
