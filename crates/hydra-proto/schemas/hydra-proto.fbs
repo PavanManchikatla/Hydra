@@ -1,0 +1,225 @@
+// hydra-proto.fbs — AUTHORITATIVE wire schema for Hydra v0.10.1.
+// Generated Rust code from this file is the source of truth; handwritten structs
+// that shadow these tables are forbidden. Protocol semantics: hydra-session-protocol.md.
+//
+// TRANSPORT FRAMING (outside FlatBuffers, little-endian):
+//   u32 magic = 0x48594652 ("HYFR") | u16 wire_version = 1 | u16 flags
+//   u32 payload_len (<= MAX_FRAME_BYTES) | payload: Frame flatbuffer
+//   [32]u8 blake3 of (header || payload)
+// A receiver validates magic, version (major must match; unknown minor -> accept),
+// payload_len against MAX_FRAME_BYTES, and the BLAKE3 tag BEFORE parsing the
+// flatbuffer, and validates every declared tensor size against caps BEFORE
+// allocating buffers.
+//
+// HARD LIMITS (normative; reject, never truncate):
+//   MAX_FRAME_BYTES        = 64 MiB          // prefill chunks dominate
+//   MAX_TENSOR_BYTES       = 48 MiB
+//   MAX_POSITIONS_PER_FRAME= 1024
+//   MAX_SNAPSHOT_BYTES     = 1 MiB           // sampler snapshots are small by design
+//   MAX_STRING_BYTES       = 4 KiB
+//
+// POSITION DISCIPLINE (spec I13): fields named *_input_pos hold input/KV positions;
+// fields named *_output_pos hold sampled-output positions. They are never
+// interchangeable; generated code wraps them in InputPos/OutputPos newtypes.
+
+namespace hydra.proto;
+
+// ---------- enums ----------
+
+enum DType : uint8 { F32 = 0, F16 = 1, BF16 = 2, I8_BLOCKQ = 3 }
+
+enum SamplePolicy : uint8 { SAMPLE = 0, NO_SAMPLE = 1 }
+
+enum ActivationKind : uint8 { INITIAL = 0, RECOVERY = 1 }
+
+enum TokenOrigin : uint8 { PROMPT = 0, TOOL_RESULT = 1, GENERATED = 2 }
+
+enum ErrCode : uint16 {
+  OK = 0,
+  ERR_FENCED = 1,              // detail: FenceState
+  ERR_TRANSITION = 2,          // detail: FenceState
+  ERR_RECOVERY_COMPLETED = 3,  // detail: FenceState (carries completion_id)
+  ERR_GAP = 4,                 // detail: applied_input_pos
+  ERR_SESSION_TERMINATED = 5,
+  ERR_LIMIT_EXCEEDED = 6,      // frame/tensor/positions cap
+  ERR_BAD_CHECKSUM = 7,
+  ERR_UNSUPPORTED_VERSION = 8,
+  ERR_CHECKPOINT_MISMATCH = 9, // fatal drift (spec §2.6b)
+  ERR_INTERNAL = 100,
+}
+
+// ---------- common ----------
+
+// Fence tuple (spec §1.1). REQUIRED on every message; a zero/absent field is a
+// protocol error, not a default.
+table Fence {
+  cluster_id: [uint8] (required);        // 16 bytes
+  manifest_hash: [uint8] (required);     // 32 bytes, BLAKE3
+  model_instance_id: [uint8] (required); // exactly 16 bytes; RESERVED — constant in v1,
+                                         //   validated but never branched on (spec §1.4 Option B hook)
+  placement_version: uint32;
+  session_id: [uint8] (required);        // 16 bytes (UUID)
+  session_epoch: uint32;
+  recovery_id: uint32;
+  activation_attempt_id: uint32;         // on activation control msgs; 0 elsewhere
+  logical_context_id: uint32;
+  stage_context_generation: uint32;      // shard-addressed frames; 0 otherwise
+  stage_generation: uint64;
+  frame_attempt_id: uint32;              // retransmission counter (telemetry)
+  branch_id: uint32;                     // RESERVED, must be 0 in v1
+}
+
+table Tensor {
+  dtype: DType;
+  dims: [uint32] (required);             // row-major; product bounded by caps
+  data: [uint8] (required);
+  block_scales: [uint8];                 // present iff dtype == I8_BLOCKQ
+}
+
+table FenceState {                        // returned inside errors
+  current_epoch: uint32;
+  current_placement: uint32;
+  current_recovery_id: uint32;
+  highest_attempt: uint32;
+  activation_state: string;              // stage-local state name
+  completion_id: uint64;                 // for ERR_RECOVERY_COMPLETED
+  applied_input_pos: int64;              // for ERR_GAP
+}
+
+// ---------- data plane ----------
+
+table ApplyToken {                        // C -> S1 (spec §3); REBUILD_APPLY is this
+  input_pos: int64;                       //   with policy = NO_SAMPLE on a rebuilding shard
+  token_id: uint32;
+  policy: SamplePolicy;
+  commit_up_to_output_pos: int64;         // piggybacked commit watermark
+}
+
+table Fwd {                               // Si -> Si+1
+  first_input_pos: int64;
+  n_positions: uint16;                    // <= MAX_POSITIONS_PER_FRAME
+  policy: SamplePolicy;
+  commit_up_to_output_pos: int64;
+  activations: Tensor (required);
+}
+
+table Sampled {                           // S_P -> C
+  output_pos: int64;
+  token_id: uint32;
+  topk_ids: [uint32];
+  topk_logprobs: [float32];
+  post_sample_snapshot: [uint8] (required); // <= MAX_SNAPSHOT_BYTES (spec §2.6a)
+  sampler_state_digest: [uint8] (required); // 32 bytes
+}
+
+table SampleNext {                        // C -> S_P; idempotent (I14)
+  output_pos: int64;
+  sampling_config_hash: [uint8] (required);
+  expected_sampler_checkpoint_id: uint64;
+}
+
+table AppliedAck { cumulative_input_pos: int64; output_checksum: [uint8]; }
+
+table BoundaryCopy {                      // Si -> durability target
+  boundary_id: uint32;                    // edge index i (between Si and Si+1)
+  first_input_pos: int64;
+  n_positions: uint16;
+  chunk_id: uint32;
+  activations: Tensor (required);
+}
+table DurabilityAck { boundary_id: uint32; durable_through_input_pos: int64;
+                      storage_generation: uint64; }
+table CommitAck  { committed_through_output_pos: int64; }
+table CommitSync { commit_up_to_output_pos: int64; }
+
+// ---------- control plane: recovery ----------
+
+table BeginRecovery { base_epoch: uint32; target_epoch: uint32;
+                      truncate_to_input_pos: int64; }
+table RecoveryAck   { applied_input_pos: int64; }
+table ResetRecoveryAttempt { target_epoch: uint32; old_recovery_id: uint32;
+                             new_recovery_id: uint32; truncate_to_input_pos: int64;
+                             committed_sampler_checkpoint_id: uint64; }
+table ResetAck { applied_input_pos: int64; }
+
+// ---------- control plane: placement & shards ----------
+
+table PreparePlacement { placement_version: uint32; manifest: [uint8] (required); }
+table PlacementReady   { placement_version: uint32; }
+table InstallPlacement { placement_version: uint32; }
+table PlacementInstalled { placement_version: uint32; }
+
+table AttachContextShard { layer_first: uint32; layer_last: uint32; }
+table ContextShardAttached { hosted_layer_first: uint32; hosted_layer_last: uint32;
+                             applied_input_pos: int64; }
+table ContextReady { applied_input_pos: int64; next_output_pos: int64;
+                     next_logits_ready: bool; logits_digest: [uint8]; }
+table CatchUpContext { goal_input_pos: int64; }
+table CatchUpReady   { applied_input_pos: int64; }
+table DestroyContext {}
+table DetachShard {}
+
+// ---------- control plane: sampler checkpoints ----------
+
+table PrepareSegmentCheckpoint { base_checkpoint_id: uint64; segment_id: uint32;
+                                 segment_token_ids: [uint32] (required); }
+table SegmentCheckpointReady { resulting_checkpoint_id: uint64;
+                               candidate_snapshot: [uint8] (required);
+                               state_checksum: [uint8] (required); }
+table InstallSamplerCheckpoint { checkpoint_id: uint64; snapshot: [uint8] (required); }
+table SamplerCheckpointInstalled { checkpoint_id: uint64;
+                                   resulting_state_digest: [uint8] (required);
+                                   sampled_output_pos: int64; }
+
+// ---------- control plane: activation transaction (spec §6.6) ----------
+
+table ActivationTuple {
+  kind: ActivationKind;
+  epoch: uint32; recovery_id: uint32; activation_attempt_id: uint32;
+  placement_version: uint32; logical_context_id: uint32;
+  shard_generations: [uint64] (required);   // indexed by stage rank
+  recovery_goal_input_pos: int64;
+  expected_applied_input_pos: [int64] (required);
+  expected_next_output_pos: int64;
+  sampler_checkpoint_id: uint64;
+  sampler_state_checksum: [uint8] (required);
+}
+table CommitActivation   { tuple: ActivationTuple (required); }
+table ActivationCommitted{ tuple: ActivationTuple (required); }
+table FinalizeActivation { completion_id: uint64; tuple: ActivationTuple (required);
+                           complete_record_hash: [uint8] (required); }
+table ActivationFinalized{ completion_id: uint64; }
+table ActivationCommitAbort { aborted_attempt_id: uint32; next_attempt_id: uint32; }
+
+// ---------- misc control ----------
+
+table Rejoin { capabilities: [string]; advisory_applied_input_pos: int64; }
+table Cancel {} table Cleaned {}
+table Heartbeat { queue_depth: uint16; mem_headroom_mib: uint32;
+                  soc_temp_dc: int16; throttled: bool; on_battery: bool; }
+table Error { code: ErrCode; state: FenceState; detail: string; }
+
+// ---------- envelope ----------
+
+union Body {
+  ApplyToken, Fwd, Sampled, SampleNext, AppliedAck, BoundaryCopy, DurabilityAck,
+  CommitAck, CommitSync,
+  BeginRecovery, RecoveryAck, ResetRecoveryAttempt, ResetAck,
+  PreparePlacement, PlacementReady, InstallPlacement, PlacementInstalled,
+  AttachContextShard, ContextShardAttached, ContextReady, CatchUpContext,
+  CatchUpReady, DestroyContext, DetachShard,
+  PrepareSegmentCheckpoint, SegmentCheckpointReady, InstallSamplerCheckpoint,
+  SamplerCheckpointInstalled,
+  CommitActivation, ActivationCommitted, FinalizeActivation, ActivationFinalized,
+  ActivationCommitAbort,
+  Rejoin, Cancel, Cleaned, Heartbeat, Error
+}
+
+table Frame { fence: Fence (required); body: Body (required); }
+
+root_type Frame;
+
+// EVOLUTION RULES: never reuse or renumber union/enum values; new fields are
+// appended and optional; a receiver ignores unknown optional fields; an unknown
+// union variant within the same major wire_version yields ErrCode.ERR_UNSUPPORTED_VERSION
+// as a structured reply, never a silent drop.

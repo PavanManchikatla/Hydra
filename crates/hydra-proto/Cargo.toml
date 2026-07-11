@@ -1,0 +1,12 @@
+[package]
+name = "hydra-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Authoritative Hydra wire + WAL FlatBuffers schemas (generated) with typed wrappers, hard limits, and framing."
+
+[dependencies]
+flatbuffers.workspace = true
+blake3.workspace = true
+thiserror.workspace = true

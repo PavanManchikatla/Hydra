@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hydra-proto",
+]
+
+[workspace.package]
+version = "0.10.1"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+flatbuffers = "25"
+blake3 = "1"
+thiserror = "2"
