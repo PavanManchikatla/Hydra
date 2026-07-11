@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/hydra-proto",
     "crates/hydra-wal",
+    "crates/hydra-transport",
 ]
 
 [workspace.package]

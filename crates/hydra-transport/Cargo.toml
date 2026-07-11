@@ -1,0 +1,19 @@
+[package]
+name = "hydra-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hydra transport: Transport trait + TCP+mTLS impl with cluster-CA pairing; framing per hydra-proto (validated pre-parse)."
+
+[dependencies]
+hydra-proto = { path = "../hydra-proto" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
