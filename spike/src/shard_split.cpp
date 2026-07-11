@@ -79,18 +79,20 @@ static DiffStat compare(const std::vector<float>& a, const std::vector<float>& b
 
 int main(int argc, char** argv) {
     std::string model_path, prompt = "The capital of France is";
-    int k = -1; // split layer (default n_layer/2)
+    int k = -1;    // split layer (default n_layer/2)
+    int ngl = 0;   // n_gpu_layers: 0 = CPU (DoD backend); 99 = all layers on GPU (Metal/CUDA)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i+1<argc) model_path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i+1<argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-k") && i+1<argc) k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-ngl") && i+1<argc) ngl = atoi(argv[++i]);
     }
-    if (model_path.empty()) die("usage: shard_split -m model.gguf [-p prompt] [-k split_layer]");
+    if (model_path.empty()) die("usage: shard_split -m model.gguf [-p prompt] [-k split_layer] [-ngl n_gpu_layers]");
 
     ggml_backend_load_all();
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;                       // CPU backend — the DoD comparison backend
+    mp.n_gpu_layers = ngl;   // 0 = CPU (DoD backend); the split runs entirely on the chosen backend
     llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) die("failed to load model");
 

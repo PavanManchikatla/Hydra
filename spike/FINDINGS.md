@@ -27,6 +27,24 @@ Checklist (BLUEPRINT §3): (a) run an arbitrary contiguous layer range — ✅ (
 (f) FP16 boundary round-trip — ✅ (characterized); (g) tokenizer/RoPE/config identical across
 shard loads — ✅ (single GGUF, shared model handle).
 
+## Backend sweep — Metal (v0.10.2 close-out)
+
+Re-ran the full 15-combination sweep with all layers offloaded to the Apple M2 GPU (`-ngl 99`,
+confirmed `layer N assigned to device MTL0`). On a single backend the split reuses the same
+kernels as the unsplit run, so — as on CPU — the F32 split is **bit-exact vs unsplit on that
+same backend**:
+
+| Metric (Metal, 15 combos) | Result |
+|---|---|
+| F32 split vs Metal-unsplit logits | **0.0 max-abs (bit-exact)**, argmax + top-10 identical, all 15 |
+| KV truncate+replay | exact |
+| FP16 boundary payload cost | 0.003–0.014 max-abs on logits (lower than CPU's 0.03–0.06), argmax stable, top-10 = 10/10 |
+
+Satisfies the ruling: split-vs-unsplit **on Metal** agree within 1e‑3 (in fact 0.0). Note this is
+*same-backend* agreement; **Metal-vs-CPU** token drift (different kernels) is a separate,
+expected I8 effect and is deferred to the M2(b) golden-token tests — which, per the v0.10.2
+amendment, run over **f32** boundaries only.
+
 ## Approach — minimal engine patch (not reimplementation)
 
 The pinned tree already exposes the two hooks needed, so the patch reuses llama.cpp's exact
@@ -68,6 +86,22 @@ reproducibility is required (e.g. exact-equivalence tests, D1 recovery onto the 
 backend), pass the boundary at **F32** — it is bit-exact here. This is a payload-precision
 default, **not** a protocol change (the protocol already parameterizes payload dtype).
 
+## ⚠ OWED — int8 + blockwise-scales boundary characterization (item f is half-done)
+Item (f) covers FP16 **and** int8+scales; only FP16 is done. **TODO (scheduled: M2 prep):**
+characterize an `int8_blockq` boundary payload — per-block int8 quantization of the boundary
+residual, matching the wire schema's `DType.I8_BLOCKQ` + `Tensor.block_scales`. This is a real
+test, not a formality: the residual carries a ~1560 massive-activation outlier (token0/dim62),
+so block scale selection around outliers will dominate the error — measure logit max-abs and
+argmax/top-k stability across the same 15-combination sweep, both backends.
+**Standing constraint (v0.10.2 §1.3): `int8_blockq` boundaries MUST NOT be used anywhere until
+this characterization exists.**
+
+## Upstream
+Drafted an upstream request for a generic (arch-agnostic) layer-window / partial-execution hook
+so the per-arch patch can eventually be retired: [`upstream-llama-issue.md`](upstream-llama-issue.md).
+Until then the patch is per-arch (`llama`, `qwen2`) and submodule-version-coupled — re-run this
+sweep on every `vendor/llama.cpp` bump (BLUEPRINT §1.2, M2 golden-token gate).
+
 ## Deferred (not required for the DoD; scoped to M2+)
 - **Range-only weight loading.** The spike loads the whole GGUF per shard and runs only its
   range. A real worker loads only its shard's tensors — trivial via GGUF tensor subsetting in
@@ -75,8 +109,7 @@ default, **not** a protocol change (the protocol already parameterizes payload d
 - **Range-only KV allocation** (item c, memory). llama.cpp allocates KV for all `n_layer`;
   only the shard's range is written. Correct but over-allocated; scope a KV-init patch to
   allocate `k_l/v_l` for `[il_start,il_end)` only (prima.cpp does this).
-- **int8+scales boundary payload** (item f) — expected worse than FP16; measure in M2.
-- **Cross-backend boundary (CPU→Metal)** — I8 semantic continuity; belongs in M2(b) golden-token tests.
+- **Cross-backend boundary (CPU↔Metal)** — I8 semantic continuity; belongs in M2(b) golden-token tests (f32 boundaries only).
 
 ## Reproduce
 ```
