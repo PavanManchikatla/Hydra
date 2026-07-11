@@ -1,0 +1,109 @@
+// wal-records.fbs — AUTHORITATIVE payload schemas for WAL-FORMAT.md record types.
+// One table per registry id; the u16 record_type in the on-disk record header selects
+// the table (no union — the header is the discriminator so a corrupt payload cannot
+// mislead type dispatch). Reuses hydra-proto.fbs types.
+// Every record embeds enough of the fence context to be self-describing on replay.
+
+include "hydra-proto.fbs";
+namespace hydra.wal;
+
+table WalFence {                          // subset of hydra.proto.Fence for durable records
+  cluster_id: [uint8] (required);
+  session_id: [uint8] (required);
+  model_instance_id: [uint8] (required);
+  manifest_hash: [uint8] (required);
+  session_epoch: uint32;
+  recovery_id: uint32;
+  activation_attempt_id: uint32;
+}
+
+table SamplerCheckpointRec {              // spec §2.6b snapshot model, in full
+  checkpoint_id: uint64;
+  rng_key: [uint8] (required);
+  rng_counter: uint64;
+  generated_through_output_pos: int64;
+  serialized_grammar_state: [uint8] (required);   // may be empty (no grammar)
+  serialized_penalty_state: [uint8] (required);
+  sampled_output_pos: int64;
+  sampling_config_hash: [uint8] (required);
+  state_checksum: [uint8] (required);             // BLAKE3 over the fields above
+}
+
+table TokenEntry {
+  absolute_position: int64;
+  token_id: uint32;
+  origin: hydra.proto.TokenOrigin;
+  message_segment_id: uint32;
+  rng_checkpoint_counter: uint64;         // GENERATED only; 0 otherwise
+}
+
+// ---- commit stream ----
+
+table InitialCommit {                     // id 1
+  fence: WalFence (required);
+  tokenizer_hash: [uint8] (required);
+  chat_template_hash: [uint8] (required);
+  rendered_prompt_bytes_hash: [uint8] (required);
+  prompt_tokens: [TokenEntry] (required);
+  prompt_length: int64;
+  initial_checkpoint: SamplerCheckpointRec (required);
+  durability_mode: uint8;                 // 0=D0, 1=D1, 2=D2
+}
+
+table SegmentCommit {                     // id 2 (tool results / appended turns)
+  fence: WalFence (required);
+  segment_id: uint32;
+  tokens: [TokenEntry] (required);        // origin PROMPT|TOOL_RESULT only
+  resulting_checkpoint: SamplerCheckpointRec (required);  // the committed CANDIDATE (I24)
+}
+
+table GenerationCommit {                  // id 3 — spec §2.6a; I19 validated on write+read:
+  fence: WalFence (required);             //   checkpoint.generated_through == last_output_pos
+  commit_id: uint64;                      //   checkpoint.sampled_pos       == last_output_pos
+  previous_commit_id: uint64;
+  first_output_pos: int64;
+  last_output_pos: int64;
+  tokens: [TokenEntry] (required);        // origin GENERATED only
+  checkpoint: SamplerCheckpointRec (required);
+  entries_checksum: [uint8] (required);
+}
+
+table InputChunkCommit {                  // id 4 — the durable event advancing
+  fence: WalFence (required);             //   prefill_stable_pos (spec §2.4)
+  segment_id: uint32;
+  chunk_id: uint32;
+  first_input_pos: int64;
+  last_input_pos: int64;
+  boundary_durable_through: [int64] (required);  // per boundary edge, mode-required set
+}
+
+// ---- control WAL ----
+
+table BeginRecoveryRec { fence: WalFence (required); base_epoch: uint32;
+                         target_epoch: uint32; truncate_to_input_pos: int64; }   // id 10
+table ResetAttemptRec  { fence: WalFence (required); old_recovery_id: uint32;
+                         new_recovery_id: uint32; truncate_to_input_pos: int64;
+                         committed_checkpoint_id: uint64; }                       // id 11
+table ActivationIntentRec { fence: WalFence (required);
+                            tuple: hydra.proto.ActivationTuple (required); }      // id 12
+table ActivationCompleteRec { fence: WalFence (required); completion_id: uint64;
+                              tuple_hash: [uint8] (required); }                   // id 13
+table ActivationAbortRec { fence: WalFence (required); aborted_attempt_id: uint32;
+                           next_attempt_id: uint32; }                             // id 14
+table ActivationUnservableRec { fence: WalFence (required); completion_id: uint64;
+                                failed_stage_ranks: [uint16] (required);
+                                predecessor_completion_id: uint64; }              // id 15
+table SessionTerminateRec { fence: WalFence (required); reason: string; }         // id 16
+table CancelCutoffRec { fence: WalFence (required);
+                        cancel_cutoff_output_pos: int64;
+                        cutoff_event_seq: uint64; }                               // id 17
+table PlacementInstallRec { fence: WalFence (required); placement_version: uint32;
+                            placement_manifest_hash: [uint8] (required); }        // id 18
+
+// ---- aux ----
+
+table EventLogSegment { fence: WalFence (required); first_event_seq: uint64;
+                        events: [uint8] (required); }  // id 30; rebuildable from ledger (I3)
+
+// EVOLUTION: registry ids are never reused or renumbered (WAL-FORMAT.md §2);
+// new fields append-only and optional; readers ignore unknown optional fields.

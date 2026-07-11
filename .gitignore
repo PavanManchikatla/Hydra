@@ -1,0 +1,24 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# llama.cpp build artifacts (source is a pinned submodule)
+/vendor/llama.cpp/build
+
+# Spike build artifacts
+/spike/build
+
+# Models (downloaded, not committed)
+/models
+*.gguf
+
+# TLA+ / TLC
+*.toolbox
+states/
+*.st
+MC.out
+
+# OS / editor
+.DS_Store
+*.swp
