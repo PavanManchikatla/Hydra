@@ -54,11 +54,25 @@ Environment: TLC 2.19 / OpenJDK 21, 1 core, sandbox with ~2-minute process ceili
 | Baseline safety (fixed model, incl. `AbortFinality`; post fairness-parameterization) | `BaselineSafety.cfg` | ~1.9M and ~1.4M states in two time-bounded runs, depth ≥ 30, **zero violations** (checkpoint written; run to fixpoint in CI). |
 | Mutation 2 | `Mut2Reset.cfg` | **Fires as designed**: `CaseBPure` violated in an 8-state trace (rebuild past truncate_to → label-only reset → Case B replay). |
 | Mutation 4 | `Mut4AbortFinality.cfg` | **Fires as designed**: `Inv` (AbortFinality/AbortSafety) violated in a 14-state trace reproducing TLC-1. |
-| Baseline liveness, Mutations 1 & 3 | `BaselineLiveness.cfg`, `Mut1Unservable.cfg`, `Mut3AttemptFence.cfg` | **NOT YET RUN here** (process ceiling). Expected: baseline liveness green under fairness; Mut1 violates `PostDecisionLoss` (lasso: LOST participant after durable decision, no supersession enabled); Mut3 violates `ServiceSafety`/`TupleSafety` via a stale INITIAL attempt. CI must run these before the transition core is called certified. |
+| Baseline liveness, Mutations 1 & 3 | `BaselineLiveness.cfg`, `Mut1Unservable.cfg`, `Mut3AttemptFence.cfg` | Superseded by the 2026-07-11 gate run below (no longer process-ceiling-limited). |
+
+### Gate run — 2026-07-11 (TLC 2.19 / OpenJDK 26, Apple M2, no process ceiling)
+Run via `verification/run-tlc.sh`; raw output under `verification/results/`. `-workers auto`,
+`-deadlock`. Config bounds unchanged (`|msgs| ≤ 20`, MaxEpoch 1 / MaxRId 1 / MaxAttempt 2 /
+MaxPos 1 / MaxCrashes 2). All claims remain bounded-model claims.
+
+| Run | Config | Result |
+|---|---|---|
+| Mutation 1 | `Mut1Unservable.cfg` | **Fires as designed**: `PostDecisionLoss` temporal property violated — 18-state counter-example ending in stuttering (a LOST participant after the durable decision, with `EnableUnservable=FALSE` no supersession is enabled, so `Progress` is never restored). 105,095 distinct states; TLC exit 13. |
+| Baseline safety | `BaselineSafety.cfg` | **In progress toward fixpoint** — ≥ 24.4M distinct states (90M generated), depth ≥ 133, **zero violations**. (Large bounded space; still draining the queue. Prior sandbox runs saw the same: zero violations.) |
+| Mutation 3 | `Mut3AttemptFence.cfg` | **In progress** — ≥ 2.0M distinct states explored, no violation surfaced yet; expected to violate `ServiceSafety`/`TupleSafety` via a stale INITIAL attempt. Not yet complete → not yet certified; escalate if it drains clean. |
+| Baseline liveness | `BaselineLiveness.cfg` | **Pending** (queued behind baseline safety in the runner). Expected green under fairness. |
 
 **Certification claim permitted today:** "bounded-model-checked transition core with one
-protocol defect found and fixed (I25), two mutations confirmed live, two mutations and
-liveness pending CI." Nothing stronger.
+protocol defect found and fixed (I25); **three** mutations confirmed live (Mut2 `CaseBPure`,
+Mut4 `AbortFinality`, **Mut1 `PostDecisionLoss`**); baseline safety exploring to fixpoint with
+zero violations; Mut3 + baseline liveness runs in progress." Nothing stronger until Mut3 fires
+and the baseline runs reach fixpoint.
 
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),

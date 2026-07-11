@@ -22,3 +22,9 @@ MC.out
 # OS / editor
 .DS_Store
 *.swp
+
+# TLC gate: downloaded tools, raw run output, metadirs
+/verification/tools/
+/verification/results/
+/verification/states/
+/verification/*.old
