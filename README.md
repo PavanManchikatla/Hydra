@@ -1,4 +1,17 @@
+<p align="center">
+  <img src="assets/hydra-hero.png" alt="Hydra" width="420">
+</p>
+
 # Hydra
+
+A trusted-LAN runtime that pipeline-shards large LLMs across heterogeneous machines, with a
+**model-checked session protocol (TLA+/TLC)**, a **10M-step adversarial simulation suite**, and
+**five mutation tests** proving the sim re-finds every known defect class.
+
+*Named for the Greek myth — many heads, one body; sever one and it regrows. No relation to other
+Hydra projects or fictional organizations.*
+
+---
 
 Hydra is an open-source, **trusted-LAN inference runtime** that runs a single large open-weight
 LLM (70B-class dense; MoE later) by **pipeline-sharding contiguous layer ranges across 2–3
