@@ -397,6 +397,12 @@ CoordCrash ==
         installedCkpt, segCommitted, caseBviolation, servedCount >>
 
 CoordRestart ==             \* phase-specific restart rule (spec §6.5), driven by WAL
+    \* BRANCH PRIORITY IS LOAD-BEARING (F-UNSERVABLE): `unservable` MUST be tested before the
+    \* `completeDurable` branches. A superseded-but-completed activation (unservable=TRUE with a
+    \* durable COMPLETE still present for this epoch) must resume SUPERSEDING, never re-enter
+    \* ACTIVATION_COMPLETE/finalization — that would reopen the I22 hole. This model was already
+    \* correct; the spec prose (§6.5) and the Rust impl were the layers that shadowed the order.
+    \* Do not "simplify" or reorder this IF/ELSIF chain.
     /\ cState = "CRASHED"
     /\ cState' =
          IF unservable                      THEN "SUPERSEDING"

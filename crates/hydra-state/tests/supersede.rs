@@ -49,6 +49,47 @@ fn post_decision_loss_supersedes_and_recovers() {
     assert!(invariants::check(&c).is_empty());
 }
 
+// ---- F-UNSERVABLE regression: crash in the superseding window restarts to SUPERSEDING ----
+// A coordinator crash after ACTIVATION_UNSERVABLE is durable but before the superseding
+// BEGIN_RECOVERY must restart to SUPERSEDING (spec §6.5, evaluated *before* the COMPLETE branch)
+// and must NEVER re-enter finalization. Regression for the durability gap the hydra-wal sim found:
+// the unservable fact was emitted as a WAL effect but never recorded in the coordinator's durable
+// WAL, so restart misclassified to ACTIVATION_COMPLETE and reopened the I22 hole.
+#[cfg(not(feature = "mutation_no_unservable"))]
+#[test]
+fn f_unservable_crash_in_superseding_window_restarts_to_superseding() {
+    let mut c = drive_to_post_decision_loss();
+    let effs = c.step(ProceedRecordUnservable);
+    assert_eq!(c.state(), CoordState::Superseding);
+    assert!(no_finalize(&effs), "recording unservable must not emit FINALIZE");
+    // crash + restart while still in the superseding window (epoch not yet advanced)
+    c.step(Crash);
+    let effs = c.step(Restart);
+    assert_eq!(
+        c.state(),
+        CoordState::Superseding,
+        "durable ACTIVATION_UNSERVABLE must classify restart as SUPERSEDING, never re-finalize"
+    );
+    assert!(no_finalize(&effs), "restart in the superseding window must not emit FINALIZE");
+    assert!(invariants::check(&c).is_empty());
+    // and the superseding recovery still opens cleanly at epoch+1 after the restart
+    let base = c.epoch();
+    let effs = c.step(ProceedStartSuperseding);
+    assert_eq!(c.state(), CoordState::Reconstructing);
+    assert_eq!(c.epoch(), base + 1);
+    assert!(!c.completed(), "predecessor COMPLETE does not leak past supersession");
+    assert!(no_finalize(&effs));
+}
+
+fn no_finalize(effs: &[hydra_state::Effect]) -> bool {
+    !effs.iter().any(|e| {
+        matches!(
+            e,
+            hydra_state::Effect::Send { msg: hydra_state::ControlMsg::FinalizeActivation { .. }, .. }
+        )
+    })
+}
+
 // ---- Mut1 parity: no supersession → post-decision deadlock ----
 #[cfg(feature = "mutation_no_unservable")]
 #[test]

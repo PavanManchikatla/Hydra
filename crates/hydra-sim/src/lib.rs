@@ -34,7 +34,9 @@ use hydra_state::{
 };
 
 pub mod rng;
+pub mod wal_disk;
 pub use rng::Rng;
+use wal_disk::VirtualWal;
 
 /// A detected failure, fully reproducible from `(seed, schedule)`.
 #[derive(Debug, Clone)]
@@ -74,6 +76,11 @@ pub struct World {
     /// Real stage state machines (the Mut2/Mut3 units under test). `stages[0]` is the recovery
     /// subject for the stage-track intents; the rest sit idle so their invariants stay checked.
     stages: Vec<Stage>,
+    /// The coordinator's durability, driven through the **real `hydra-wal` codec** on an in-memory
+    /// virtual disk: WAL writes are framed by the real encoder, crashes tear the in-flight write,
+    /// and restart recovers via the real partial-tail-discard scanner. Cross-checked against the
+    /// coordinator's own durable WAL on every restart (M0 §5 torn-write contract in the loop).
+    vwal: VirtualWal,
     n_stages: u16,
     rng: Rng,
     /// A WAL write emitted but not yet durable (crash here loses it — the decided-but-untold window).
@@ -113,6 +120,7 @@ impl World {
         let mut w = World {
             coord: Coordinator::new_initial(SessionId([7; 16]), n_stages, 1),
             stages: Vec::new(),
+            vwal: VirtualWal::new([7; 16]),
             n_stages,
             rng: Rng::new(seed),
             pending_wal: None,
@@ -141,6 +149,7 @@ impl World {
         sid[0] = self.round as u8;
         sid[1] = (self.round >> 8) as u8;
         self.coord = Coordinator::new_initial(SessionId(sid), self.n_stages, 1);
+        self.vwal = VirtualWal::new(sid);
         self.pending_wal = None;
         self.commit_acks.clear();
         self.finalize_acks.clear();
@@ -191,12 +200,27 @@ impl World {
         for e in effects {
             match e {
                 Effect::WriteWal { record, .. } => {
-                    self.pending_wal = match record {
-                        WalRecord::ActivationCommitIntent { .. } => Some(WalKindTag::Intent),
-                        WalRecord::ActivationComplete { .. } => Some(WalKindTag::Complete),
-                        WalRecord::ActivationAbort { .. } => Some(WalKindTag::Abort),
-                        _ => self.pending_wal,
-                    };
+                    // Frame the record into the virtual disk's pending (not-yet-durable) tail via
+                    // the real codec, mirroring the abstract `pending_wal` gate.
+                    self.vwal.write(&record);
+                    match record {
+                        WalRecord::ActivationCommitIntent { .. } => {
+                            self.pending_wal = Some(WalKindTag::Intent)
+                        }
+                        WalRecord::ActivationComplete { .. } => {
+                            self.pending_wal = Some(WalKindTag::Complete)
+                        }
+                        WalRecord::ActivationAbort { .. } => {
+                            self.pending_wal = Some(WalKindTag::Abort)
+                        }
+                        // ACTIVATION_UNSERVABLE (and SESSION_TERMINATE) are recorded synchronously
+                        // by the coordinator (atomic WAL-write + state transition, no separate
+                        // WalDurable step — F-UNSERVABLE / TLA+ CoordRecordUnservable), so fsync
+                        // them immediately here to keep the virtual disk's durable set == self.wal.
+                        WalRecord::ActivationUnservable { .. } | WalRecord::SessionTerminate => {
+                            self.vwal.fsync()
+                        }
+                    }
                 }
                 Effect::Send { msg, .. } => match msg {
                     ControlMsg::CommitActivation { tuple } => {
@@ -398,9 +422,13 @@ impl World {
 
         match action {
             Action::Coord(ev) => {
+                let is_restart = matches!(ev, CoordEvent::Restart);
                 // Crash loses any in-flight (non-durable) WAL write — the decided-but-untold window.
+                // On the virtual disk this *tears* the in-flight write (truncate/bit-flip) through
+                // the real codec, so restart must recover the same durable set the coordinator kept.
                 if matches!(ev, CoordEvent::Crash) {
                     self.pending_wal = None;
+                    self.vwal.crash_tear(&mut self.rng);
                 }
                 // Ack delivery: normally remove (delivered); sometimes keep (duplicate → redelivery).
                 match &ev {
@@ -420,11 +448,34 @@ impl World {
                     }
                     CoordEvent::WalDurable(_) => {
                         self.pending_wal = None;
+                        self.vwal.fsync(); // fdatasync: the pending write is now durable
                     }
                     _ => {}
                 }
                 let effects = self.coord.step(ev);
                 self.interpret(effects);
+                // On restart, the real codec recovers the durable prefix from the (possibly torn)
+                // virtual disk; it must equal the coordinator's own durable WAL. A divergence means
+                // the WAL-FORMAT §5 torn-write recovery disagrees with the sim's durability model.
+                if is_restart {
+                    match self.vwal.recover() {
+                        Err(e) => {
+                            return Some(self.fail("WalCodecRecover", format!("{e:?}")));
+                        }
+                        Ok(recovered) => {
+                            if recovered.as_slice() != self.coord.wal() {
+                                return Some(self.fail(
+                                    "WalCodecDivergence",
+                                    format!(
+                                        "codec recovered {} records, coordinator holds {}",
+                                        recovered.len(),
+                                        self.coord.wal().len()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             Action::Stage(i, ev) => {
                 if let Some(st) = self.stages.get_mut(i) {

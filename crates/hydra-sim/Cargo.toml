@@ -8,6 +8,7 @@ description = "Deterministic simulation harness (DST) driving hydra-state under 
 
 [dependencies]
 hydra-state = { path = "../hydra-state" }
+hydra-wal = { path = "../hydra-wal" }
 
 [features]
 # Forward the hydra-state mutation switches so the randomized sim can be run under each sabotage

@@ -151,6 +151,7 @@ name = "hydra-sim"
 version = "0.10.2"
 dependencies = [
  "hydra-state",
+ "hydra-wal",
 ]
 
 [[package]]

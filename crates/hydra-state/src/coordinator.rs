@@ -309,6 +309,14 @@ impl Coordinator {
             ProceedRecordUnservable => {
                 let id = self.next_effect_id(EffectKind::WriteWal);
                 let completion_id = self.completion_id().unwrap_or(0);
+                // F-UNSERVABLE: record the ACTIVATION_UNSERVABLE fact in the durable WAL *and*
+                // transition, atomically — mirroring TLA+ `CoordRecordUnservable` (Wal(UNSERVABLE)
+                // ∧ unservable'=TRUE ∧ cState'=SUPERSEDING). Without the durable record,
+                // `unservable_recorded()` (and thus §6.5's restart-superseding branch, which is
+                // evaluated *before* the COMPLETE branch) can never fire, so a crash in the window
+                // before the superseding BEGIN_RECOVERY would restart into finalization and reopen
+                // the I22 hole. This durability was missing; the WAL effect alone was not enough.
+                self.wal.push(WalRecord::ActivationUnservable { completion_id });
                 self.state = CoordState::Superseding;
                 vec![Effect::WriteWal {
                     id,
