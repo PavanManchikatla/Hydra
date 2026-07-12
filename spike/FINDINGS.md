@@ -100,10 +100,14 @@ argmax/top-k stability across the same 15-combination sweep, both backends.
 this characterization exists.**
 
 ## Upstream
-Drafted an upstream request for a generic (arch-agnostic) layer-window / partial-execution hook
-so the per-arch patch can eventually be retired: [`upstream-llama-issue.md`](upstream-llama-issue.md).
-Until then the patch is per-arch (`llama`, `qwen2`) and submodule-version-coupled — re-run this
-sweep on every `vendor/llama.cpp` bump (BLUEPRINT §1.2, M2 golden-token gate).
+Filed a request for a generic (arch-agnostic) layer-window / partial-execution hook so the
+per-arch patch can eventually be retired: **https://github.com/ggml-org/llama.cpp/issues/25577**
+(draft: [`upstream-llama-issue.md`](upstream-llama-issue.md); cites #22436 / #23568 as motivating
+use cases; the two bugs — non-causal embeddings default, dangling `inp_out_ids` — included as
+supporting evidence, offered as separate issues if maintainers prefer). **Monitor for replies at
+each session start; drafts only — owner approves before any reply posts.** Until a hook lands the
+patch is per-arch (`llama`, `qwen2`) and submodule-version-coupled — re-run this sweep on every
+`vendor/llama.cpp` bump (BLUEPRINT §1.2, M2 golden-token gate).
 
 ## Deferred (not required for the DoD; scoped to M2+)
 - **Range-only weight loading.** The spike loads the whole GGUF per shard and runs only its
