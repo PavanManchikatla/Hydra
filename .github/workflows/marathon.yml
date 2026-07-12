@@ -1,0 +1,69 @@
+name: DST Marathon
+
+# The deterministic-simulation gate (BLUEPRINT §4, M1 DoD (a)/(c)): the seeded `hydra-sim`
+# harness driving `hydra-state` under adversarial schedules, asserting I1–I25 after every step.
+# Unlike TLC, the marathon is CPU-cheap (a release Rust binary), so the full DoD scale runs in
+# minutes — but it is structured like `tlc.yml` (smoke on push, full run on dispatch/weekly) so
+# the 10M-step DoD run has a durable, citable CI home for the M1 gate evidence table.
+#
+#  - `smoke` : fast, required on push/PR touching the sim or state — a bounded faithful marathon
+#              (0 violations) + all four mutation parities must still be caught. < 15 min.
+#  - `long`  : dispatch / weekly — the DoD run (≥1,000 seeds × ≥10,000 steps = ≥10M steps, 0
+#              violations) across 2- and 3-stage topologies.
+
+on:
+  push:
+    paths: ['crates/hydra-sim/**', 'crates/hydra-state/**', 'crates/hydra-wal/**', 'crates/hydra-proto/**', '.github/workflows/marathon.yml']
+  pull_request:
+    paths: ['crates/hydra-sim/**', 'crates/hydra-state/**']
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'seeds (DoD ≥ 1000)'
+        default: '1000'
+      steps:
+        description: 'steps per seed (DoD: seeds×steps ≥ 10,000,000)'
+        default: '10000'
+  schedule:
+    - cron: '0 7 * * 1'   # weekly Monday 07:00 UTC — an hour after the TLC long job
+
+jobs:
+  # ---------- fast, required ----------
+  smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Faithful marathon (bounded) — must report 0 invariant violations
+        run: cargo run --release -p hydra-sim --bin marathon -- --seeds 200 --steps 20000
+      - name: Mutation parity — every mutation must still be caught (≥95% catch-rate asserted in dst.rs)
+        run: |
+          for feat in mutation_no_abort_finality mutation_no_unservable mutation_label_reset mutation_no_attempt_fence; do
+            echo "=== $feat ==="
+            cargo test --release -p hydra-sim --features "$feat" --test dst -- --nocapture
+          done
+
+  # ---------- full DoD run, dispatch/weekly ----------
+  long:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        stages: [2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: DoD marathon — ${{ inputs.seeds || '1000' }} seeds × ${{ inputs.steps || '10000' }} steps × ${{ matrix.stages }} stages (0 violations)
+        run: |
+          cargo run --release -p hydra-sim --bin marathon -- \
+            --seeds "${{ inputs.seeds || '1000' }}" \
+            --steps "${{ inputs.steps || '10000' }}" \
+            --stages ${{ matrix.stages }}
+          # The binary exits non-zero on any invariant violation (with the reproducing seed+schedule),
+          # so a green job is a machine-checkable "≥10M steps, 0 violations" record for gate (a).
