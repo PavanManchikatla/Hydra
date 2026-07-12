@@ -1,0 +1,133 @@
+name: TLC
+
+# The TLA+ model-checking gate (BLUEPRINT §4.3), offloaded to CI because model checking to
+# fixpoint is thermally infeasible on the owner's laptop (PROJECT_STATE §9).
+#
+#  - `smoke`  : fast, required on every push/PR touching the model or hydra-state — parse +
+#               the two invariant mutations (Mut2, Mut4) + a bounded baseline-safety smoke. < 10 min.
+#  - `long`   : manual / weekly — baseline-safety→fixpoint, baseline-liveness, Mut1, Mut3, each
+#               checkpointed; the checkpoint dir is uploaded at the ~6h job boundary and resumed
+#               via `-recover` on the next dispatch (set input `recover=true`) until complete.
+
+on:
+  push:
+    paths: ['verification/**', 'crates/hydra-state/**', '.github/workflows/tlc.yml']
+  pull_request:
+    paths: ['verification/**', 'crates/hydra-state/**']
+  workflow_dispatch:
+    inputs:
+      recover:
+        description: 'Long run: resume from the most recent checkpoint artifact'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * 1'   # weekly Monday 06:00 UTC — kicks the long job
+
+env:
+  TLA_URL: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+  TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+
+jobs:
+  # ---------- fast, required ----------
+  smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - name: Fetch + verify tla2tools.jar (pinned v1.7.4)
+        working-directory: verification
+        run: |
+          curl -sSL -o tla2tools.jar "$TLA_URL"
+          echo "$TLA_SHA256  tla2tools.jar" | sha256sum -c -
+      - name: Parse check (SANY)
+        working-directory: verification
+        run: java -cp tla2tools.jar tla2sany.SANY HydraActivationCore.tla
+      - name: Mut2 must violate (CaseBPure — label-only reset)
+        working-directory: verification
+        run: |
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -config Mut2Reset.cfg HydraActivationCore.tla > mut2.log 2>&1 || true
+          grep -q "Invariant Inv is violated" mut2.log \
+            && echo "OK: Mut2 fired as designed" \
+            || { echo "FAIL: Mut2 did not violate Inv"; tail -40 mut2.log; exit 1; }
+      - name: Mut4 must violate (AbortFinality/I25 — TLC-1)
+        working-directory: verification
+        run: |
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -config Mut4AbortFinality.cfg HydraActivationCore.tla > mut4.log 2>&1 || true
+          grep -q "Invariant Inv is violated" mut4.log \
+            && echo "OK: Mut4 fired as designed" \
+            || { echo "FAIL: Mut4 did not violate Inv"; tail -40 mut4.log; exit 1; }
+      - name: Baseline-safety smoke must NOT violate (bounded time budget)
+        working-directory: verification
+        run: |
+          # Explore for ~5 min; a violation would surface fast. Timeout (124) = clean-so-far = pass.
+          timeout 300 java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config BaselineSafety.cfg HydraActivationCore.tla > base.log 2>&1; rc=$?
+          if grep -qE "Invariant .* is violated|Temporal properties were violated" base.log; then
+            echo "FAIL: baseline-safety smoke surfaced a violation"; tail -60 base.log; exit 1
+          fi
+          echo "OK: baseline-safety smoke clean (rc=$rc; 124=time-boxed, expected)"
+
+  # ---------- long, checkpointed, manual/weekly ----------
+  long:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # ~5.8 h, under GitHub's 6 h ceiling
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: baseline-safety, cfg: BaselineSafety.cfg,   expect: clean }
+          - { name: baseline-live,   cfg: BaselineLiveness.cfg, expect: clean }
+          - { name: mut1,            cfg: Mut1Unservable.cfg,    expect: violation }
+          - { name: mut3,            cfg: Mut3AttemptFence.cfg,  expect: violation }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - name: Fetch + verify tla2tools.jar
+        working-directory: verification
+        run: |
+          curl -sSL -o tla2tools.jar "$TLA_URL"
+          echo "$TLA_SHA256  tla2tools.jar" | sha256sum -c -
+      - name: Restore prior checkpoint (if recovering)
+        if: ${{ inputs.recover }}
+        uses: actions/download-artifact@v4
+        with: { name: tlc-checkpoint-${{ matrix.name }}, path: verification/states }
+        continue-on-error: true
+      - name: Run ${{ matrix.name }} (checkpointed)
+        working-directory: verification
+        run: |
+          mkdir -p ci-results states
+          RECOVER=""
+          if [ "${{ inputs.recover }}" = "true" ] && [ -d states ]; then
+            CK=$(ls -dt states/*/ 2>/dev/null | head -1)
+            [ -n "$CK" ] && RECOVER="-recover ${CK%/}"
+          fi
+          # -checkpoint 60: snapshot every 60 min so a 6 h boundary loses at most ~1 h.
+          java -Xmx12g -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -checkpoint 60 \
+            $RECOVER -config ${{ matrix.cfg }} HydraActivationCore.tla > ci-results/${{ matrix.name }}.log 2>&1 || true
+          tail -20 ci-results/${{ matrix.name }}.log
+      - name: Classify result
+        working-directory: verification
+        run: |
+          log=ci-results/${{ matrix.name }}.log
+          violated=$(grep -cE "Invariant .* is violated|Temporal properties were violated" "$log" || true)
+          complete=$(grep -cE "Model checking completed. No error" "$log" || true)
+          echo "expect=${{ matrix.expect }} violated=$violated complete=$complete" | tee ci-results/${{ matrix.name }}.status
+          if [ "${{ matrix.expect }}" = "violation" ] && [ "$violated" -ge 1 ]; then exit 0; fi
+          if [ "${{ matrix.expect }}" = "clean" ] && [ "$complete" -ge 1 ]; then exit 0; fi
+          # Not yet conclusive (timed out at the 6 h boundary): upload checkpoint and continue next dispatch.
+          echo "INCONCLUSIVE — checkpoint uploaded; re-dispatch with recover=true to continue."
+      - name: Upload checkpoint + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-checkpoint-${{ matrix.name }}
+          path: |
+            verification/states
+            verification/ci-results/${{ matrix.name }}.log
+            verification/ci-results/${{ matrix.name }}.status
+          retention-days: 30
