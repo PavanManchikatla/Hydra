@@ -38,6 +38,12 @@ pub mod wal_disk;
 pub use rng::Rng;
 use wal_disk::VirtualWal;
 
+/// Sim/scheduler version identifier — stamped on every run's output header and on each `Failure`,
+/// so result provenance is mechanically visible if the adversarial scheduler ever changes (a
+/// median or catch-rate is only comparable within one scheduler version). Bump on any change to
+/// candidate generation, intent set, round structure, or the torn-write model.
+pub const SCHED_VERSION: &str = "sched-v2 (5-intent: coord {happy,abort-crash,complete-lose} + stage {reset-after-catchup, stale-fence}; real hydra-wal torn-write disk)";
+
 /// A detected failure, fully reproducible from `(seed, schedule)`.
 #[derive(Debug, Clone)]
 pub struct Failure {
@@ -52,6 +58,7 @@ pub struct Failure {
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "SIM FAILURE: {} — {}", self.invariant, self.detail)?;
+        writeln!(f, "  scheduler: {SCHED_VERSION}")?;
         writeln!(f, "  reproduce with seed={} (step {})", self.seed, self.step)?;
         writeln!(f, "  schedule ({} actions):", self.schedule.len())?;
         for (i, a) in self.schedule.iter().enumerate() {

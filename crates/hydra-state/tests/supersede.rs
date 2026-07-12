@@ -78,7 +78,9 @@ fn post_decision_loss_supersedes_and_recovers() {
 // and must NEVER re-enter finalization. Regression for the durability gap the hydra-wal sim found:
 // the unservable fact was emitted as a WAL effect but never recorded in the coordinator's durable
 // WAL, so restart misclassified to ACTIVATION_COMPLETE and reopened the I22 hole.
-#[cfg(not(feature = "mutation_no_unservable"))]
+// Asserts the FIX; Mut5 (`mutation_unservable_restart`) deliberately reintroduces the defect, so
+// exclude it there — the sim's WAL-codec cross-check covers that build (mutation-parity convention).
+#[cfg(not(any(feature = "mutation_no_unservable", feature = "mutation_unservable_restart")))]
 #[test]
 fn f_unservable_crash_in_superseding_window_restarts_to_superseding() {
     let mut c = drive_to_post_decision_loss();

@@ -17,6 +17,7 @@ mutation_no_unservable = ["hydra-state/mutation_no_unservable"]
 mutation_label_reset = ["hydra-state/mutation_label_reset"]
 mutation_no_attempt_fence = ["hydra-state/mutation_no_attempt_fence"]
 mutation_no_abort_finality = ["hydra-state/mutation_no_abort_finality"]
+mutation_unservable_restart = ["hydra-state/mutation_unservable_restart"]
 
 [[bin]]
 name = "marathon"

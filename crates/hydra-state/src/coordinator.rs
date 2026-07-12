@@ -316,6 +316,11 @@ impl Coordinator {
                 // evaluated *before* the COMPLETE branch) can never fire, so a crash in the window
                 // before the superseding BEGIN_RECOVERY would restart into finalization and reopen
                 // the I22 hole. This durability was missing; the WAL effect alone was not enough.
+                // Mut5 (`mutation_unservable_restart`) reintroduces exactly that omission: the
+                // WriteWal effect below is still emitted (a real disk / the sim's virtual WAL records
+                // it), but `self.wal` does not — so restart misclassifies. The sim re-finds it via
+                // the WAL-codec cross-check (monotone-mutation rule).
+                #[cfg(not(feature = "mutation_unservable_restart"))]
                 self.wal.push(WalRecord::ActivationUnservable { completion_id });
                 self.state = CoordState::Superseding;
                 vec![Effect::WriteWal {

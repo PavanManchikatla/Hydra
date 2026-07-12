@@ -31,6 +31,9 @@ Randomized detection over 200 seeds each, budget 20,000 steps (catch-rate bar �
 | Mut2 `mutation_label_reset` | CaseBPure (I11/I23) | ✅ **200/200** | 250 | 200 |
 | Mut3 `mutation_no_attempt_fence` | F2 AttemptFence (I4) | ✅ **200/200** | 187 | 200 |
 | Mut4 `mutation_no_abort_finality` | I25 AbortFinality | ✅ **200/200** | 82 | 200 |
+| Mut5 `mutation_unservable_restart` | WalCodecDivergence (F-UNSERVABLE: omitted durable UNSERVABLE) | ✅ **200/200** | 658 | 200 |
+
+Mut5 is the monotone-mutation left behind by F-UNSERVABLE (§7.10): it reintroduces the omitted durable-`ACTIVATION_UNSERVABLE`-record behavior, and the WAL-codec cross-check that originally found the defect re-finds it. Every run's output header carries `hydra_sim::SCHED_VERSION` (result-provenance hygiene: medians/catch-rates compare only within one scheduler version).
 
 ## (c) Directed scenarios — spec verification-plan checklist
 
@@ -122,7 +125,7 @@ Each invariant → the executable check (function / test), or an explicit deferr
 | Criterion | State |
 |---|---|
 | (a) randomized 10M+/≥1000 seeds, 0 violations | ✅ **CI green** (run 29182450338, 10M × {2,3} stages) + local |
-| (b) all 4 mutation parities caught | ✅ 200/200 each |
+| (b) all mutation parities caught | ✅ **5/5 at 200/200** (Mut1–Mut4 + Mut5 F-UNSERVABLE monotone-mutation) |
 | (c) directed scenarios | ✅ except I24 (→M3) and SAMPLE_NEXT retention (→M2), both deferred-with-owed-item |
 | (d) 4 TLC-trace replays | ✅ 4/4, event-sequence fidelity |
 | (e) TLC six configs | ✅ 4/6 conclusive; ⏳ baseline-safety fixpoint + Mut3 still running in CI |

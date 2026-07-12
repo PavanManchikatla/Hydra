@@ -17,3 +17,7 @@ mutation_no_unservable = []   # Mut1: remove the ACTIVATION_UNSERVABLE/supersess
 mutation_label_reset = []     # Mut2: RESET_RECOVERY_ATTEMPT becomes a label-only r-bump
 mutation_no_attempt_fence = [] # Mut3: disable activation_attempt_id fencing
 mutation_no_abort_finality = [] # Mut4: allow COMPLETE after a durable ABORT (I25 off)
+mutation_unservable_restart = [] # Mut5 (F-UNSERVABLE): omit the durable ACTIVATION_UNSERVABLE
+                                 #   record in self.wal, so restart misclassifies out of the
+                                 #   superseding window (the exact defect the WAL-codec cross-check
+                                 #   found); the sim must re-find it (monotone-mutation rule)

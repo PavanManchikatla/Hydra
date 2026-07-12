@@ -41,7 +41,7 @@ jobs:
         run: cargo run --release -p hydra-sim --bin marathon -- --seeds 200 --steps 20000
       - name: Mutation parity — every mutation must still be caught (≥95% catch-rate asserted in dst.rs)
         run: |
-          for feat in mutation_no_abort_finality mutation_no_unservable mutation_label_reset mutation_no_attempt_fence; do
+          for feat in mutation_no_abort_finality mutation_no_unservable mutation_label_reset mutation_no_attempt_fence mutation_unservable_restart; do
             echo "=== $feat ==="
             cargo test --release -p hydra-sim --features "$feat" --test dst -- --nocapture
           done

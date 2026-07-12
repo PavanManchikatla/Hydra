@@ -9,7 +9,8 @@
     feature = "mutation_no_abort_finality",
     feature = "mutation_no_unservable",
     feature = "mutation_label_reset",
-    feature = "mutation_no_attempt_fence"
+    feature = "mutation_no_attempt_fence",
+    feature = "mutation_unservable_restart"
 )))]
 #[test]
 fn randomized_runs_are_violation_free() {
@@ -28,7 +29,8 @@ fn randomized_runs_are_violation_free() {
     feature = "mutation_no_abort_finality",
     feature = "mutation_no_unservable",
     feature = "mutation_label_reset",
-    feature = "mutation_no_attempt_fence"
+    feature = "mutation_no_attempt_fence",
+    feature = "mutation_unservable_restart"
 ))]
 fn detection_stats(k: u64, budget: u64) -> (u64, u64, u64) {
     let mut steps: Vec<u64> = Vec::new();
@@ -72,5 +74,17 @@ fn mut2_caseb_caught_by_randomized_runs() {
 fn mut3_attempt_fence_caught_by_randomized_runs() {
     let (caught, total, median) = detection_stats(200, 20_000);
     println!("Mut3 (F2 AttemptFence): {caught}/{total} seeds caught; median steps-to-detection = {median}");
+    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+}
+
+// Mut5 (F-UNSERVABLE monotone-mutation): omit the durable ACTIVATION_UNSERVABLE record — the WAL
+// effect is still emitted (so the virtual disk records it) but self.wal is not, so restart
+// misclassifies. The WAL-codec cross-check (the very check that found F-UNSERVABLE) must re-find it.
+#[cfg(feature = "mutation_unservable_restart")]
+#[test]
+fn mut5_unservable_restart_caught_by_randomized_runs() {
+    println!("scheduler: {}", hydra_sim::SCHED_VERSION);
+    let (caught, total, median) = detection_stats(200, 20_000);
+    println!("Mut5 (WalCodecDivergence / omitted durable UNSERVABLE): {caught}/{total} seeds caught; median steps-to-detection = {median}");
     assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
 }
