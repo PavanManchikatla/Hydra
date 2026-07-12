@@ -126,8 +126,13 @@ jobs:
             CK=$(ls -dt states/*/ 2>/dev/null | head -1)
             [ -n "$CK" ] && RECOVER="-recover ${CK%/}"
           fi
-          # -checkpoint 60: snapshot every 60 min so a 6 h boundary loses at most ~1 h.
-          java -Xmx12g -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -checkpoint 60 \
+          # -checkpoint 60: snapshot every 60 min so a boundary loses at most ~1 h.
+          # INNER time-box (`timeout 320m`, < the 350-min job timeout): a long config that will
+          # not drain in one job must EXIT CLEANLY here (timeout rc 124, swallowed) so the Classify
+          # and Upload steps still run and the checkpoint is preserved. Without this, the job-level
+          # `timeout-minutes` cancels the job mid-run and `if: always()` never uploads — the
+          # `-recover` chain then silently loses its checkpoint for exactly the slow jobs that need it.
+          timeout 320m java -Xmx12g -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -checkpoint 60 \
             $RECOVER -config ${{ matrix.cfg }} HydraActivationCore.tla > ci-results/${{ matrix.name }}.log 2>&1 || true
           tail -20 ci-results/${{ matrix.name }}.log
       - name: Classify result
