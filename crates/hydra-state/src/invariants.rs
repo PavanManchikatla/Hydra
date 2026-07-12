@@ -6,6 +6,7 @@
 //! defect), decision monotonicity (I10a/WAL), and evidence-based serviceability (I16/I18).
 
 use crate::coordinator::{Coordinator, CoordState};
+use crate::stage::{Stage, StageState};
 use crate::WalRecord;
 
 /// A detected invariant violation. Every simulator failure prints the offending invariant.
@@ -21,6 +22,28 @@ pub fn check(c: &Coordinator) -> Vec<Violation> {
     abort_finality(c, &mut v);
     decision_monotone(c, &mut v);
     service_safety(c, &mut v);
+    v
+}
+
+/// Check a stage's local invariants (F2 attempt fencing — the Mut3 detector).
+pub fn check_stage(s: &Stage) -> Vec<Violation> {
+    let mut v = Vec::new();
+    // **F2 / I4 (attempt fencing):** a stage bound into PREACTIVE/ACTIVE_FINAL must be at the
+    // highest attempt it has accepted — it never regresses onto a stale (lower) attempt. Mut3
+    // (no fencing) lets a stale COMMIT pull `attempt` below `highest_attempt`.
+    if matches!(s.state(), StageState::Preactive | StageState::ActiveFinal)
+        && s.attempt() != s.highest_attempt()
+    {
+        v.push(Violation {
+            invariant: "F2 AttemptFence",
+            detail: format!(
+                "stage in {:?} at attempt {} but highest accepted is {}",
+                s.state(),
+                s.attempt(),
+                s.highest_attempt()
+            ),
+        });
+    }
     v
 }
 

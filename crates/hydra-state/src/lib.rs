@@ -18,8 +18,10 @@
 
 pub mod coordinator;
 pub mod invariants;
+pub mod stage;
 
 pub use coordinator::{Coordinator, CoordEvent, CoordState};
+pub use stage::{Stage, StageEffect, StageEvent, StageState};
 
 // ---------- identifiers ----------
 
