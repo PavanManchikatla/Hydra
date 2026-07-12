@@ -4,6 +4,7 @@ members = [
     "crates/hydra-proto",
     "crates/hydra-wal",
     "crates/hydra-transport",
+    "crates/hydra-state",
 ]
 
 [workspace.package]

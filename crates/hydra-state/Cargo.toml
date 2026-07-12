@@ -1,0 +1,18 @@
+[package]
+name = "hydra-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PURE, synchronous Hydra state machines (coordinator + stage-session + activation transaction). No I/O, no clocks, no randomness. Mirrors HydraActivationCore.tla 1:1."
+
+[dependencies]
+blake3.workspace = true
+
+[features]
+# Mutation-parity switches (M1 DoD): re-introduce the four TLA+ sabotages so the simulator
+# can prove it catches each one. Default build is faithful (all guards on).
+mutation_no_unservable = []   # Mut1: remove the ACTIVATION_UNSERVABLE/supersession path
+mutation_label_reset = []     # Mut2: RESET_RECOVERY_ATTEMPT becomes a label-only r-bump
+mutation_no_attempt_fence = [] # Mut3: disable activation_attempt_id fencing
+mutation_no_abort_finality = [] # Mut4: allow COMPLETE after a durable ABORT (I25 off)

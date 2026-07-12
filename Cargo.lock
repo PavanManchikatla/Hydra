@@ -147,6 +147,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-state"
+version = "0.10.2"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "hydra-transport"
 version = "0.10.2"
 dependencies = [
