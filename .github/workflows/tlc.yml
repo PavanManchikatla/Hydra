@@ -45,31 +45,48 @@ jobs:
       - name: Parse check (SANY)
         working-directory: verification
         run: java -cp tla2tools.jar tla2sany.SANY HydraActivationCore.tla
-      - name: Mut2 must violate (CaseBPure — label-only reset)
+      # Mutation steps assert the SPECIFIC expected invariant fires (smoke configs check the exact
+      # conjunct, not the aggregate Inv). Absence of the expected violation FAILS the job — a
+      # mutation that stopped firing must never pass green (masked-failure guard).
+      - name: Mut2 must trip CaseBPure (label-only reset)
         working-directory: verification
         run: |
-          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -config Mut2Reset.cfg HydraActivationCore.tla > mut2.log 2>&1 || true
-          grep -q "Invariant Inv is violated" mut2.log \
-            && echo "OK: Mut2 fired as designed" \
-            || { echo "FAIL: Mut2 did not violate Inv"; tail -40 mut2.log; exit 1; }
-      - name: Mut4 must violate (AbortFinality/I25 — TLC-1)
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config smoke/Mut2-CaseBPure.cfg HydraActivationCore.tla > mut2.log 2>&1 || rc=$?
+          if grep -q "Invariant CaseBPure is violated" mut2.log; then
+            echo "OK: Mut2 tripped CaseBPure (rc=$rc)"
+          else
+            echo "FAIL: Mut2 did NOT trip CaseBPure — the mutation stopped firing"; tail -40 mut2.log; exit 1
+          fi
+      - name: Mut4 must trip AbortFinality (no abort finality — TLC-1/I25)
         working-directory: verification
         run: |
-          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -config Mut4AbortFinality.cfg HydraActivationCore.tla > mut4.log 2>&1 || true
-          grep -q "Invariant Inv is violated" mut4.log \
-            && echo "OK: Mut4 fired as designed" \
-            || { echo "FAIL: Mut4 did not violate Inv"; tail -40 mut4.log; exit 1; }
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config smoke/Mut4-AbortFinality.cfg HydraActivationCore.tla > mut4.log 2>&1 || rc=$?
+          if grep -q "Invariant AbortFinality is violated" mut4.log; then
+            echo "OK: Mut4 tripped AbortFinality (rc=$rc)"
+          else
+            echo "FAIL: Mut4 did NOT trip AbortFinality — the mutation stopped firing"; tail -40 mut4.log; exit 1
+          fi
       - name: Baseline-safety smoke must NOT violate (bounded time budget)
         working-directory: verification
         run: |
-          # Explore for ~4 min; a violation would surface fast. The `|| true` swallows timeout's
-          # exit 124 (the intended time-box) so bash -e doesn't treat it as a failure.
+          rc=0
           timeout 240 java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-            -config BaselineSafety.cfg HydraActivationCore.tla > base.log 2>&1 || true
-          if grep -qE "Invariant .* is violated|Temporal properties were violated" base.log; then
-            echo "FAIL: baseline-safety smoke surfaced a violation"; tail -60 base.log; exit 1
+            -config BaselineSafety.cfg HydraActivationCore.tla > base.log 2>&1 || rc=$?
+          # Any violation/Error text fails the job regardless of rc — the gate must not lie.
+          if grep -qE "is violated|Temporal properties were violated|^Error:" base.log; then
+            echo "FAIL: baseline-safety surfaced a violation/error"; tail -60 base.log; exit 1
           fi
-          echo "OK: baseline-safety smoke clean (time-boxed, no violation)"
+          # Exit-code discrimination: 124 = time-boxed (pass); 0 = bounded run completed clean (pass);
+          # anything else = unexpected (fail).
+          case "$rc" in
+            124) echo "OK: baseline-safety time-boxed at 240s, no violation" ;;
+            0)   echo "OK: baseline-safety bounded run completed, no violation" ;;
+            *)   echo "FAIL: baseline-safety unexpected rc=$rc"; tail -60 base.log; exit 1 ;;
+          esac
 
   # ---------- long, checkpointed, manual/weekly ----------
   long:
