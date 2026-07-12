@@ -1,0 +1,22 @@
+[package]
+name = "hydra-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic simulation harness (DST) driving hydra-state under adversarial schedules; asserts I1–I25 after every step; reproduces from (seed, schedule)."
+
+[dependencies]
+hydra-state = { path = "../hydra-state" }
+
+[features]
+# Forward the hydra-state mutation switches so the randomized sim can be run under each sabotage
+# and must catch it within a bounded step budget (M1 mutation-parity DoD).
+mutation_no_unservable = ["hydra-state/mutation_no_unservable"]
+mutation_label_reset = ["hydra-state/mutation_label_reset"]
+mutation_no_attempt_fence = ["hydra-state/mutation_no_attempt_fence"]
+mutation_no_abort_finality = ["hydra-state/mutation_no_abort_finality"]
+
+[[bin]]
+name = "marathon"
+path = "src/bin/marathon.rs"

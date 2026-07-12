@@ -147,6 +147,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-sim"
+version = "0.10.2"
+dependencies = [
+ "hydra-state",
+]
+
+[[package]]
 name = "hydra-state"
 version = "0.10.2"
 dependencies = [
