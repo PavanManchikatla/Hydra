@@ -3,7 +3,51 @@
 > **What this file is.** The single, always-current narrative of the Hydra project: what it is, what has happened, what is true right now, what is owed, and what happens next. It is written so that any human or AI agent can read this one file and act correctly without archaeology through commits or chat logs.
 > **Update rule (binding on the coding agent):** this file is updated in the *same commit* as any milestone progress, gate decision, finding, verification result, or package amendment. A commit that changes project reality without updating this file is a process defect. Each update appends to §12 (changelog) with date + summary.
 
-**Last updated:** 2026-07-11 · **Package version:** v0.10.2 · **Phase:** M0 ratified → **M1 in progress** (state machines + deterministic simulation) · **Repo:** github.com/PavanManchikatla/Hydra
+**Last updated:** 2026-07-11 (session handoff) · **Package version:** v0.10.2 · **Phase:** **M1 in progress** — `hydra-state` complete + `hydra-sim` foundation landed; gate not yet reached (see §0c) · **Repo:** github.com/PavanManchikatla/Hydra
+
+---
+
+## 0. RESUMPTION BRIEFING (read first — a fresh session resumes from the repo alone)
+
+### (a) Standing rules currently in force
+1. **Attribution:** the owner `Pavan Manchikatla <91258136+PavanManchikatla@users.noreply.github.com>` is the **primary author + committer on every commit** (repo-local `git config user.name/user.email`); every commit message ends with `Co-Authored-By: Claude <noreply@anthropic.com>`. Do **not** use `-c` overrides.
+2. **Push cadence:** small logical commits, conventional messages, **push after every commit**; local never leads remote by more than a day.
+3. **§11 same-commit:** any commit that changes project reality (milestone progress, gate verdicts, findings, TLC/sim results, amendments, owed items) updates this file **in the same commit** and appends one line to §12.
+4. **History-rewrite prohibition:** `git` history rewrites are **forbidden** (the one authorized attribution backfill is done; never again).
+5. **Ratification-pause:** any finding that changes a package decision (defaults / formats / scope) **pauses for owner ratification** before the next milestone; findings that don't, proceed and are logged in §7/§12.
+6. **Escalate-with-traces:** verification deviations **escalate with the trace**; the model/spec is **never** adjusted to make a run pass.
+7. **Thermal rule:** local TLC is **smoke-only** (parse, Mut2, Mut4); baseline-safety / baseline-liveness / Mut1 / Mut3 are **CI-owned** (`.github/workflows/tlc.yml`). Any exceptional local run uses `-checkpoint 1 -workers 1 nice -n 19` and must be `-recover`-resumable.
+8. **#25577 reply-monitoring:** check https://github.com/ggml-org/llama.cpp/issues/25577 for maintainer replies **at each session start**; draft any response and get **owner approval before posting**.
+9. **Fix-the-sim-never-the-budget:** a mutation the randomized sim can't catch within its step budget is a **sim-weakness to fix**, never a budget to relax.
+10. **Parked decisions never block work:** proceed with milestone work; don't idle on a pending owner decision unless the work literally depends on it.
+
+### (b) In-flight state
+- **TLC long run:** GitHub Actions run **29179427311** (`workflow_dispatch` on `tlc.yml`). Completed: **smoke ✅**, **baseline-liveness GREEN ✅**, **Mut1 fired ✅**. **Pending: `baseline-safety` (→ fixpoint) and `Mut3`.** Fold results into `verification/VERIFICATION-README.md` §results **and** §6 here, same-commit, as they land.
+- **Mut3 drain-clean contingency ladder** (fires **only** if the CI Mut3 leg **completes its bounded space without firing** — a SIGTERM/timeout triggers **nothing**): (a) rerun with `StateConstraint` `|msgs| ≤ 30`; (b) if still clean, `MaxAttempt = 3`; (c) if still clean, **escalate with state-space stats** — the model needs a documented strengthening, a package change requiring ratification. Never edit model logic to force it.
+- **Pending `-recover` round-trip verification:** the checkpoint-artifact **upload** is verified (33–34 MB artifacts materialize), but **resume-from-checkpoint (`-recover`) is UNTESTED** until one artifact round-trips at a 6 h job boundary — treat the first successful resume as a **required verification, not an assumption**.
+
+### (c) M1 remaining work (in order) + the gate evidence table to produce
+**Remaining M1, in order:**
+1. **Stage-SM integration into `hydra-sim`** → Mut2/Mut3 randomized parity **through the sim** (today the randomized sim drives only the coordinator; Mut2/Mut3 are covered at SM-level + directed tests).
+2. **Real `hydra-wal` torn-write virtual disk** — drive durability through the actual `hydra-wal` codec (virtual file truncated/bit-flipped at arbitrary offsets), so M0's §5 contract protects the sim's durability model.
+3. **Directed scenarios** — the **full spec verification-plan list** + the **four TLC traces** (TLC-1; Mut1's 18-state lasso; Mut2's 8-state trace; Mut4's 14-state trace) replayed **step-for-step** as directed tests.
+4. **CI marathon job** (the 10M-step DoD run in Actions, dispatch+weekly like TLC) **+ the (a)–(f) gate evidence table**.
+
+**Gate evidence-table format (produce with evidence pointers — test names / CI run URLs / commit hashes):**
+- **(a) randomized:** steps, seeds, violations = 0, run URL.
+- **(b) per-mutation:** caught Y/N, median steps-to-detection, seed count.
+- **(c) directed scenarios:** full checklist from the spec verification plan, each ✅ with test name.
+- **(d) TLC traces replayed:** 4/4 with test names.
+- **(e) TLC six-config status** from CI.
+- **(f) invariant coverage map:** I1–I25 each → the function name that checks it, **or** an explicit "not checkable at this layer, deferred to `<layer>`" — **unmapped invariants are gate blockers.**
+
+### (d) Local-environment facts a fresh session must know
+- **Repo:** `/Users/pavanmanchikatla/Documents/hydra` (remote `github.com/PavanManchikatla/Hydra`, branch `main`).
+- **Submodule:** `git submodule update --init` — `vendor/llama.cpp` pinned @ `13f2b28b` (a gitlink, not vendored source).
+- **flatc:** `/opt/homebrew/bin/flatc` (25.12.19) — only for `hydra-proto` regen (`scripts/gen-proto.sh`); generated code is committed.
+- **JDK:** `/opt/homebrew/opt/openjdk/bin/java` (OpenJDK 26). **TLC jar** = `verification/tools/tla2tools.jar` (**v1.7.4**, sha256 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`) — **git-ignored; must be re-fetched** from `https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar`.
+- **macOS has no `timeout`** (CI Ubuntu does); concurrent TLC runs need a unique `-metadir`.
+- **Build:** `cargo test --workspace` (49 tests). Spike: `cmake` in `spike/` against `vendor/llama.cpp/build`; test model in `models/` is **git-ignored** (re-download Qwen2.5-0.5B fp16).
 
 ---
 
@@ -139,3 +183,4 @@ Apple Silicon M2, 8 GB RAM (→ small models locally; 70B targets need M2-milest
 - **2026-07-11** — **fix(ci): smoke steps assert semantic outcomes, not just exit codes.** Baseline step now discriminates exit codes (124 time-box → pass; 0 → pass only if no violation/Error text; else → fail) and fails on any violation text regardless of rc. Mutation steps now check the **specific** conjunct via smoke configs (`verification/smoke/Mut2-CaseBPure.cfg`, `Mut4-AbortFinality.cfg`) and FAIL if `Invariant CaseBPure/AbortFinality is violated` is absent (masked-failure guard — a mutation that stops firing can't pass green). The authoritative long-job configs still check the full `Inv`.
 - **2026-07-11** — **M1 `hydra-sim` foundation landed**: deterministic DST harness (SplitMix64 RNG, adversarial scheduler with per-round intents + step-cap, `(seed, schedule)` reproduction) driving the coordinator; per-step invariant checks + I22 deadlock watchdog; `marathon` binary ran **10M steps × 1,000 seeds, 0 violations** locally. Randomized mutation parity through the sim: **Mut4 (I25) 200/200 caught, median 79 steps; Mut1 (I22 PostDecisionLoss) 200/200, median 216** (fixed three sim-gentleness issues per the DoD rule — quiescence-reset, per-round intent, round step-cap — never relaxed the budget). Workspace 49 tests. Remaining M1: stage-SM sim integration (Mut2/Mut3 randomized parity), real hydra-wal torn-write disk, directed scenarios + 4 TLC-trace replays, CI marathon + evidence table.
 - **2026-07-11** — **Long TLC dispatched to CI** (Actions run 29179427311) and results folding in: **smoke success**; **baseline-liveness completed GREEN** (no violation under fairness); **Mut1 confirmed firing** (PostDecisionLoss) in CI; baseline-safety + Mut3 still running. **Checkpoint-artifact upload verified to materialize** (baseline-live 33.7 MB, mut1 34.0 MB) — the `-recover` round-trip is the remaining required verification once a long job hits its 6h boundary.
+- **2026-07-11** — **Session handoff.** Added §0 RESUMPTION BRIEFING (standing rules, in-flight TLC state, M1 remaining-work list + (a)–(f) gate evidence-table format, local-environment facts) so a fresh session resumes from the repo alone. Reconciled §3/§4/§6/§8. At handoff: TLC run 29179427311 has baseline-liveness GREEN + Mut1 fired; baseline-safety + Mut3 pending; #25577 no replies; workspace 49 tests; local == remote.
