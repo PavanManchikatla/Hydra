@@ -95,7 +95,9 @@ jobs:
       - name: Restore prior checkpoint (if recovering)
         if: ${{ inputs.recover }}
         uses: actions/download-artifact@v4
-        with: { name: tlc-checkpoint-${{ matrix.name }}, path: verification/states }
+        with:
+          name: tlc-checkpoint-${{ matrix.name }}
+          path: verification/states
         continue-on-error: true
       - name: Run ${{ matrix.name }} (checkpointed)
         working-directory: verification
