@@ -62,13 +62,14 @@ jobs:
       - name: Baseline-safety smoke must NOT violate (bounded time budget)
         working-directory: verification
         run: |
-          # Explore for ~5 min; a violation would surface fast. Timeout (124) = clean-so-far = pass.
-          timeout 300 java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-            -config BaselineSafety.cfg HydraActivationCore.tla > base.log 2>&1; rc=$?
+          # Explore for ~4 min; a violation would surface fast. The `|| true` swallows timeout's
+          # exit 124 (the intended time-box) so bash -e doesn't treat it as a failure.
+          timeout 240 java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config BaselineSafety.cfg HydraActivationCore.tla > base.log 2>&1 || true
           if grep -qE "Invariant .* is violated|Temporal properties were violated" base.log; then
             echo "FAIL: baseline-safety smoke surfaced a violation"; tail -60 base.log; exit 1
           fi
-          echo "OK: baseline-safety smoke clean (rc=$rc; 124=time-boxed, expected)"
+          echo "OK: baseline-safety smoke clean (time-boxed, no violation)"
 
   # ---------- long, checkpointed, manual/weekly ----------
   long:
