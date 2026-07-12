@@ -18,10 +18,15 @@
 
 pub mod coordinator;
 pub mod invariants;
+pub mod ledger;
 pub mod stage;
 
 pub use coordinator::{Coordinator, CoordEvent, CoordState};
+pub use ledger::{Ledger, TokenEntry, TokenOrigin};
 pub use stage::{Stage, StageEffect, StageEvent, StageState};
+
+/// Position discipline (spec I13): input/KV positions vs sampled-output positions.
+pub use hydra_proto::{InputPos, OutputPos};
 
 // ---------- identifiers ----------
 

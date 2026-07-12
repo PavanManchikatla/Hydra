@@ -8,6 +8,7 @@ description = "PURE, synchronous Hydra state machines (coordinator + stage-sessi
 
 [dependencies]
 blake3.workspace = true
+hydra-proto = { path = "../hydra-proto" }
 
 [features]
 # Mutation-parity switches (M1 DoD): re-introduce the four TLA+ sabotages so the simulator

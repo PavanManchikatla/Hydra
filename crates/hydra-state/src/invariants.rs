@@ -25,6 +25,37 @@ pub fn check(c: &Coordinator) -> Vec<Violation> {
     v
 }
 
+/// Check the token ledger's watermark/commit invariants (spec §2.7), named by number.
+pub fn check_ledger(l: &crate::Ledger) -> Vec<Violation> {
+    let mut v = Vec::new();
+    let gen = l.generation_durable_pos().get();
+    let sampled = l.sampled_pos().get();
+    let emitted = l.emitted_pos().get();
+    let ledger_durable = l.ledger_durable_pos().get();
+
+    // I2a/I2b (monotone frontiers): generation_durable ≤ sampled; generation_durable ≤ ledger_durable.
+    if sampled < gen {
+        v.push(Violation { invariant: "I2 SampledFrontier", detail: format!("sampled_pos {sampled} < generation_durable_pos {gen}") });
+    }
+    if ledger_durable < gen {
+        v.push(Violation { invariant: "I2 LedgerFrontier", detail: format!("ledger_durable_pos {ledger_durable} < generation_durable_pos {gen}") });
+    }
+    // I6 (emit-after-commit): a token is emitted only once committed.
+    if emitted > gen {
+        v.push(Violation { invariant: "I6 EmitAfterCommit", detail: format!("emitted_pos {emitted} > generation_durable_pos {gen}") });
+    }
+    // I9 (cancellation cutoff): the cutoff is exactly generation_durable_pos, and no provisional survives.
+    if let Some(cutoff) = l.cancel_cutoff_pos() {
+        if cutoff.get() != gen {
+            v.push(Violation { invariant: "I9 CancelCutoff", detail: format!("cancel cutoff {} != generation_durable_pos {gen}", cutoff.get()) });
+        }
+        if l.provisional_len() != 0 {
+            v.push(Violation { invariant: "I9 CancelCutoff", detail: "provisional tokens survived cancellation".into() });
+        }
+    }
+    v
+}
+
 /// Check a stage's local invariants (F2 attempt fencing — the Mut3 detector).
 pub fn check_stage(s: &Stage) -> Vec<Violation> {
     let mut v = Vec::new();
