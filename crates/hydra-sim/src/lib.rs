@@ -6,14 +6,32 @@
 //! writes that may crash before becoming durable — and asserts the invariants after **every
 //! step**. Every failure reproduces from its `(seed, schedule)`, printed on failure.
 //!
-//! **This slice** drives the coordinator activation transaction (the crash-window/abort/finality
-//! core, where TLC-1 lived) and catches the two coordinator-side mutations, **Mut4 (I25)** and
-//! **Mut1 (PostDecisionLoss)**, through *randomized* runs. Full stage integration (adding the
-//! stage-side Mut2/Mut3 parities), the real `hydra-wal` torn-write virtual disk, and the directed
-//! scenario + TLC-trace replays land in subsequent slices.
+//! **What this slice drives.** Two tracks share one adversarial scheduler and one per-step
+//! invariant check:
+//!
+//! * **Coordinator activation track** (the crash-window/abort/finality core where TLC-1 lived):
+//!   the `ACTIVATION_COMMIT_INTENT → COMMIT → COMPLETE → FINALIZE` transaction, catching the two
+//!   coordinator-side mutations **Mut4 (I25 AbortFinality)** and **Mut1 (I22 PostDecisionLoss)**
+//!   through *randomized* runs.
+//! * **Stage recovery/activation track** (new this slice): real [`Stage`] state machines are
+//!   driven through their reconstruction+activation lifecycle — catch-up, `RESET_RECOVERY_ATTEMPT`,
+//!   `BEGIN_RECOVERY` Case B replay, and the `COMMIT/ABORT/COMMIT` attempt-fencing sequence — so
+//!   the two stage-side mutations **Mut2 (CaseBPure, from a label-only reset)** and **Mut3 (F2
+//!   AttemptFence, from missing attempt fencing)** are now caught by *randomized* runs too, not
+//!   just the directed SM-level tests. `check_stage` runs on every stage after every step.
+//!
+//! The stage track models the coordinator's reconstruction *orchestration* (the phase that emits
+//! `BEGIN_RECOVERY`/`RESET`) directly from the scheduler — that orchestration is not yet in the
+//! coordinator transition core, and the `Stage` SM is the unit under test for Mut2/Mut3. Wiring
+//! the real stage acks back into the coordinator's commit loop is a later fidelity extension; it
+//! is deliberately kept separate here so the proven Mut1/Mut4 catch behavior is not disturbed.
 
 use hydra_state::coordinator::WalKindTag;
-use hydra_state::{invariants, ControlMsg, CoordEvent, CoordState, Coordinator, Effect, SessionId, WalRecord};
+use hydra_state::stage::{StageEvent, StageState};
+use hydra_state::{
+    invariants, ActivationKind, ActivationTuple, ControlMsg, CoordEvent, CoordState, Coordinator,
+    Effect, Epoch, RecoveryId, SessionId, Stage, WalRecord,
+};
 
 pub mod rng;
 pub use rng::Rng;
@@ -41,15 +59,26 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// The simulated world: one coordinator + an abstract stage environment (ack emitters) + the
-/// in-flight WAL/message state the adversarial scheduler manipulates.
+/// One scheduler action: either a coordinator event or a stage event addressed to a rank.
+#[derive(Clone, Debug)]
+enum Action {
+    Coord(CoordEvent),
+    Stage(usize, StageEvent),
+}
+
+/// The simulated world: one coordinator + an abstract stage environment (ack emitters) for the
+/// coordinator track, plus **real [`Stage`] machines** for the recovery/activation track, all
+/// manipulated by one adversarial scheduler.
 pub struct World {
     coord: Coordinator,
+    /// Real stage state machines (the Mut2/Mut3 units under test). `stages[0]` is the recovery
+    /// subject for the stage-track intents; the rest sit idle so their invariants stay checked.
+    stages: Vec<Stage>,
     n_stages: u16,
     rng: Rng,
     /// A WAL write emitted but not yet durable (crash here loses it — the decided-but-untold window).
     pending_wal: Option<WalKindTag>,
-    /// Stage COMMITTED acks in flight for the current attempt (drop = never delivered; dup = redelivered).
+    /// Stage COMMITTED acks in flight for the current attempt (drop = never delivered; dup = redelivery).
     commit_acks: Vec<u16>,
     finalize_acks: Vec<u16>,
     ack_attempt: u32,
@@ -59,19 +88,31 @@ pub struct World {
     /// A fresh activation transaction is started whenever the coordinator reaches a quiescent
     /// absorbing state — so one run exercises many independent transactions (many abort windows).
     round: u32,
-    /// RNG-chosen adversarial goal for the current round: 0 = happy, 1 = abort-then-crash
-    /// (the TLC-1/Mut4 window), 2 = complete-then-lose (the post-decision/Mut1 window). Still fully
-    /// randomized — the intent is seeded — but each round drives toward one interesting window.
+    /// RNG-chosen adversarial goal for the current round. Coordinator-track intents: 0 = happy,
+    /// 1 = abort-then-crash (the TLC-1/Mut4 window), 2 = complete-then-lose (post-decision/Mut1).
+    /// Stage-track intents: 3 = reset-after-catch-up (Mut2/CaseBPure window), 4 = stale-attempt
+    /// commit (Mut3/F2 window). Still fully randomized — the intent is seeded — but each round
+    /// drives toward one interesting window.
     round_intent: u8,
     /// Steps taken in the current round; a round that runs too long (e.g. an abort-crash loop that
     /// never completes) is force-reset so intents keep cycling and no run gets stuck.
     round_steps: u32,
+    /// Recovery params for the current stage-track round (seeded per round): the Case-B target
+    /// epoch, the truncate frontier `t`, and the catch-up `goal > t`. The stage is caught up past
+    /// `t`, RESET to `t`, then Case-B replayed at `t`: faithful RESET truncates (clean); Mut2's
+    /// label-only RESET leaves `applied = goal > t`, tripping CaseBPure.
+    rec_target: Epoch,
+    rec_truncate: i64,
+    rec_goal: i64,
 }
+
+const N_INTENTS: usize = 5;
 
 impl World {
     pub fn new(seed: u64, n_stages: u16) -> Self {
-        World {
+        let mut w = World {
             coord: Coordinator::new_initial(SessionId([7; 16]), n_stages, 1),
+            stages: Vec::new(),
             n_stages,
             rng: Rng::new(seed),
             pending_wal: None,
@@ -84,12 +125,17 @@ impl World {
             round: 0,
             round_intent: 1, // first round targets the abort-crash window
             round_steps: 0,
-        }
+            rec_target: 1,
+            rec_truncate: 1,
+            rec_goal: 3,
+        };
+        w.setup_stages();
+        w
     }
 
     fn new_round(&mut self) {
         self.round = self.round.wrapping_add(1);
-        self.round_intent = self.rng.below(3) as u8;
+        self.round_intent = self.rng.below(N_INTENTS) as u8;
         self.round_steps = 0;
         let mut sid = [7u8; 16];
         sid[0] = self.round as u8;
@@ -99,7 +145,36 @@ impl World {
         self.commit_acks.clear();
         self.finalize_acks.clear();
         self.lost.clear();
+        self.setup_stages();
         self.schedule.push(format!("--- new round {} (intent {}) ---", self.round, self.round_intent));
+    }
+
+    /// Initialize the real stage machines for the current round's intent. For the stage-track
+    /// intents `stages[0]` is placed at the start of the target recovery sequence; other stages
+    /// (and all stages under coordinator-track intents) sit idle in `FROZEN_READY`.
+    fn setup_stages(&mut self) {
+        self.stages.clear();
+        match self.round_intent {
+            3 => {
+                // reset-after-catch-up (Mut2). Seeded params keep the sequence varied but legal.
+                self.rec_target = 1;
+                self.rec_truncate = 1 + self.rng.below(2) as i64; // 1..=2
+                self.rec_goal = self.rec_truncate + 1 + self.rng.below(3) as i64; // t+1..=t+3
+                // A survivor already at the target epoch, applied 0, about to catch up.
+                self.stages.push(Stage::frozen(0, self.rec_target, 0, 0));
+                for r in 1..self.n_stages {
+                    self.stages.push(Stage::frozen_ready(r, self.rec_target, 0));
+                }
+            }
+            _ => {
+                // intent 4 (stale-attempt commit, Mut3) and the coordinator-track intents: all
+                // stages FROZEN_READY at epoch 0. Intent 4 drives stages[0] through commit/abort/
+                // commit/stale-commit; the others stay idle.
+                for r in 0..self.n_stages {
+                    self.stages.push(Stage::frozen_ready(r, 0, 0));
+                }
+            }
+        }
     }
 
     fn fail(&self, invariant: &str, detail: impl Into<String>) -> Failure {
@@ -141,10 +216,22 @@ impl World {
     }
 
     /// Build the set of currently-possible scheduler actions (enabled coordinator actions,
-    /// deliverable acks/WAL, and low-probability adversarial injections).
-    fn candidates(&mut self) -> Vec<CoordEvent> {
+    /// deliverable acks/WAL, real-stage recovery events, and low-probability adversarial injections).
+    ///
+    /// Each round belongs to **one track**: coordinator-track intents (0–2) drive the coordinator
+    /// activation transaction; stage-track intents (3–4) drive the real `Stage` sequence to
+    /// completion with the coordinator idle. Racing the two in one round let the coordinator's
+    /// happy path reach `Serviceable` (→ `new_round`, wiping the stages) before the longer
+    /// catch-up→reset→replay sequence finished, so Mut2 was never observed — the tracks are
+    /// separated by round instead. Both are invariant-checked identically every step.
+    fn candidates(&mut self) -> Vec<Action> {
         use CoordEvent::*;
-        let mut c = Vec::new();
+        let mut c: Vec<Action> = Vec::new();
+        if self.round_intent >= 3 {
+            // stage-track round: the scheduler focuses on the stage sequence (Mut2/Mut3).
+            self.stage_candidates(&mut c);
+            return c;
+        }
         for ev in [
             StagesReconstructed,
             ProceedWriteIntent,
@@ -157,51 +244,118 @@ impl World {
             ProceedStartSuperseding,
         ] {
             if self.coord.enabled(&ev) {
-                c.push(ev);
+                c.push(Action::Coord(ev));
             }
         }
         if let Some(tag) = self.pending_wal {
-            c.push(WalDurable(tag));
+            c.push(Action::Coord(WalDurable(tag)));
         }
         for &r in &self.commit_acks {
-            c.push(StageCommitted { rank: r, attempt: self.ack_attempt });
+            c.push(Action::Coord(StageCommitted { rank: r, attempt: self.ack_attempt }));
         }
         for &r in &self.finalize_acks {
-            c.push(StageFinalized { rank: r, attempt: self.ack_attempt });
+            c.push(Action::Coord(StageFinalized { rank: r, attempt: self.ack_attempt }));
         }
         // Intent-driven adversarial bias (still randomized: `round_intent` is seeded).
         let intent = self.round_intent;
         let aborted = self.coord.attempt_aborted(self.coord.attempt());
         // intent 1 (abort-crash / TLC-1): abort a not-yet-aborted attempt, then crash before retry.
         if intent == 1 && self.coord.state() == CoordState::Committing && !aborted {
-            c.push(ProceedAbort);
-            c.push(ProceedAbort);
-            c.push(ProceedAbort);
+            c.push(Action::Coord(ProceedAbort));
+            c.push(Action::Coord(ProceedAbort));
+            c.push(Action::Coord(ProceedAbort));
         }
         if intent == 1 && self.coord.state() == CoordState::ReadyAll && aborted {
-            c.push(Crash);
-            c.push(Crash);
-            c.push(Crash);
+            c.push(Action::Coord(Crash));
+            c.push(Action::Coord(Crash));
+            c.push(Action::Coord(Crash));
         }
         // intent 2 (complete-lose / post-decision): lose a pending-finalize participant.
         if intent == 2 && self.coord.state() == CoordState::Finalizing {
             if let Some(&r) = self.finalize_acks.first() {
                 for _ in 0..5 {
-                    c.push(StageLost { rank: r });
+                    c.push(Action::Coord(StageLost { rank: r }));
                 }
             }
         }
         // low-rate baseline adversity for all intents (keeps general coverage without derailing).
         if self.coord.state() != CoordState::Crashed && self.rng.chance(1, 20) {
-            c.push(Crash);
+            c.push(Action::Coord(Crash));
         }
         if self.coord.state() == CoordState::Crashed {
-            c.push(Restart);
+            c.push(Action::Coord(Restart));
         }
         if !self.lost_candidate().is_empty() && self.rng.chance(1, 40) {
-            c.push(StageLost { rank: self.lost_candidate()[0] });
+            c.push(Action::Coord(StageLost { rank: self.lost_candidate()[0] }));
         }
         c
+    }
+
+    /// Stage-track candidate generation. For intent 3 it walks `stages[0]` through
+    /// catch-up → RESET → Case-B replay; for intent 4 through commit → abort → commit → stale
+    /// commit. Each is a *legal* protocol sequence: faithful stages stay clean, and the active
+    /// mutation turns it into the invariant violation the checker catches.
+    fn stage_candidates(&mut self, c: &mut Vec<Action>) {
+        if self.stages.is_empty() {
+            return;
+        }
+        let s = &self.stages[0];
+        // Offer the target event three times so it dominates coordinator noise in the pick.
+        let bias = |c: &mut Vec<Action>, ev: StageEvent| {
+            for _ in 0..3 {
+                c.push(Action::Stage(0, ev.clone()));
+            }
+        };
+        match self.round_intent {
+            3 => {
+                let (t, goal, target) = (self.rec_truncate, self.rec_goal, self.rec_target);
+                match s.state() {
+                    // catch up toward the goal. RebuildStep advances `applied` while below the
+                    // goal and, once `applied == goal`, flips the stage to FROZEN_READY — so this
+                    // must keep being offered *at* the goal (not just strictly below it), or the
+                    // stage stalls in REBUILDING and the round resets before RESET/BEGIN.
+                    StageState::Frozen | StageState::Rebuilding if s.recovery_id() == 0 => {
+                        bias(c, StageEvent::RebuildStep { goal });
+                    }
+                    // caught up (FROZEN_READY at recovery_id 0): RESET truncating back to `t`
+                    StageState::FrozenReady if s.recovery_id() == 0 => {
+                        bias(c, StageEvent::RecvReset { target, new_recovery_id: 1, truncate_to: t });
+                    }
+                    // reset done (FROZEN, recovery_id bumped): Case-B BEGIN_RECOVERY replay at `t`
+                    StageState::Frozen if s.recovery_id() == 1 => {
+                        bias(
+                            c,
+                            StageEvent::RecvBegin { base: 0, target, recovery_id: 1, truncate_to: t },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            4 => {
+                let ep: Epoch = 0;
+                let rid: RecoveryId = 0;
+                let tup = |attempt| ActivationTuple {
+                    kind: ActivationKind::Recovery,
+                    epoch: ep,
+                    recovery_id: rid,
+                    attempt,
+                    sampler_checkpoint_id: 1,
+                };
+                match (s.state(), s.attempt(), s.highest_attempt()) {
+                    // fresh: commit attempt 1
+                    (StageState::FrozenReady, _, 0) => bias(c, StageEvent::RecvCommit { tuple: tup(1) }),
+                    // PREACTIVE at attempt 1: abort it
+                    (StageState::Preactive, 1, _) => bias(c, StageEvent::RecvAbort { attempt: 1 }),
+                    // post-abort FROZEN_READY (fence floor 1): retry at attempt 2
+                    (StageState::FrozenReady, _, 1) => bias(c, StageEvent::RecvCommit { tuple: tup(2) }),
+                    // PREACTIVE at attempt 2: deliver the stale attempt-1 COMMIT (fenced faithfully;
+                    // accepted under Mut3 → attempt regresses below highest → F2 AttemptFence)
+                    (StageState::Preactive, 2, _) => bias(c, StageEvent::RecvCommit { tuple: tup(1) }),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     fn lost_candidate(&self) -> Vec<u16> {
@@ -239,40 +393,56 @@ impl World {
             return None;
         }
         let idx = self.rng.below(cands.len());
-        let ev = cands[idx].clone();
-        self.schedule.push(format!("{ev:?}"));
+        let action = cands[idx].clone();
+        self.schedule.push(format!("{action:?}"));
 
-        // Crash loses any in-flight (non-durable) WAL write — the decided-but-untold window.
-        if matches!(ev, CoordEvent::Crash) {
-            self.pending_wal = None;
-        }
-        // Ack delivery: normally remove (delivered); sometimes keep (duplicate → redelivery).
-        match &ev {
-            CoordEvent::StageCommitted { rank, .. } => {
-                if self.rng.chance(3, 4) {
-                    self.commit_acks.retain(|r| r != rank);
+        match action {
+            Action::Coord(ev) => {
+                // Crash loses any in-flight (non-durable) WAL write — the decided-but-untold window.
+                if matches!(ev, CoordEvent::Crash) {
+                    self.pending_wal = None;
+                }
+                // Ack delivery: normally remove (delivered); sometimes keep (duplicate → redelivery).
+                match &ev {
+                    CoordEvent::StageCommitted { rank, .. } => {
+                        if self.rng.chance(3, 4) {
+                            self.commit_acks.retain(|r| r != rank);
+                        }
+                    }
+                    CoordEvent::StageFinalized { rank, .. } => {
+                        if self.rng.chance(3, 4) {
+                            self.finalize_acks.retain(|r| r != rank);
+                        }
+                    }
+                    CoordEvent::StageLost { rank } => {
+                        self.lost.push(*rank);
+                        self.finalize_acks.retain(|r| r != rank);
+                    }
+                    CoordEvent::WalDurable(_) => {
+                        self.pending_wal = None;
+                    }
+                    _ => {}
+                }
+                let effects = self.coord.step(ev);
+                self.interpret(effects);
+            }
+            Action::Stage(i, ev) => {
+                if let Some(st) = self.stages.get_mut(i) {
+                    st.step(ev);
                 }
             }
-            CoordEvent::StageFinalized { rank, .. } => {
-                if self.rng.chance(3, 4) {
-                    self.finalize_acks.retain(|r| r != rank);
-                }
-            }
-            CoordEvent::StageLost { rank } => {
-                self.lost.push(*rank);
-                self.finalize_acks.retain(|r| r != rank);
-            }
-            CoordEvent::WalDurable(_) => {
-                self.pending_wal = None;
-            }
-            _ => {}
         }
 
-        let effects = self.coord.step(ev);
-        self.interpret(effects);
-
-        // ---- invariant check after every step (spec §2.7) ----
-        invariants::check(&self.coord).into_iter().next().map(|v| self.fail(v.invariant, v.detail))
+        // ---- invariant check after every step (spec §2.7): coordinator + every real stage ----
+        if let Some(v) = invariants::check(&self.coord).into_iter().next() {
+            return Some(self.fail(v.invariant, v.detail));
+        }
+        for st in &self.stages {
+            if let Some(v) = invariants::check_stage(st).into_iter().next() {
+                return Some(self.fail(v.invariant, v.detail));
+            }
+        }
+        None
     }
 }
 

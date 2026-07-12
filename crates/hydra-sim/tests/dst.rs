@@ -1,8 +1,16 @@
-//! DST harness tests: default runs are violation-free; each coordinator-side mutation is caught
-//! by *randomized* runs within a bounded step budget (median steps-to-detection recorded).
+//! DST harness tests: default runs are violation-free; each of the four mutations (two
+//! coordinator-side, two stage-side) is caught by *randomized* runs within a bounded step budget
+//! (median steps-to-detection recorded).
 
 // ---- default: randomized runs find no invariant violation ----
-#[cfg(not(any(feature = "mutation_no_abort_finality", feature = "mutation_no_unservable")))]
+// Gated out under EVERY mutation: with the stage track now driven, Mut2/Mut3 fire in the sim too,
+// so the violation-free run is only meaningful on the faithful build.
+#[cfg(not(any(
+    feature = "mutation_no_abort_finality",
+    feature = "mutation_no_unservable",
+    feature = "mutation_label_reset",
+    feature = "mutation_no_attempt_fence"
+)))]
 #[test]
 fn randomized_runs_are_violation_free() {
     // 300 seeds × 3000 steps = 900k steps; the marathon binary scales this to the 10M DoD in CI.
@@ -16,7 +24,12 @@ fn randomized_runs_are_violation_free() {
 /// the sabotage within `budget`, and the median steps-to-detection over the caught runs. The
 /// **ensemble** must catch the sabotage reliably (a low catch-rate means the schedule is too
 /// gentle — a sim bug to fix, per the DoD).
-#[cfg(any(feature = "mutation_no_abort_finality", feature = "mutation_no_unservable"))]
+#[cfg(any(
+    feature = "mutation_no_abort_finality",
+    feature = "mutation_no_unservable",
+    feature = "mutation_label_reset",
+    feature = "mutation_no_attempt_fence"
+))]
 fn detection_stats(k: u64, budget: u64) -> (u64, u64, u64) {
     let mut steps: Vec<u64> = Vec::new();
     for i in 0..k {
@@ -43,5 +56,21 @@ fn mut4_i25_caught_by_randomized_runs() {
 fn mut1_post_decision_loss_caught_by_randomized_runs() {
     let (caught, total, median) = detection_stats(200, 20_000);
     println!("Mut1 (I22 PostDecisionLoss): {caught}/{total} seeds caught; median steps-to-detection = {median}");
+    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+}
+
+#[cfg(feature = "mutation_label_reset")]
+#[test]
+fn mut2_caseb_caught_by_randomized_runs() {
+    let (caught, total, median) = detection_stats(200, 20_000);
+    println!("Mut2 (CaseBPure): {caught}/{total} seeds caught; median steps-to-detection = {median}");
+    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+}
+
+#[cfg(feature = "mutation_no_attempt_fence")]
+#[test]
+fn mut3_attempt_fence_caught_by_randomized_runs() {
+    let (caught, total, median) = detection_stats(200, 20_000);
+    println!("Mut3 (F2 AttemptFence): {caught}/{total} seeds caught; median steps-to-detection = {median}");
     assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
 }
