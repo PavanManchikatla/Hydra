@@ -89,15 +89,29 @@ reproducibility is required (e.g. exact-equivalence tests, D1 recovery onto the 
 backend), pass the boundary at **F32** — it is bit-exact here. This is a payload-precision
 default, **not** a protocol change (the protocol already parameterizes payload dtype).
 
-## ⚠ OWED — int8 + blockwise-scales boundary characterization (item f is half-done)
-Item (f) covers FP16 **and** int8+scales; only FP16 is done. **TODO (scheduled: M2 prep):**
-characterize an `int8_blockq` boundary payload — per-block int8 quantization of the boundary
-residual, matching the wire schema's `DType.I8_BLOCKQ` + `Tensor.block_scales`. This is a real
-test, not a formality: the residual carries a ~1560 massive-activation outlier (token0/dim62),
-so block scale selection around outliers will dominate the error — measure logit max-abs and
-argmax/top-k stability across the same 15-combination sweep, both backends.
-**Standing constraint (v0.10.2 §1.3): `int8_blockq` boundaries MUST NOT be used anywhere until
-this characterization exists.**
+## int8 + block-scale boundary characterization (item f, second half — DONE, M2 prep, 2026-07-12)
+`int8_blockq` boundary payload characterized: **symmetric per-block int8, block size QK=32**
+(ggml Q8_0 convention; the `.fbs` leaves block size to the codec) matching the wire schema's
+`DType.I8_BLOCKQ` + `Tensor.block_scales`. Harness: `src/shard_split.cpp` **Check E** (scale =
+block-amax/127, quantize→dequantize the boundary, run shard B, compare logits). Sweep: 5 splits
+`k∈{1,4,12,18,23}` × prompts, CPU (DoD backend) + Metal spot-check.
+
+**Result — int8_blockq is far lossier than FP16 and does NOT meet the M2(b) mixed-backend tolerance:**
+
+| split k | int8 logit max-abs (CPU) | argmax | top-10 |
+|---|---|---|---|
+| 1 (early) | 0.067–0.073 | stable | 10/10 |
+| 4 | 1.35–1.68 | stable | 9–10/10 |
+| 12 (mid) | **1.80–1.81** | stable | **8/10** |
+| 18 | 1.57–1.75 | stable | 9–10/10 |
+| 23 (late) | 0.20–0.26 | stable | 10/10 |
+
+- **F32 boundary stays bit-exact (0.0)** at every combo (mechanism unaffected — only the payload precision differs).
+- Peak int8 cost **~1.8 logit max-abs at mid-network splits (k=4–18)** — **~40× worse than FP16's ~0.04** for the same split. **argmax stays stable everywhere**, but **top-10 overlap drops to 8/10** at the worst mid-split — **below M2(b)'s ≥ 9/10 mixed-backend bar**.
+- **Root cause = the massive-activation outlier.** Check E's diagnostic: global **max|x| = 1624.6 at dim 62**; it dominates its QK=32 block, giving block scale **12.79** — so the other ~31 dims in that block quantize with a step of ~12.8 and any dim below ~6.4 collapses to 0. The outlier is the error, exactly as predicted.
+- **Backend-invariant, unlike FP16.** CPU **1.805** ≈ Metal **1.834** at k=12 — the int8 error is *outlier/quantization*-dominated (a property of the residual), not accumulation-order-dominated, so it does not shrink on Metal the way FP16 does (Metal FP16 ~0.010 vs CPU ~0.043, the ~4× documented earlier). This is a qualitatively different, and worse, error source than FP16 drift.
+
+**Ruling.** Naïve `int8_blockq` (QK=32, symmetric) **fails the M2 mixed-backend tolerance** at mid-network split points and is **not usable for v1**. The **standing constraint stands upheld** (v0.10.2 §1.3: `int8_blockq` boundaries MUST NOT be used anywhere) — this measurement is the evidence that the "forbidden until measured" gate was correct, not a formality. **Before any future int8 use (M2+),** the outlier must be handled explicitly: outlier-aware quantization (carry the massive-activation dims — e.g. dim 62 — out-of-band at higher precision), much smaller blocks, or per-channel scales; each must re-run this Check E sweep and clear ≥ 9/10 top-10 at every split before `int8_blockq` is unblocked. `f16` remains the production default; `f32` for the exact-equivalence tier.
 
 ## Upstream
 Filed a request for a generic (arch-agnostic) layer-window / partial-execution hook so the

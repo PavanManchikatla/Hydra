@@ -253,6 +253,45 @@ int main(int argc, char** argv) {
         llama_free(ctx);
     }
 
+    // ---- Check E: int8 + block-scale boundary characterization (test item f, second half) ----
+    // Matches the wire schema `DType.I8_BLOCKQ` + `Tensor.block_scales` (docs/hydra-proto.fbs):
+    // symmetric per-block int8, block size QK=32 (ggml Q8_0 convention; the .fbs leaves the block
+    // size to the codec). scale = amax/127 per block. The residual's ~1560 massive-activation
+    // outlier dominates its block's scale, so this is a real precision test, not a formality.
+    const int QK = 32;
+    std::vector<float> boundary_i8(boundary.size());
+    // outlier diagnostics: the block containing the global max-|x| element.
+    double gmax = 0; size_t gmax_idx = 0;
+    for (size_t i = 0; i < boundary.size(); i++) {
+        double a = std::fabs((double)boundary[i]);
+        if (a > gmax) { gmax = a; gmax_idx = i; }
+    }
+    double outlier_block_scale = 0, outlier_block_amax = 0;
+    for (size_t base = 0; base < boundary.size(); base += QK) {
+        size_t blk = std::min((size_t)QK, boundary.size() - base);
+        float amax = 0;
+        for (size_t j = 0; j < blk; j++) amax = std::max(amax, std::fabs(boundary[base + j]));
+        float scale = amax > 0 ? amax / 127.0f : 1.0f;
+        for (size_t j = 0; j < blk; j++) {
+            int q = (int)lroundf(boundary[base + j] / scale);
+            if (q > 127) q = 127; if (q < -127) q = -127;
+            boundary_i8[base + j] = q * scale;
+        }
+        if (gmax_idx >= base && gmax_idx < base + blk) { outlier_block_scale = scale; outlier_block_amax = amax; }
+    }
+    double i8_max = 1e9; bool i8_argmax_ok = false; int i8_top10 = 0;
+    {
+        auto [ctx, got] = run_shardB(boundary_i8);
+        llama_free(ctx);
+        DiffStat d = compare(ref, got);
+        i8_max = d.max_abs; i8_argmax_ok = (d.argmax_ref == d.argmax_got); i8_top10 = d.topk_overlap;
+        printf("[Check E] split (int8_blockq QK=%d boundary) vs unsplit logits: max_abs=%.3e mean_abs=%.3e argmax %d%s%d top10=%d/10  (payload cost; argmax %s)\n",
+               QK, d.max_abs, d.mean_abs, d.argmax_ref, d.argmax_ref==d.argmax_got?"==":"!=", d.argmax_got, d.topk_overlap,
+               i8_argmax_ok ? "stable" : "CHANGED");
+        printf("[Check E] outlier: global max|x|=%.1f at flat idx %zu (dim %zu); its QK=%d block amax=%.1f -> scale=%.3f (int8 step; smaller residual dims in that block quantize to ~0)\n",
+               gmax, gmax_idx, gmax_idx % (size_t)n_embd, QK, outlier_block_amax, outlier_block_scale);
+    }
+
     // DoD: the split mechanism reproduces unsplit logits on the same backend (F32, <1e-3)
     // and KV truncate+replay reproduces them. FP16 payload cost is reported separately.
     bool boundary_ok = (a_max < 0) || (a_max < 1e-4);   // exact if the callback ran
@@ -263,6 +302,8 @@ int main(int argc, char** argv) {
     printf("  KV truncate+replay exact  : %s\n", replay_ok?"yes":"NO");
     printf("  FP16 boundary payload cost: max_abs=%.3e on logits, argmax %s (item f; spec I8)\n",
            f16_max, f16_argmax_ok?"stable":"CHANGED");
+    printf("  int8_blockq payload cost  : max_abs=%.3e on logits, argmax %s, top10=%d/10 (item f 2nd half; forbidden until measured, v0.10.2 §1.3)\n",
+           i8_max, i8_argmax_ok?"stable":"CHANGED", i8_top10);
     printf("\n=== M-1 DoD: %s ===\n", dod_pass ? "PASS" : "FAIL");
     llama_model_free(model);
     return dod_pass ? 0 : 1;
