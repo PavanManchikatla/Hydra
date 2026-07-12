@@ -103,6 +103,9 @@ pub enum WalRecord {
     ActivationCommitIntent { tuple: ActivationTuple },
     ActivationComplete { tuple: ActivationTuple, completion_id: CompletionId },
     ActivationAbort { epoch: Epoch, recovery_id: RecoveryId, attempt: AttemptId },
+    /// `ACTIVATION_UNSERVABLE{completion_id, ...}` (spec §6.7, I22): a decided activation whose
+    /// participant was lost is superseded rather than served.
+    ActivationUnservable { completion_id: CompletionId },
     SessionTerminate,
 }
 

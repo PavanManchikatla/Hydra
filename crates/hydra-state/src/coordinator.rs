@@ -45,6 +45,8 @@ pub enum CoordState {
     Finalizing,
     /// Finalized everywhere; data plane may serve (I16/I20).
     Serviceable,
+    /// `ACTIVATION_UNSERVABLE` recorded: the decision stands but is not served (§6.7).
+    Superseding,
     Crashed,
     Terminal,
 }
@@ -64,6 +66,12 @@ pub enum CoordEvent {
     ProceedSendFinalize,
     StageFinalized { rank: StageRank, attempt: crate::AttemptId },
     ProceedBecomeServiceable,
+    /// A required participant is permanently lost (new stage_generation / removal).
+    StageLost { rank: StageRank },
+    /// §6.7: record ACTIVATION_UNSERVABLE for a decided-but-unservable activation.
+    ProceedRecordUnservable,
+    /// §6.7 step 3: open the superseding recovery at epoch+1.
+    ProceedStartSuperseding,
     Crash,
     Restart,
 }
@@ -83,6 +91,8 @@ pub struct Coordinator {
     tuple: Option<ActivationTuple>,
     committed: BTreeSet<StageRank>,
     finalized: BTreeSet<StageRank>,
+    /// Participants permanently lost after the durable decision (drives §6.7).
+    lost: BTreeSet<StageRank>,
     next_completion_id: CompletionId,
 
     /// Durable coordinator WAL (the coordinator's persistent truth).
@@ -106,6 +116,7 @@ impl Coordinator {
             tuple: None,
             committed: BTreeSet::new(),
             finalized: BTreeSet::new(),
+            lost: BTreeSet::new(),
             next_completion_id: 1,
             wal: Vec::new(),
             monotonic_seq: 0,
@@ -115,14 +126,25 @@ impl Coordinator {
     pub fn state(&self) -> CoordState {
         self.state
     }
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
     pub fn attempt(&self) -> crate::AttemptId {
         self.attempt
     }
     pub fn wal(&self) -> &[WalRecord] {
         &self.wal
     }
+    /// A durable COMPLETE exists for the **current epoch** (a superseding recovery advances the
+    /// epoch, so the predecessor's COMPLETE must not leak into the new transaction).
     pub fn completed(&self) -> bool {
-        self.wal.iter().any(|r| matches!(r, WalRecord::ActivationComplete { .. }))
+        self.wal.iter().any(
+            |r| matches!(r, WalRecord::ActivationComplete { tuple, .. } if tuple.epoch == self.epoch),
+        )
+    }
+
+    fn unservable_recorded(&self) -> bool {
+        self.wal.iter().any(|r| matches!(r, WalRecord::ActivationUnservable { .. })) && self.completed()
     }
 
     /// True iff a durable ABORT exists for `(epoch, recovery_id, attempt)` (I25 predicate).
@@ -165,9 +187,33 @@ impl Coordinator {
             }
             ProceedSendFinalize => self.state == CoordState::ActivationComplete,
             ProceedBecomeServiceable => self.state == CoordState::Finalizing && self.all_finalized(),
+            ProceedRecordUnservable => {
+                // §6.7: a durable decision, a required participant lost, not yet all finalized —
+                // supersede instead of blocking. Mut1 removes this recourse.
+                cfg!(not(feature = "mutation_no_unservable"))
+                    && matches!(self.state, CoordState::ActivationComplete | CoordState::Finalizing)
+                    && self.completed()
+                    && !self.all_finalized()
+                    && !self.lost.is_empty()
+            }
+            ProceedStartSuperseding => self.state == CoordState::Superseding,
             // external events: deliverable in any live (non-crashed/terminal) state
             _ => !matches!(self.state, CoordState::Terminal),
         }
+    }
+
+    /// **Post-decision liveness (I22 / Mut1 detector):** a durable decision with a permanently
+    /// lost participant that can neither finalize nor supersede is a stuck state — the
+    /// `PostDecisionLoss` liveness hole. With the unservable path present this never holds
+    /// (`ProceedRecordUnservable` is enabled); Mut1 removes it and this fires. The simulator uses
+    /// it as a deadlock watchdog.
+    pub fn post_decision_deadlock(&self) -> bool {
+        self.completed()
+            && !self.all_finalized()
+            && !self.lost.is_empty()
+            && matches!(self.state, CoordState::Finalizing)
+            && !self.enabled(&CoordEvent::ProceedRecordUnservable)
+            && !self.enabled(&CoordEvent::ProceedStartSuperseding)
     }
 
     /// Apply one event. Disabled events are no-ops (return no effects), mirroring TLC firing only
@@ -255,6 +301,34 @@ impl Coordinator {
                 self.state = CoordState::Serviceable;
                 Vec::new()
             }
+            StageLost { rank } => {
+                self.lost.insert(rank);
+                self.finalized.remove(&rank); // a lost participant's finalize evidence is gone
+                Vec::new()
+            }
+            ProceedRecordUnservable => {
+                let id = self.next_effect_id(EffectKind::WriteWal);
+                let completion_id = self.completion_id().unwrap_or(0);
+                self.state = CoordState::Superseding;
+                vec![Effect::WriteWal {
+                    id,
+                    record: WalRecord::ActivationUnservable { completion_id },
+                }]
+            }
+            ProceedStartSuperseding => {
+                // §6.7 step 3: open a superseding recovery at epoch+1 (base = completed epoch),
+                // restoring an enabled transition (I22). Reachable survivors take Case A normally.
+                self.epoch += 1;
+                self.recovery_id = 0;
+                self.attempt = 0;
+                self.kind = ActivationKind::Recovery;
+                self.tuple = None;
+                self.committed.clear();
+                self.finalized.clear();
+                self.lost.clear();
+                self.state = CoordState::Reconstructing;
+                Vec::new()
+            }
             Crash => {
                 self.state = CoordState::Crashed;
                 Vec::new()
@@ -268,7 +342,9 @@ impl Coordinator {
 
     fn completion_id(&self) -> Option<CompletionId> {
         self.wal.iter().find_map(|r| match r {
-            WalRecord::ActivationComplete { completion_id, .. } => Some(*completion_id),
+            WalRecord::ActivationComplete { tuple, completion_id } if tuple.epoch == self.epoch => {
+                Some(*completion_id)
+            }
             _ => None,
         })
     }
@@ -320,8 +396,11 @@ impl Coordinator {
         self.finalized.clear();
         // AbortGuardEnabled = the I25 guard (off only under the Mut4 mutation).
         let abort_guard = !cfg!(feature = "mutation_no_abort_finality");
-        self.state = if complete {
-            // decision stands; finalize (or supersede — §6.7, later slice)
+        self.state = if self.unservable_recorded() {
+            // §6.7: an unservable activation was recorded → resume the superseding recovery.
+            CoordState::Superseding
+        } else if complete {
+            // decision stands; finalize.
             CoordState::ActivationComplete
         } else if abort_guard && self.attempt_aborted(self.attempt) {
             // TLC-1 / I25: durable ABORT for the current attempt, no COMPLETE ⇒ attempt terminal;

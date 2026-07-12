@@ -77,14 +77,20 @@ fn abort_finality(c: &Coordinator, out: &mut Vec<Violation>) {
     }
 }
 
-/// **DecisionMonotone (I10a/WAL):** the volatile `completed` view is backed by a durable
-/// COMPLETE record (a decision is never claimed without its WAL evidence).
+/// **DecisionMonotone (I10a/WAL):** any post-decision coordinator state is backed by a durable
+/// COMPLETE for the current epoch — a decision is never claimed without its WAL evidence.
 fn decision_monotone(c: &Coordinator, out: &mut Vec<Violation>) {
-    let has_complete = c.wal().iter().any(|r| matches!(r, WalRecord::ActivationComplete { .. }));
-    if c.completed() != has_complete {
+    let post_decision = matches!(
+        c.state(),
+        CoordState::ActivationComplete
+            | CoordState::Finalizing
+            | CoordState::Serviceable
+            | CoordState::Superseding
+    );
+    if post_decision && !c.completed() {
         out.push(Violation {
             invariant: "DecisionMonotone",
-            detail: format!("completed()={} but durable COMPLETE present={}", c.completed(), has_complete),
+            detail: format!("post-decision state {:?} without a durable COMPLETE", c.state()),
         });
     }
 }
