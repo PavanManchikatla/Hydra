@@ -1,49 +1,66 @@
 # Hydra
 
-Trusted-LAN inference runtime that runs a single large open-weight LLM by pipeline-sharding
-it across 2–3 heterogeneous desktop-class machines, with crash-safe sessions, exactly-once
-token semantics, and recoverable generation streams.
+Hydra is an open-source, **trusted-LAN inference runtime** that runs a single large open-weight
+LLM (70B-class dense; MoE later) by **pipeline-sharding contiguous layer ranges across 2–3
+heterogeneous desktop-class machines** (CUDA desktop, Apple Silicon Macs, CPU nodes). Its
+differentiator is not speed — physics caps a 70B at ~2–7 tok/s on wired desktop hardware — but
+**correctness under failure**: crash-safe sessions, exactly-once token semantics, teacher-forced
+recovery, and generation streams that survive any single machine dying mid-sentence without
+duplicating or losing a single visible token.
 
-**Read [`BLUEPRINT.md`](BLUEPRINT.md) first** — it is the root of the package and governs
-process & scope. Normative documents live in [`docs/`](docs/); the machine-checked transition
-core lives in [`verification/`](verification/).
+## Start here
 
-## Milestone status
+👉 **[`PROJECT_STATE.md`](PROJECT_STATE.md) is the current-status entry point** — the single,
+always-current narrative of what Hydra is, what has happened, what is true right now, what is
+owed, and what happens next. Read it first; it is kept accurate in the same commit as any change
+to project reality.
 
-Per `BLUEPRINT.md §3`. A milestone is not started until the previous one's Definition of Done
-passes. **Do not proceed past a milestone until its DoD passes.**
+## Reading order (from `PROJECT_STATE.md` §2)
 
-| Milestone | Description | Status |
-|---|---|---|
-| **M−1** | Engine feasibility spike (shard-style llama.cpp execution) | ✅ **PASS** — [`spike/FINDINGS.md`](spike/FINDINGS.md) |
-| M0 | Skeleton + protocol types (`hydra-proto`, `hydra-wal`, `hydra-transport`) | ⏳ next |
-| M1 | State machines + deterministic simulation (correctness heart) | ⏳ |
-| M2 | Two-node real pipeline (first tokens) | ⏳ (now schedulable — M−1 note exists) |
-| M3 | Heterogeneity, scheduler, hardening | ⏳ |
-| M4 | Product hardening | ⏳ |
+| # | File | Role |
+|---|------|------|
+| 0 | [`PROJECT_STATE.md`](PROJECT_STATE.md) | Current truth (narrative authority) |
+| 1 | [`BLUEPRINT.md`](BLUEPRINT.md) | What to build, order, DoD gates, fixed decisions |
+| 2 | [`docs/hydra-session-protocol.md`](docs/hydra-session-protocol.md) | Messages, state machines, **invariants I1–I25** (correctness authority) |
+| 3 | [`docs/hydra-proto.fbs`](docs/hydra-proto.fbs) + [`docs/wal-records.fbs`](docs/wal-records.fbs) | Wire + WAL payload schemas (generated code is source of truth) |
+| 4 | [`docs/WAL-FORMAT.md`](docs/WAL-FORMAT.md) | On-disk format, fsync rules, torn-write contract |
+| 5 | [`verification/`](verification/) | TLA+ model + 6 configs + VERIFICATION-README (CI gate for transition-logic changes) |
+| 6 | [`docs/federated-llm-inference-report.md`](docs/federated-llm-inference-report.md) | Research rationale (consult for *why*) |
 
-**M−1 result:** shard A → shard B reproduces unsplit llama.cpp logits **bit-exactly** on CPU
-(F32 boundary, 0.0 max-abs across k ∈ {1,4,12,18,23} × 3 prompts); KV truncate+replay exact;
-FP16 boundary payload costs ~0.04 logit max-abs with stable argmax (spec I8). Engine delta is a
-47-line per-arch layer-window patch (`spike/llama-cpp-layer-window.patch`).
-
-## Layout (BLUEPRINT §2)
+## Layout
 
 ```
-hydra/
-├── BLUEPRINT.md            # root instruction set
-├── docs/                   # normative spec, WAL format, schemas, research report
-├── verification/           # HydraActivationCore.tla + cfgs + VERIFICATION-README
-├── vendor/llama.cpp/       # pinned submodule (MIT) — the compute engine
-├── spike/                  # M−1 throwaway feasibility spike (not the product)
-├── crates/                 # M0+ Rust workspace (hydra-proto, hydra-wal, ...)
-└── tests/                  # integration + chaos (M2+)
+crates/     hydra-proto | hydra-wal | hydra-transport   (M1: + hydra-state, hydra-sim)
+spike/      M−1 engine feasibility spike + FINDINGS.md + llama.cpp layer-window patch
+verification/  TLA+ transition-core model, configs, run-gate.sh
+vendor/llama.cpp   pinned submodule (a pointer, not vendored source)
+docs/       protocol spec, schemas, WAL format, research report
 ```
 
-## M−1 spike (current)
+## Build prerequisites
 
-Goal (BLUEPRINT §3, M−1): prove the narrow llama.cpp/ggml FFI can support shard-style
-execution before any transport/recovery code is written. DoD: a prompt applied through
-shard A → shard B produces final logits matching unsplit llama.cpp on the same CPU backend
-within **1e‑3 max‑abs**; KV truncate+replay reproduces them; a one-page findings note records
-any FFI-boundary changes needed. See [`spike/README.md`](spike/README.md).
+- **Rust** (stable ≥ 1.80) — `cargo test --workspace`
+- **flatc** (FlatBuffers compiler, ≥ 25.x) — only to regenerate `hydra-proto` (`scripts/gen-proto.sh`); generated code is committed
+- **CMake ≥ 3.20 + a C/C++ toolchain** — only for the M−1 `spike/` (llama.cpp)
+- **JDK + `tla2tools.jar`** — only to run the `verification/` TLC gate (`tla2tools.jar` is not committed; fetch from the tlaplus GitHub release)
+
+## Clone
+
+The compute engine is a **pinned git submodule**, so after cloning:
+
+```sh
+git clone https://github.com/PavanManchikatla/Hydra.git
+cd Hydra
+git submodule update --init      # fetch vendor/llama.cpp at the pinned commit
+cargo test --workspace
+```
+
+## Status
+
+Package **v0.10.2**. Gates passed: **M−1** (engine feasibility) ✅ · **M0** (protocol types) ✅.
+**M1** (state machines + deterministic simulation) in progress. See
+[`PROJECT_STATE.md`](PROJECT_STATE.md) for the live picture.
+
+## License
+
+MIT (matching the vendored llama.cpp/ggml). See individual crate manifests.

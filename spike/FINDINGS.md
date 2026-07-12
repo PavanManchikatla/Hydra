@@ -40,6 +40,9 @@ same backend**:
 | KV truncate+replay | exact |
 | FP16 boundary payload cost | 0.003–0.014 max-abs on logits (lower than CPU's 0.03–0.06), argmax stable, top-10 = 10/10 |
 
+The FP16 boundary cost is **~4× lower on Metal than CPU** (0.003–0.014 vs 0.03–0.06) — an
+accumulation-order artifact of Metal's kernels, not a correctness signal; **no action**.
+
 Satisfies the ruling: split-vs-unsplit **on Metal** agree within 1e‑3 (in fact 0.0). Note this is
 *same-backend* agreement; **Metal-vs-CPU** token drift (different kernels) is a separate,
 expected I8 effect and is deferred to the M2(b) golden-token tests — which, per the v0.10.2

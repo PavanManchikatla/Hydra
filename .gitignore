@@ -5,26 +5,25 @@ Cargo.lock.bak
 
 # llama.cpp build artifacts (source is a pinned submodule)
 /vendor/llama.cpp/build
-
 # Spike build artifacts
 /spike/build
-
 # Models (downloaded, not committed)
 /models
 *.gguf
-
 # TLA+ / TLC
 *.toolbox
 states/
 *.st
 MC.out
-
 # OS / editor
 .DS_Store
 *.swp
-
 # TLC gate: downloaded tools, raw run output, metadirs
 /verification/tools/
 /verification/results/
 /verification/states/
 /verification/*.old
+# Publish-audit hardening (directive): generic build dirs, jars, models
+**/build/
+*.jar
+/models/
