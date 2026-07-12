@@ -44,6 +44,16 @@ pub fn check_stage(s: &Stage) -> Vec<Violation> {
             ),
         });
     }
+    // **CaseBPure (I11 + I23):** BEGIN_RECOVERY Case B is a *pure replay* — it must never see a
+    // stage advanced past `truncate_to`. Legitimate post-catch-up advancement is handled by
+    // RESET_RECOVERY_ATTEMPT, which truncates. Mut2's label-only reset leaves the stage advanced,
+    // tripping this on the next Case-B replay.
+    if s.caseb_violated() {
+        v.push(Violation {
+            invariant: "CaseBPure",
+            detail: "Case B replay saw applied > truncate_to (RESET failed to truncate)".into(),
+        });
+    }
     v
 }
 
