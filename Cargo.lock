@@ -138,6 +138,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-engine-sys"
+version = "0.10.2"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "hydra-proto"
 version = "0.10.2"
 dependencies = [

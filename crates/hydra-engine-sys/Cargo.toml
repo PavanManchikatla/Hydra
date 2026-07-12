@@ -1,0 +1,17 @@
+[package]
+name = "hydra-engine-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Narrow C ABI FFI to the vendored (patched) llama.cpp/ggml — the ONLY place unsafe/C touches Hydra. Computes shard layer-ranges; holds no protocol state (BLUEPRINT §1.4)."
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+
+# The bit-exact smoke test loads a real GGUF (git-ignored) and links the vendored llama.cpp
+# build tree; both are dev-environment artifacts (see build.rs + lib.rs docs). The test skips
+# cleanly when the model is absent.

@@ -6,6 +6,7 @@ members = [
     "crates/hydra-transport",
     "crates/hydra-state",
     "crates/hydra-sim",
+    "crates/hydra-engine-sys",
 ]
 
 [workspace.package]
