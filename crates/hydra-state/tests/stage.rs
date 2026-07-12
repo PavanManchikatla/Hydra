@@ -6,9 +6,13 @@ use hydra_state::stage::{StageEffect, StageEvent::*, StageState};
 use hydra_state::{ActivationKind, ActivationTuple, Stage};
 
 fn tuple(attempt: u32) -> ActivationTuple {
+    tuple_at(0, attempt)
+}
+
+fn tuple_at(epoch: u32, attempt: u32) -> ActivationTuple {
     ActivationTuple {
         kind: ActivationKind::Recovery,
-        epoch: 0,
+        epoch,
         recovery_id: 0,
         attempt,
         sampler_checkpoint_id: 1,
@@ -49,6 +53,24 @@ fn abort_returns_to_frozen_ready() {
     step_ok(&mut s, RecvAbort { attempt: 1 });
     assert_eq!(s.state(), StageState::FrozenReady);
     assert_eq!(s.highest_attempt(), 1, "fence floor persists across abort");
+}
+
+// Mixed-epoch retransmit (F1): a straggler COMMIT_ACTIVATION from a *previous epoch* must be
+// rejected by fence-tuple epoch matching (spec §4 / I4-F1), independent of attempt fencing (F2).
+// This is the epoch-level companion to `stale_attempt_is_fenced` (which covers F2).
+#[test]
+fn mixed_epoch_commit_is_rejected_by_f1() {
+    // A stage that has advanced to epoch 1 (e.g. after a recovery to target epoch 1).
+    let mut s = Stage::frozen_ready(0, 1, 0);
+    // A delayed COMMIT for epoch 0 (a mixed-epoch retransmit) must be a no-op — not applied.
+    let e = step_ok(&mut s, RecvCommit { tuple: tuple(1) }); // tuple() is epoch 0
+    assert!(e.is_empty(), "a COMMIT for the wrong epoch produces no ack (F1 reject)");
+    assert_eq!(s.state(), StageState::FrozenReady, "stage does not act on a mixed-epoch message");
+    assert_eq!(s.epoch(), 1, "stage stays at its own epoch");
+    // the matching-epoch COMMIT is accepted normally, proving the reject was epoch-specific
+    let e = step_ok(&mut s, RecvCommit { tuple: tuple_at(1, 1) });
+    assert_eq!(s.state(), StageState::Preactive);
+    assert!(matches!(e[0], StageEffect::Committed { epoch: 1, .. }));
 }
 
 // ---- F2 attempt fencing (default build) ----

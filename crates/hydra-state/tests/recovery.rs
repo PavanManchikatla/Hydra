@@ -42,8 +42,24 @@ fn case_b_pure_replay_ok_when_within_truncate() {
     assert!(!s.caseb_violated());
 }
 
-// The named "reset-after-catch-up" DST scenario: a survivor advanced past truncate_to by
-// catch-up must be RESET (truncated) before a Case-B replay, or Case B fatally trips.
+// ================= TLC-trace replay: Mut2 (gate evidence (d)) =================
+// TLC counterexample: `verification/smoke/Mut2-CaseBPure.cfg`, 8-state trace (`CaseBPure`
+// violated). Event-sequence fidelity replay of the stage-side portion — the impl `Stage` is
+// driven through the mapped ordered sequence; the faithful build (RESET truncates) and the Mut2
+// build (label-only reset) walk the identical sequence to opposite outcomes. The pivotal spot
+// assertion is `applied` after the RESET (truncated=1 faithful vs advanced=3 Mut2).
+//
+//   TLC state : action              -> impl event (stage-side realization)
+//   S2        : CoordResetAttempt    -> (coordinator orchestration; the RESET the stage sees at S7)
+//   S3–S4     : CoordCrash/Restart   -> (coordinator restart; not stage-visible)
+//   S5        : SendBeginRecovery    -> (coordinator emits BEGIN_RECOVERY; the stage sees it at S8)
+//   S6        : StageRebuildStep     -> RebuildStep{goal:3}  (catch up applied past truncate_to)
+//   S7        : StageRecvResetAt      -> RecvReset{…,truncate_to:1}
+//               faithful: applied 3 -> 1 (truncates) | Mut2: applied stays 3 (label-only)
+//   S8        : StageRecvBeginAt      -> RecvBegin Case B{truncate_to:1}
+//               => Mut2: `CaseBPure` violated at the mapped step S8 (applied 3 > truncate_to 1).
+
+// Faithful build (RESET truncates): the identical sequence completes clean — the replay's dual.
 #[cfg(not(feature = "mutation_label_reset"))]
 #[test]
 fn reset_after_catch_up_truncates_then_case_b_ok() {

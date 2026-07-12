@@ -10,8 +10,31 @@ fn sid() -> SessionId {
     SessionId([1u8; 16])
 }
 
+// ================= TLC-trace replay: Mut1 (gate evidence (d)) =================
+// TLC counterexample: `Mut1Unservable.cfg`, 18-state stuttering lasso (`PostDecisionLoss`/Progress
+// liveness violated — a LOST participant after the durable decision, no supersession under
+// EnableUnservable=FALSE, so Progress is never restored). Event-sequence fidelity replay of the
+// defect-bearing tail; the early recovery setup (S2–S9) is orchestration the coordinator
+// transition core abstracts as its Reconstructing→ReadyAll edge (`StagesReconstructed`), so it is
+// documented-as-abstracted rather than driven. The impl checks the lasso via the
+// `post_decision_deadlock()` watchdog (liveness is not modeled directly): the faithful build
+// (supersession available) escapes it; the Mut1 build wedges in it — the stuttering lasso.
+//
+//   TLC state : action                        -> impl event(s)
+//   S2–S9     : StageCrash/Rejoin/ResetAt/     -> (recovery orchestration; abstracted as
+//               RebuildStep×4                       `StagesReconstructed` in the transition core)
+//   S10       : CoordWriteIntent               -> ProceedWriteIntent ; WalDurable(Intent)
+//   S11       : CoordSendCommit                -> ProceedSendCommit
+//   S12,S14   : StageRecvCommitAt ×2           -> StageCommitted{rank:0} ; StageCommitted{rank:1}
+//   S15       : CoordWriteComplete             -> ProceedWriteComplete ; WalDurable(Complete)  (decision durable)
+//   S16       : CoordSendFinalize              -> ProceedSendFinalize
+//   S17       : StageRecvFinalizeAt            -> StageFinalized{rank:0}   (one stage finalizes)
+//   S13       : StageCrash (post-commit loss)  -> StageLost{rank:1}        (the other is lost)
+//   S18       : Stuttering (no Progress)       -> post_decision_deadlock(): faithful=false, Mut1=true
+
 /// Drive a 2-stage session to `Finalizing` with the durable decision made, stage 0 finalized,
-/// and stage 1 permanently lost (the post-decision-loss state).
+/// and stage 1 permanently lost (the post-decision-loss state) — the mapped tail (S10–S17,S13) of
+/// the Mut1 lasso above.
 fn drive_to_post_decision_loss() -> Coordinator {
     let mut c = Coordinator::new_initial(sid(), 2, 1);
     c.step(StagesReconstructed);
