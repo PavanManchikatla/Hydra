@@ -19,7 +19,7 @@
 | Invariants checked per step | coordinator (`invariants::check`) + **every** real stage (`invariants::check_stage`) + I22 deadlock watchdog | `crates/hydra-sim/src/lib.rs::World::step` |
 | Durability path | through the **real `hydra-wal` codec** (virtual disk; torn-write on crash; real partial-tail-discard scanner on restart), cross-checked vs. the coordinator's durable WAL every restart | `crates/hydra-sim/src/wal_disk.rs`; F-UNSERVABLE found here (§7.10) |
 | Reproducibility | every failure prints `(seed, schedule)`; SplitMix64, no wall-clock/OS randomness | `crates/hydra-sim/src/rng.rs`, `Failure` |
-| **CI home (10M DoD, dispatch+weekly)** | `.github/workflows/marathon.yml` `long` job — ≥1,000 seeds × ≥10,000 steps × {2,3} stages; exits non-zero on any violation | **PENDING first dispatch** (workflow added this commit); run URL to be recorded on dispatch |
+| **CI DoD run** | **1,000 seeds × 10,000 steps = 10,000,000 steps × {2,3} stages → 0 violations** | ✅ **GREEN** — `marathon.yml` `long`, run [29182450338](https://github.com/PavanManchikatla/Hydra/actions/runs/29182450338) (both `long (2)` and `long (3)` success); smoke green run [29182414676](https://github.com/PavanManchikatla/Hydra/actions/runs/29182414676) |
 
 ## (b) Per-mutation parity — caught, median steps-to-detection, seeds
 
@@ -121,11 +121,11 @@ Each invariant → the executable check (function / test), or an explicit deferr
 
 | Criterion | State |
 |---|---|
-| (a) randomized 10M+/≥1000 seeds, 0 violations | ✅ local; CI home added (`marathon.yml`), first dispatch pending |
+| (a) randomized 10M+/≥1000 seeds, 0 violations | ✅ **CI green** (run 29182450338, 10M × {2,3} stages) + local |
 | (b) all 4 mutation parities caught | ✅ 200/200 each |
 | (c) directed scenarios | ✅ except I24 (→M3) and SAMPLE_NEXT retention (→M2), both deferred-with-owed-item |
 | (d) 4 TLC-trace replays | ✅ 4/4, event-sequence fidelity |
 | (e) TLC six configs | ✅ 4/6 conclusive; ⏳ baseline-safety fixpoint + Mut3 still running in CI |
 | (f) I1–I25 coverage map | ✅ complete; no unmapped invariant |
 
-**Outstanding before a fully-green gate:** (e) baseline-safety fixpoint + Mut3 firing (CI-owned, running) and the `-recover` checkpoint round-trip; (a) first dispatch of the CI marathon. These are CI-execution items, not code gaps. **Paused here for the owner's M1 gate decision.**
+**Outstanding before a fully-green gate:** only (e) — baseline-safety fixpoint + Mut3 firing (CI-owned, still running, run 29179427311) and the `-recover` checkpoint round-trip. These are CI-execution items, not code gaps. Every code-side criterion (a)–(d), (f) is green. **Paused here for the owner's M1 gate decision.**
