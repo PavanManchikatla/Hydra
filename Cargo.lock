@@ -385,9 +385,11 @@ version = "0.10.2"
 dependencies = [
  "blake3",
  "flatbuffers",
+ "hydra-coordinator",
  "hydra-engine-sys",
  "hydra-proto",
  "hydra-state",
+ "hydra-tokenizer",
  "hydra-transport",
  "rustls",
  "thiserror",
