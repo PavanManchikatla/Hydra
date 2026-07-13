@@ -15,7 +15,10 @@ pub mod tls;
 
 pub use framed::Conn;
 pub use tcp_mtls::TcpMtls;
-pub use tls::ClusterCa;
+pub use tls::{client_config_with_ca, server_config_with_ca, ClusterCa, DeviceIdentity};
+
+/// Re-exported so downstream crates can build cert values without pinning `rustls-pki-types`.
+pub use rustls_pki_types::CertificateDer;
 
 use hydra_proto::framing::{FrameError, FrameHeader};
 

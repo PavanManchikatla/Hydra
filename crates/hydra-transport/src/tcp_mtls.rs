@@ -29,7 +29,15 @@ impl TcpMtlsListener {
         ca: &ClusterCa,
         id: &DeviceIdentity,
     ) -> Result<Self, TransportError> {
-        let cfg = ca.server_config(id)?;
+        Self::bind_with_config(addr, ca.server_config(id)?).await
+    }
+
+    /// Bind from a prebuilt server config (e.g. a provisioned worker via
+    /// [`server_config_with_ca`](crate::tls::server_config_with_ca)).
+    pub async fn bind_with_config(
+        addr: SocketAddr,
+        cfg: rustls::ServerConfig,
+    ) -> Result<Self, TransportError> {
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
         let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener, acceptor })
@@ -55,7 +63,12 @@ pub struct TcpMtls {
 
 impl TcpMtls {
     pub fn new(ca: &ClusterCa, id: &DeviceIdentity) -> Result<Self, TransportError> {
-        let cfg = ca.client_config(id)?;
+        Self::from_config(ca.client_config(id)?)
+    }
+
+    /// Build from a prebuilt client config (e.g. a provisioned worker/coordinator via
+    /// [`client_config_with_ca`](crate::tls::client_config_with_ca)).
+    pub fn from_config(cfg: rustls::ClientConfig) -> Result<Self, TransportError> {
         Ok(Self { connector: TlsConnector::from(Arc::new(cfg)) })
     }
 

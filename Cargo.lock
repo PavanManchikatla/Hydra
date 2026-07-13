@@ -194,6 +194,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-worker"
+version = "0.10.2"
+dependencies = [
+ "blake3",
+ "flatbuffers",
+ "hydra-engine-sys",
+ "hydra-proto",
+ "hydra-state",
+ "hydra-transport",
+ "rustls",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

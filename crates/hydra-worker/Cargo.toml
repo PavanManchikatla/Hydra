@@ -1,0 +1,25 @@
+[package]
+name = "hydra-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hydra stage worker: a thin effect executor. recv -> verify_frame (F1 fence + hard limits pre-alloc) -> decode -> the real hydra-state stage-session SM .step() -> execute effects (engine via hydra-engine-sys, acks) -> send. No parallel 'simple' path; the DST-tested SM is the one that runs (BLUEPRINT M2)."
+
+[[bin]]
+name = "hydra-worker"
+path = "src/bin/hydra-worker.rs"
+
+[dependencies]
+hydra-proto = { path = "../hydra-proto" }
+hydra-state = { path = "../hydra-state" }
+hydra-transport = { path = "../hydra-transport" }
+hydra-engine-sys = { path = "../hydra-engine-sys" }
+flatbuffers.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

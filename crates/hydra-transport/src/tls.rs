@@ -41,6 +41,61 @@ impl DeviceIdentity {
     fn key(&self) -> PrivateKeyDer<'static> {
         self.key_der.clone_key()
     }
+
+    /// Rebuild an identity from **provisioned DER** — the shape a worker gets in the field (its
+    /// signed cert chain `[leaf, ca]` + PKCS#8 key), never the CA's private key. Pairs with
+    /// [`server_config_with_ca`] / [`client_config_with_ca`], which trust a CA by its cert alone.
+    pub fn from_der(
+        name: impl Into<String>,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key_pkcs8_der: Vec<u8>,
+    ) -> Self {
+        DeviceIdentity {
+            name: name.into(),
+            cert_chain,
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8_der)),
+        }
+    }
+
+    /// The PKCS#8 private-key DER (for provisioning a worker; keep it secret).
+    pub fn key_pkcs8_der(&self) -> Vec<u8> {
+        match &self.key_der {
+            PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
+            other => other.secret_der().to_vec(),
+        }
+    }
+}
+
+fn roots_from(ca_cert: &CertificateDer<'static>) -> Result<RootCertStore, TransportError> {
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_cert.clone())?;
+    Ok(roots)
+}
+
+/// Server config trusting `ca_cert` as the client-auth anchor and presenting `id`'s chain —
+/// built from a CA **certificate only** (no CA key), the way a provisioned worker runs.
+pub fn server_config_with_ca(
+    ca_cert: &CertificateDer<'static>,
+    id: &DeviceIdentity,
+) -> Result<ServerConfig, TransportError> {
+    ensure_provider();
+    let roots = Arc::new(roots_from(ca_cert)?);
+    let verifier = WebPkiClientVerifier::builder(roots).build().map_err(cert_err)?;
+    Ok(ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(id.cert_chain.clone(), id.key())?)
+}
+
+/// Client config trusting `ca_cert` for the server cert and presenting `id`'s chain for mTLS —
+/// built from a CA **certificate only** (no CA key).
+pub fn client_config_with_ca(
+    ca_cert: &CertificateDer<'static>,
+    id: &DeviceIdentity,
+) -> Result<ClientConfig, TransportError> {
+    ensure_provider();
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots_from(ca_cert)?)
+        .with_client_auth_cert(id.cert_chain.clone(), id.key())?)
 }
 
 /// The cluster certificate authority created at pairing.
