@@ -1,0 +1,12 @@
+[package]
+name = "hydra-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Coordinator-side tokenizer + incremental UTF-8-safe detokenizer. Tokenization is delegated to llama.cpp via hydra-engine-sys (the engine that computes is the engine that tokenizes); the detokenizer buffers to UTF-8 boundaries (I6). Admission hashes per INITIAL_COMMIT (spec §2.6a)."
+
+[dependencies]
+hydra-engine-sys = { path = "../hydra-engine-sys" }
+blake3.workspace = true
+thiserror.workspace = true

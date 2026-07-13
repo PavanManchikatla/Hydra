@@ -40,6 +40,10 @@ typedef struct {
 
 /* Load the full GGUF. n_gpu_layers: 0 = CPU (the deterministic DoD backend), 99 = all on GPU. */
 HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers);
+/* Load ONLY the tokenizer/vocab (no weights) — the low-memory path for coordinator-side
+ * tokenization (the engine that computes is the engine that tokenizes). Contexts cannot be made
+ * from a vocab-only model. */
+HydraModel* hydra_model_load_vocab_only(const char* path);
 void        hydra_model_free(HydraModel* m);
 HydraModelInfo hydra_model_info(const HydraModel* m);
 
@@ -47,6 +51,17 @@ HydraModelInfo hydra_model_info(const HydraModel* m);
  * `out`; returns the token count, or the NEGATED required count if `cap` was too small. */
 int32_t hydra_tokenize(const HydraModel* m, const char* text, int32_t text_len,
                        int32_t* out, int32_t cap);
+
+/* Tokenize with explicit control over BOS/EOS (`add_special`) and special-token parsing
+ * (`parse_special`). Same return convention as `hydra_tokenize`. */
+int32_t hydra_tokenize_ex(const HydraModel* m, const char* text, int32_t text_len,
+                          int32_t add_special, int32_t parse_special, int32_t* out, int32_t cap);
+
+/* Render token `token` to its raw display bytes (llama_token_to_piece; `special`=0 => special
+ * tokens render empty). Writes up to `cap` bytes into `out`; returns the byte count, or the
+ * NEGATED required count if `cap` was too small. */
+int32_t hydra_token_to_piece(const HydraModel* m, int32_t token, int32_t special,
+                             uint8_t* out, int32_t cap);
 
 /* New context windowed to layers [l0, l1) (l1 == -1 => to the last layer). embeddings != 0 makes
  * a boundary-emitting context (extract the residual leaving l1-1); 0 makes a logits context. */

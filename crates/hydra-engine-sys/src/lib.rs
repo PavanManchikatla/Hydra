@@ -59,13 +59,23 @@ mod ffi {
     }
     extern "C" {
         pub fn hydra_model_load(path: *const c_char, n_gpu_layers: i32) -> *mut HydraModel;
+        pub fn hydra_model_load_vocab_only(path: *const c_char) -> *mut HydraModel;
         pub fn hydra_model_free(m: *mut HydraModel);
         pub fn hydra_model_info(m: *const HydraModel) -> HydraModelInfo;
-        pub fn hydra_tokenize(
+        pub fn hydra_tokenize_ex(
             m: *const HydraModel,
             text: *const c_char,
             text_len: i32,
+            add_special: i32,
+            parse_special: i32,
             out: *mut i32,
+            cap: i32,
+        ) -> i32;
+        pub fn hydra_token_to_piece(
+            m: *const HydraModel,
+            token: i32,
+            special: i32,
+            out: *mut u8,
             cap: i32,
         ) -> i32;
         pub fn hydra_context_new(
@@ -116,6 +126,18 @@ mod imp {
         pub fn load(path: &str, n_gpu_layers: i32) -> Result<Model, EngineError> {
             let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path has NUL" })?;
             let raw = unsafe { ffi::hydra_model_load(c.as_ptr(), n_gpu_layers) };
+            Self::wrap(raw)
+        }
+
+        /// Load only the tokenizer/vocab (no weights) — the low-memory coordinator path. Contexts
+        /// cannot be created from a vocab-only model (tokenize/detokenize only).
+        pub fn load_vocab_only(path: &str) -> Result<Model, EngineError> {
+            let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path has NUL" })?;
+            let raw = unsafe { ffi::hydra_model_load_vocab_only(c.as_ptr()) };
+            Self::wrap(raw)
+        }
+
+        fn wrap(raw: *mut ffi::HydraModel) -> Result<Model, EngineError> {
             if raw.is_null() {
                 return Err(EngineError { code: 2, what: "model load failed" });
             }
@@ -133,22 +155,45 @@ mod imp {
             self.n_vocab
         }
 
+        /// Tokenize with BOS + special-token parsing (the default session path).
         pub fn tokenize(&self, text: &str) -> Result<Vec<i32>, EngineError> {
+            self.tokenize_ex(text, true, true)
+        }
+
+        /// Tokenize with explicit `add_special` (BOS/EOS) and `parse_special` control.
+        pub fn tokenize_ex(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>, EngineError> {
             let bytes = text.as_bytes();
-            // First probe for the required length, then fill.
+            let (add, parse) = (add_special as i32, parse_special as i32);
             let need = unsafe {
-                ffi::hydra_tokenize(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, std::ptr::null_mut(), 0)
+                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, add, parse, std::ptr::null_mut(), 0)
             };
             let cap = if need < 0 { -need } else { need };
-            if cap <= 0 {
+            if cap < 0 {
                 return Err(EngineError { code: 4, what: "tokenize failed" });
             }
             let mut out = vec![0i32; cap as usize];
             let got = unsafe {
-                ffi::hydra_tokenize(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, out.as_mut_ptr(), cap)
+                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, add, parse, out.as_mut_ptr(), cap)
             };
             if got < 0 {
                 return Err(EngineError { code: 4, what: "tokenize failed" });
+            }
+            out.truncate(got as usize);
+            Ok(out)
+        }
+
+        /// Render one token to its raw display bytes (`special=false` renders special tokens empty).
+        /// The detokenizer substrate: pieces are **bytes**, not strings (I6 UTF-8 safety).
+        pub fn token_to_piece(&self, token: i32, special: bool) -> Result<Vec<u8>, EngineError> {
+            let need = unsafe { ffi::hydra_token_to_piece(self.raw, token, special as i32, std::ptr::null_mut(), 0) };
+            let cap = if need < 0 { -need } else { need };
+            if cap < 0 {
+                return Err(EngineError { code: 4, what: "token_to_piece failed" });
+            }
+            let mut out = vec![0u8; cap as usize];
+            let got = unsafe { ffi::hydra_token_to_piece(self.raw, token, special as i32, out.as_mut_ptr(), cap) };
+            if got < 0 {
+                return Err(EngineError { code: 4, what: "token_to_piece failed" });
             }
             out.truncate(got as usize);
             Ok(out)
@@ -279,6 +324,9 @@ mod imp {
         pub fn load(_path: &str, _n_gpu_layers: i32) -> Result<Model, EngineError> {
             Err(EngineError::unavailable())
         }
+        pub fn load_vocab_only(_path: &str) -> Result<Model, EngineError> {
+            Err(EngineError::unavailable())
+        }
         pub fn n_layer(&self) -> i32 {
             0
         }
@@ -289,6 +337,12 @@ mod imp {
             0
         }
         pub fn tokenize(&self, _text: &str) -> Result<Vec<i32>, EngineError> {
+            Err(EngineError::unavailable())
+        }
+        pub fn tokenize_ex(&self, _text: &str, _add_special: bool, _parse_special: bool) -> Result<Vec<i32>, EngineError> {
+            Err(EngineError::unavailable())
+        }
+        pub fn token_to_piece(&self, _token: i32, _special: bool) -> Result<Vec<u8>, EngineError> {
             Err(EngineError::unavailable())
         }
         pub fn context(

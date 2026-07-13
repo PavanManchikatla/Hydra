@@ -43,6 +43,22 @@ HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers) {
     return h;
 }
 
+HydraModel* hydra_model_load_vocab_only(const char* path) {
+    if (!path) return nullptr;
+    if (!g_backends_loaded) { ggml_backend_load_all(); g_backends_loaded = true; }
+    llama_model_params mp = llama_model_default_params();
+    mp.vocab_only = true;
+    llama_model* model = llama_model_load_from_file(path, mp);
+    if (!model) return nullptr;
+    auto* h = new HydraModel();
+    h->model   = model;
+    h->vocab   = llama_model_get_vocab(model);
+    h->n_layer = llama_model_n_layer(model);
+    h->n_embd  = llama_model_n_embd(model);
+    h->n_vocab = llama_vocab_n_tokens(h->vocab);
+    return h;
+}
+
 void hydra_model_free(HydraModel* m) {
     if (!m) return;
     if (m->model) llama_model_free(m->model);
@@ -62,6 +78,28 @@ int32_t hydra_tokenize(const HydraModel* m, const char* text, int32_t text_len,
     if (need < 0) return -HYDRA_E_TOKENIZE;
     if (!out || cap < need) return -need; // caller resizes and retries
     int32_t got = llama_tokenize(m->vocab, text, text_len, out, cap, true, true);
+    if (got < 0) return -HYDRA_E_TOKENIZE;
+    return got;
+}
+
+int32_t hydra_tokenize_ex(const HydraModel* m, const char* text, int32_t text_len,
+                          int32_t add_special, int32_t parse_special, int32_t* out, int32_t cap) {
+    if (!m || !text) return -HYDRA_E_NULL;
+    int32_t need = -llama_tokenize(m->vocab, text, text_len, nullptr, 0, add_special != 0, parse_special != 0);
+    if (need < 0) return -HYDRA_E_TOKENIZE;
+    if (!out || cap < need) return -need;
+    int32_t got = llama_tokenize(m->vocab, text, text_len, out, cap, add_special != 0, parse_special != 0);
+    if (got < 0) return -HYDRA_E_TOKENIZE;
+    return got;
+}
+
+int32_t hydra_token_to_piece(const HydraModel* m, int32_t token, int32_t special,
+                             uint8_t* out, int32_t cap) {
+    if (!m) return -HYDRA_E_NULL;
+    int32_t need = -llama_token_to_piece(m->vocab, token, nullptr, 0, /*lstrip=*/0, special != 0);
+    if (need < 0) return -HYDRA_E_TOKENIZE;
+    if (!out || cap < need) return -need;
+    int32_t got = llama_token_to_piece(m->vocab, token, (char*) out, cap, 0, special != 0);
     if (got < 0) return -HYDRA_E_TOKENIZE;
     return got;
 }

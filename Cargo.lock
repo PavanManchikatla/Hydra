@@ -170,6 +170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-tokenizer"
+version = "0.10.2"
+dependencies = [
+ "blake3",
+ "hydra-engine-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "hydra-transport"
 version = "0.10.2"
 dependencies = [
