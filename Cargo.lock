@@ -138,6 +138,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-coordinator"
+version = "0.10.2"
+dependencies = [
+ "blake3",
+ "flatbuffers",
+ "hydra-proto",
+ "hydra-state",
+ "hydra-tokenizer",
+ "hydra-wal",
+ "thiserror",
+]
+
+[[package]]
 name = "hydra-engine-sys"
 version = "0.10.2"
 dependencies = [

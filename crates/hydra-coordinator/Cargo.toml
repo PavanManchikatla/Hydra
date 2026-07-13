@@ -1,0 +1,18 @@
+[package]
+name = "hydra-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The coordinator: durable commit stream (hydra-wal on a real disk file), token ledger, group commit (spec §3), and (later sub-slices) the OpenAI/SSE surface + D1 recovery orchestration. Emit-after-commit governs everything."
+
+[dependencies]
+hydra-proto = { path = "../hydra-proto" }
+hydra-wal = { path = "../hydra-wal" }
+hydra-state = { path = "../hydra-state" }
+hydra-tokenizer = { path = "../hydra-tokenizer" }
+flatbuffers.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

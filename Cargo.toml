@@ -9,6 +9,7 @@ members = [
     "crates/hydra-engine-sys",
     "crates/hydra-worker",
     "crates/hydra-tokenizer",
+    "crates/hydra-coordinator",
 ]
 
 [workspace.package]
