@@ -75,7 +75,7 @@ CI run [29179427311](https://github.com/PavanManchikatla/Hydra/actions/runs/2917
 | Config | Expect | Status |
 |---|---|---|
 | `BaselineSafety.cfg` | clean → fixpoint | ⏳ **PENDING** (CI `long`, running; deepest prior local 26.6M distinct / depth 143, 0 violations, no fixpoint) |
-| `BaselineLiveness.cfg` | clean | ✅ **GREEN** (CI, run 29179427311) |
+| `BaselineLiveness.cfg` | clean | ⚠️ **NOT clean — `Progress` violated (fairness artifact, F-LIVENESS-FAIR, §7.13).** Correction: earlier "GREEN" was a **misread** of the job's `success` status (which only meant the classify step did not hard-fail); both runs (29179427311, 29206917524) show `Error: Temporal properties were violated` — a `CoordAbortActivation` lasso that satisfies every `WF_` yet aborts forever. Analysis: fairness-spec incompleteness (completion path needs SF, not WF), the documented §6 "masquerades-as-liveness-bug" class — **not** a protocol defect. **Escalated; paused for owner ratification of the fairness fix (I do not touch the model).** |
 | `Mut1Unservable.cfg` | violation | ✅ **FIRED** — PostDecisionLoss, 18-state lasso (CI) |
 | `Mut2Reset.cfg` (CaseBPure) | violation | ✅ **FIRED** — 8-state (smoke, local + CI) |
 | `Mut3AttemptFence.cfg` | violation | ⏳ **PENDING** (CI `long`, running; expected ServiceSafety/TupleSafety via stale INITIAL attempt) |
@@ -128,7 +128,7 @@ Each invariant → the executable check (function / test), or an explicit deferr
 | (b) all mutation parities caught | ✅ **5/5 at 200/200** (Mut1–Mut4 + Mut5 F-UNSERVABLE monotone-mutation) |
 | (c) directed scenarios | ✅ except I24 (→M3) and SAMPLE_NEXT retention (→M2), both deferred-with-owed-item |
 | (d) 4 TLC-trace replays | ✅ 4/4, event-sequence fidelity |
-| (e) TLC six configs | ✅ 4/6 conclusive; ⏳ baseline-safety fixpoint + Mut3 still running in CI |
+| (e) TLC six configs | ⚠️ **REVISED (correction):** BaselineLiveness is **NOT** clean — `Progress` fairness artifact (F-LIVENESS-FAIR §7.13), escalated + paused for ratification. Mut1/Mut2/Mut4 conclusive-good; baseline-safety fixpoint + Mut3 pending (CI, `-recover` chain now working) |
 | (f) I1–I25 coverage map | ✅ complete; no unmapped invariant |
 
-**Outstanding before a fully-green gate:** only (e) — baseline-safety fixpoint + Mut3 firing (CI-owned, still running, run 29179427311) and the `-recover` checkpoint round-trip. These are CI-execution items, not code gaps. Every code-side criterion (a)–(d), (f) is green. **Paused here for the owner's M1 gate decision.**
+**Outstanding before a fully-green gate (corrected 2026-07-13):** (e) has three items, not two — **(1) F-LIVENESS-FAIR:** BaselineLiveness `Progress` is violated by a `CoordAbortActivation` fairness lasso (§7.13); analysis says fairness-spec incompleteness (SF vs WF on the completion path), the documented §6 artifact class, not a protocol defect — **escalated, paused for owner ratification of the fairness fix**; **(2)** baseline-safety fixpoint; **(3)** Mut3 fire/contingency + the `-recover` round-trip (the checkpoint-upload fix now works — checkpoints uploaded). Every **code-side** criterion (a)–(d), (f) is green and independently verified; (e) is the model layer. **The earlier "(e) 4/6 conclusive, baseline-live GREEN" was a misread and is corrected here.**
