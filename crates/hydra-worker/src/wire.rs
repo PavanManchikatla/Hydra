@@ -79,6 +79,10 @@ pub enum Msg {
     ActivationCommitAbort { aborted_attempt: AttemptId },
     BeginRecovery { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
     RecoveryAck { applied_input_pos: i64 },
+    /// `CATCH_UP_CONTEXT{goal}` — drive the stage's `RebuildStep` to `goal` (recovery catch-up).
+    CatchUpContext { goal_input_pos: i64 },
+    /// `CATCH_UP_READY{applied}` — the stage reached `FROZEN_READY` (catch-up complete).
+    CatchUpReady { applied_input_pos: i64 },
     // --- sampler plane (spec §2.6a/§2.6b, M2 slice 3) ---
     /// `SAMPLE_NEXT{output_pos, sampling_config_hash, expected_sampler_checkpoint_id}` (I14).
     SampleNext { output_pos: i64, sampling_config_hash: Vec<u8>, expected_sampler_checkpoint_id: u64 },
@@ -204,6 +208,14 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         Body::RecoveryAck => {
             let r = frame.body_as_recovery_ack().ok_or(WireError::Malformed("RecoveryAck".into()))?;
             Ok(Msg::RecoveryAck { applied_input_pos: r.applied_input_pos() })
+        }
+        Body::CatchUpContext => {
+            let c = frame.body_as_catch_up_context().ok_or(WireError::Malformed("CatchUpContext".into()))?;
+            Ok(Msg::CatchUpContext { goal_input_pos: c.goal_input_pos() })
+        }
+        Body::CatchUpReady => {
+            let c = frame.body_as_catch_up_ready().ok_or(WireError::Malformed("CatchUpReady".into()))?;
+            Ok(Msg::CatchUpReady { applied_input_pos: c.applied_input_pos() })
         }
         Body::SampleNext => {
             let s = frame.body_as_sample_next().ok_or(WireError::Malformed("SampleNext".into()))?;
@@ -476,6 +488,20 @@ pub fn encode_sampler_checkpoint_installed(keys: &SessionKeys, epoch: Epoch, che
         &proto::SamplerCheckpointInstalledArgs { checkpoint_id, resulting_state_digest: Some(dig), sampled_output_pos },
     );
     finish_frame(&mut fbb, fence, proto::Body::SamplerCheckpointInstalled, body.as_union_value())
+}
+
+pub fn encode_catch_up_context(keys: &SessionKeys, epoch: Epoch, recovery_id: RecoveryId, goal_input_pos: i64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let body = proto::CatchUpContext::create(&mut fbb, &proto::CatchUpContextArgs { goal_input_pos });
+    finish_frame(&mut fbb, fence, proto::Body::CatchUpContext, body.as_union_value())
+}
+
+pub fn encode_catch_up_ready(keys: &SessionKeys, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let body = proto::CatchUpReady::create(&mut fbb, &proto::CatchUpReadyArgs { applied_input_pos });
+    finish_frame(&mut fbb, fence, proto::Body::CatchUpReady, body.as_union_value())
 }
 
 pub fn encode_error(keys: &SessionKeys, epoch: Epoch, attempt: AttemptId, code: u16) -> Vec<u8> {

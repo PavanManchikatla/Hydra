@@ -67,6 +67,10 @@ pub struct WorkerConfig {
     /// The session sampling config — set on the **final** stage (S_P) to enable the sampler
     /// (spec §2.6b). `None` on non-final stages and for the teacher-forced-only anchor.
     pub sampler_config: Option<SamplingConfig>,
+    /// A **recovery-replacement** worker starts its stage `FROZEN` (not `FROZEN_READY`) so it can
+    /// accept `BEGIN_RECOVERY` **Case A** through the real stage SM (spec §6.2/§6.5). Default `false`
+    /// (a fresh session's worker is `FROZEN_READY`).
+    pub recovery_start: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,7 +169,12 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(cfg: WorkerConfig) -> Result<Worker, WorkerError> {
-        let stage = Stage::frozen_ready(cfg.rank, cfg.epoch, cfg.recovery_id);
+        // Recovery replacement → FROZEN (accepts BEGIN_RECOVERY Case A); fresh → FROZEN_READY.
+        let stage = if cfg.recovery_start {
+            Stage::frozen(cfg.rank, cfg.epoch, cfg.recovery_id, 0)
+        } else {
+            Stage::frozen_ready(cfg.rank, cfg.epoch, cfg.recovery_id)
+        };
         let engine = Engine::try_new(&cfg)?;
         // The sampler lives only on S_P (the final stage) and only when a config is provided.
         let sampler = if cfg.is_final {
@@ -223,15 +232,37 @@ impl Worker {
             Msg::BeginRecovery { base, target, recovery_id, truncate_to } => {
                 Ok(self.step_control(StageEvent::RecvBegin { base, target, recovery_id, truncate_to }))
             }
+            Msg::CatchUpContext { goal_input_pos } => Ok(self.catch_up(goal_input_pos)),
             // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them.
             Msg::ActivationCommitted(_)
             | Msg::ActivationFinalized
             | Msg::RecoveryAck { .. }
+            | Msg::CatchUpReady { .. }
             | Msg::AppliedAck { .. }
             | Msg::Sampled { .. }
             | Msg::SamplerCheckpointInstalled { .. }
             | Msg::Err { .. } => Ok(vec![]),
         }
+    }
+
+    /// Drive the **real stage SM** through catch-up: step `RebuildStep{goal}` until it reaches
+    /// `FROZEN_READY` (or stalls), then emit `CATCH_UP_READY`. The engine KV is rebuilt separately by
+    /// the preceding `REBUILD_APPLY` (`APPLY_TOKEN` NO_SAMPLE) frames — this advances the SM's
+    /// control-plane frontier so activation can commit (spec §6.2). Bounded to `goal+2` steps so a
+    /// stuck SM cannot loop forever.
+    fn catch_up(&mut self, goal: i64) -> Vec<Vec<u8>> {
+        let mut ready: Option<Vec<u8>> = None;
+        for _ in 0..goal.max(0) + 2 {
+            for eff in self.stage.step(StageEvent::RebuildStep { goal }) {
+                if let StageEffect::Ready { recovery_id, applied, .. } = eff {
+                    ready = Some(wire::encode_catch_up_ready(&self.cfg.keys, self.stage.epoch(), recovery_id, applied));
+                }
+            }
+            if ready.is_some() {
+                break;
+            }
+        }
+        ready.into_iter().collect()
     }
 
     /// Final-stage apply tail: retain the position's logits (for a later `SAMPLE_NEXT`, I14) and

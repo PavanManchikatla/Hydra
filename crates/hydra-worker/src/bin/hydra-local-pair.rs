@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_gpu_layers: 0,
         n_ctx: tokens.len() as i32 + 8,
         sampler_config: None,
+        recovery_start: false,
     };
 
     let s1 = SubprocessWorker::spawn(&binary, &boot(&s1_id, base(0, 0, k, false, true)))?;

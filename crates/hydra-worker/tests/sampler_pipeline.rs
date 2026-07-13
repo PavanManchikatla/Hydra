@@ -37,11 +37,13 @@ fn spin_up(path: &str, n_layer: i32, n_ctx: i32, seed_byte: u8, sampler: Samplin
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(path.to_string()),
         n_gpu_layers: 0, n_ctx, sampler_config: None,
+        recovery_start: false,
     };
     let s2_cfg = WorkerConfig {
         keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(path.to_string()),
         n_gpu_layers: 0, n_ctx, sampler_config: Some(sampler),
+        recovery_start: false,
     };
     let s1_addr = hydra_worker::pair::spawn_endpoint(s1_cfg, cluster.ca.server_config(&s1_id).unwrap());
     let s2_addr = hydra_worker::pair::spawn_endpoint(s2_cfg, cluster.ca.server_config(&s2_id).unwrap());

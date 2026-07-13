@@ -74,6 +74,7 @@ impl Bootstrap {
         w.str(self.cfg.model_path.as_deref().unwrap_or(""));
         w.i32(self.cfg.n_gpu_layers);
         w.i32(self.cfg.n_ctx);
+        w.u32(self.cfg.recovery_start as u32);
         match &self.cfg.sampler_config {
             Some(s) => {
                 w.u32(1);
@@ -115,6 +116,7 @@ impl Bootstrap {
         let model_path = r.str()?;
         let n_gpu_layers = r.i32()?;
         let n_ctx = r.i32()?;
+        let recovery_start = r.u32()? != 0;
         let sampler_config = if r.u32()? != 0 {
             Some(SamplingConfig {
                 temperature: r.f32()?,
@@ -145,6 +147,7 @@ impl Bootstrap {
                 n_gpu_layers,
                 n_ctx,
                 sampler_config,
+                recovery_start,
             },
         })
     }
@@ -237,6 +240,7 @@ mod tests {
                 n_gpu_layers: 0,
                 n_ctx: 64,
                 sampler_config: Some(SamplingConfig { temperature: 0.7, top_p: 0.9, repeat_penalty: 1.1, penalty_last_n: 16, seed: 99 }),
+                recovery_start: false,
             },
         };
         let bytes = boot.encode();
