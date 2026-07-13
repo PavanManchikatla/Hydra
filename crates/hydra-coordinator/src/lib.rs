@@ -10,10 +10,12 @@
 
 pub mod commit_stream;
 pub mod event_log;
+pub mod recovery;
 pub mod server;
 pub mod session;
 
 pub use commit_stream::{CommitError, CommitStream, Durability, GroupBatch, GroupCommitter, WalFenceCtx};
 pub use event_log::{Event, EventLog};
+pub use recovery::{CommitStreamStats, RecoveryError, RecoveryState};
 pub use server::{router, AppState, GenFn};
 pub use session::{CommitOutcome, PieceSource, SampledToken, Session, TokenizerPieces};
