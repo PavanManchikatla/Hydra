@@ -10,10 +10,12 @@
 //! - [`wire`]   — `Frame` (fence + `Body` union) codec + the F1 fence check.
 //! - [`worker`] — [`Worker`] (`Stage` SM + engine) and the async serve loop.
 //!
-//! The `--local-pair` runner (two workers as real mTLS endpoints on localhost, with a kill/restart
-//! switch from day one) lands in sub-slice B.
+//! - [`pair`]   — the `--local-pair` runner: two workers as real mTLS endpoints on localhost, the
+//!   teacher-forced NO_SAMPLE bit-exact anchor, and a `kill -9`/restart switch from day one (so the
+//!   later D1 recovery DoD runs against an existing kill-switch).
 
 pub mod bootstrap;
+pub mod pair;
 pub mod wire;
 pub mod worker;
 

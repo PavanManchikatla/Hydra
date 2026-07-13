@@ -10,6 +10,10 @@ description = "Hydra stage worker: a thin effect executor. recv -> verify_frame 
 name = "hydra-worker"
 path = "src/bin/hydra-worker.rs"
 
+[[bin]]
+name = "hydra-local-pair"
+path = "src/bin/hydra-local-pair.rs"
+
 [dependencies]
 hydra-proto = { path = "../hydra-proto" }
 hydra-state = { path = "../hydra-state" }
@@ -19,7 +23,7 @@ flatbuffers.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
