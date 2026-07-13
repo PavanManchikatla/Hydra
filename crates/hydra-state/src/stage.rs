@@ -154,7 +154,12 @@ impl Stage {
                     return vec![StageEffect::RecoveryCompleted { rank: self.rank, target }];
                 }
                 // Case A: first application at base — freeze, adopt target, truncate (I7a).
-                if matches!(self.state, ActiveFinal | Frozen) && self.epoch == base {
+                // PREACTIVE is included per spec §1.3 ("a stage in PREACTIVE receiving
+                // BEGIN_RECOVERY for the next attempt/epoch treats it per the abort rule:
+                // PREACTIVE is reversible"): a still-preactive stage reverts (discard the preactive
+                // tuple, freeze at target, adopt r), so a post-supersession stage is never marooned
+                // (F-LIVENESS-FAIR family 3; the model carried the same gap).
+                if matches!(self.state, ActiveFinal | Frozen | Preactive) && self.epoch == base {
                     self.state = Frozen;
                     self.epoch = target;
                     self.recovery_id = r;

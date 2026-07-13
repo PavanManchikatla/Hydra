@@ -167,6 +167,22 @@ StageRecvBeginAt(s, tEpoch, r0) ==
               /\ stFinal'  = [stFinal  EXCEPT ![s] = FALSE]
               /\ Send([t |-> "RACK", s |-> s, tgt |-> m.tgt, r |-> m.r])
               /\ UNCHANGED << stAttempt, caseBviolation >>
+           \/ (* --- PREACTIVE revert (spec §1.3 model-fidelity, F-LIVENESS-FAIR family 3) ---
+                 spec §1.3: "a stage in PREACTIVE receiving BEGIN_RECOVERY for the next
+                 attempt/epoch treats it per the abort rule: PREACTIVE is reversible." Case A
+                 above accepted only {ACTIVE_FINAL, FROZEN}, so a post-supersession stage left
+                 PREACTIVE was marooned (no RESET could outrank its stRId once rId was exhausted).
+                 Revert per the abort rule: discard the preactive tuple, freeze at target, adopt
+                 r, truncate, ack. (Same body as Case A; mirror of F-UNSERVABLE -- spec right,
+                 model previously incomplete.) *)
+              /\ stState[s] = "PREACTIVE" /\ stEpoch[s] = m.base
+              /\ stState'  = [stState  EXCEPT ![s] = "FROZEN"]
+              /\ stEpoch'  = [stEpoch  EXCEPT ![s] = m.tgt]
+              /\ stRId'    = [stRId    EXCEPT ![s] = m.r]
+              /\ stApplied'= [stApplied EXCEPT ![s] = Min(stApplied[s], m.trunc)]
+              /\ stFinal'  = [stFinal  EXCEPT ![s] = FALSE]
+              /\ Send([t |-> "RACK", s |-> s, tgt |-> m.tgt, r |-> m.r])
+              /\ UNCHANGED << stAttempt, caseBviolation >>
            \/ (* --- Case B: PURE replay to a frozen stage of this transition --- *)
               /\ stState[s] = "FROZEN" /\ stEpoch[s] = m.tgt /\ m.r >= stRId[s]
               /\ caseBviolation' = (caseBviolation \/ stApplied[s] > m.trunc)
@@ -448,7 +464,16 @@ DropCandidate ==            \* admission failure / cancellation: no trace
 
 SessionTerminate ==         \* spec SS11: no admissible placement => explicit terminal
     /\ cState \in {"RECOVERY_STARTED", "RECONSTRUCTING", "READY_ALL", "SUPERSEDING"}
-    /\ \E s \in Stages : stState[s] = "LOST"
+    \* F-LIVENESS-FAIR (§6.4, TLC-3 model-completeness): terminate on participant loss OR
+    \* bound exhaustion (attempt >= MaxAttempt, or reconstruction rId >= MaxRId). Both bounds are
+    \* policy-set; the real system policy-bounds attempts and terminates per §11, so the bound's
+    \* outcome must be defined here too. This does NOT force premature termination: WF fires only on
+    \* *continuous* enablement, and any run that makes progress leaves this cState set (into
+    \* COMMITTING/COMPLETE/SERVICEABLE/...), disabling the guard -- so only genuinely-stuck runs,
+    \* where it stays enabled forever, are terminated.
+    /\ \/ (\E s \in Stages : stState[s] = "LOST")
+       \/ attempt >= MaxAttempt
+       \/ rId >= MaxRId
     /\ Wal([t |-> "TERMINAL", tgt |-> recTarget])
     /\ cState' = "TERMINAL"
     /\ UNCHANGED << msgs, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,

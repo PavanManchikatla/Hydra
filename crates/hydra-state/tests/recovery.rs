@@ -25,6 +25,22 @@ fn case_a_first_application_truncates() {
     assert!(matches!(e[0], StageEffect::RecoveryAck { target: 1, .. }));
 }
 
+// F-LIVENESS-FAIR family 3 (spec §1.3): a PREACTIVE stage receiving BEGIN_RECOVERY for its epoch
+// reverts (per the abort rule; PREACTIVE is reversible) rather than being marooned. Regression for
+// the model-fidelity gap the checker found post-supersession.
+#[test]
+fn preactive_stage_reverts_on_begin_recovery() {
+    let mut s = Stage::frozen_ready(0, 0, 0);
+    step_ok(&mut s, RecvCommit { tuple: tuple(0, 1) }); // -> PREACTIVE at epoch 0, attempt 1
+    assert_eq!(s.state(), StageState::Preactive);
+    // BEGIN_RECOVERY for the next epoch, base = the stage's epoch: must revert, not be rejected.
+    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0 });
+    assert_eq!(s.state(), StageState::Frozen, "PREACTIVE reverts to FROZEN (spec §1.3)");
+    assert_eq!(s.epoch(), 1, "adopts the target epoch");
+    assert!(!s.holds_final_evidence());
+    assert!(matches!(e[0], StageEffect::RecoveryAck { target: 1, .. }), "acks the recovery");
+}
+
 #[test]
 fn case_b_prime_completed_is_locally_decidable() {
     let mut s = Stage::frozen_ready(0, 1, 0);
