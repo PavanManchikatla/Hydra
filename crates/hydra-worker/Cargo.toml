@@ -27,3 +27,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# D1 recovery harness (sub-slice C, seam 2b): the coordinator's real commit stream + recovery
+# reader, driven against a real subprocess S_P. One-way dev edge — hydra-coordinator does not
+# depend on hydra-worker, so there is no cycle.
+hydra-coordinator = { path = "../hydra-coordinator" }
+hydra-tokenizer = { path = "../hydra-tokenizer" }
