@@ -14,5 +14,11 @@ hydra-tokenizer = { path = "../hydra-tokenizer" }
 flatbuffers.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+axum = "0.7"
+futures-core = "0.3"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

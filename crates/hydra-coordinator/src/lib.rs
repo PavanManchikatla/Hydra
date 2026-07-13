@@ -9,5 +9,11 @@
 //!   disk file; `snapshot(q)` embedded from the SAMPLED ring; I19 validated on write.
 
 pub mod commit_stream;
+pub mod event_log;
+pub mod server;
+pub mod session;
 
-pub use commit_stream::{CommitError, CommitStream, GroupBatch, GroupCommitter, WalFenceCtx};
+pub use commit_stream::{CommitError, CommitStream, Durability, GroupBatch, GroupCommitter, WalFenceCtx};
+pub use event_log::{Event, EventLog};
+pub use server::{router, AppState, GenFn};
+pub use session::{CommitOutcome, PieceSource, SampledToken, Session, TokenizerPieces};

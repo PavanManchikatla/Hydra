@@ -26,6 +26,24 @@ pub enum CommitError {
     BadCheckpoint(String),
 }
 
+/// The durability sink behind the commit stream — one `append` = one record made durable
+/// (`fdatasync`) before it returns. Abstracted so the emit-after-commit gate can be proven **by
+/// absence**: a sink whose `append` stalls/fails must leave `generation_durable_pos` un-advanced,
+/// so nothing is ever emitted past the last durable position.
+pub trait Durability: Send {
+    fn append(&mut self, record_type: u16, flags: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError>;
+    fn durable_len(&self) -> u64;
+}
+
+impl Durability for WalWriter {
+    fn append(&mut self, record_type: u16, flags: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError> {
+        WalWriter::append(self, record_type, flags, payload)
+    }
+    fn durable_len(&self) -> u64 {
+        self.len()
+    }
+}
+
 /// The durable-fence context every commit record embeds (a subset of the wire fence).
 #[derive(Clone, Debug)]
 pub struct WalFenceCtx {
@@ -101,7 +119,7 @@ fn build_token_entries<'a>(fbb: &mut FlatBufferBuilder<'a>, tokens: &[(i64, u32)
 
 /// The coordinator's durable commit stream.
 pub struct CommitStream {
-    writer: WalWriter,
+    writer: Box<dyn Durability>,
     generation_durable_pos: i64,
     committed_sampler_checkpoint_id: u64,
     next_commit_id: u64,
@@ -114,13 +132,19 @@ impl CommitStream {
     pub fn create(path: impl AsRef<std::path::Path>, cluster_id: [u8; 16], session_id: [u8; 16]) -> Result<CommitStream, CommitError> {
         let header = FileHeader { flags: 0, cluster_id, session_scope: session_id };
         let writer = WalWriter::create(path, &header)?;
-        Ok(CommitStream {
+        Ok(Self::with_durability(Box::new(writer)))
+    }
+
+    /// Build over an arbitrary [`Durability`] sink (tests: a stalling/failing `fdatasync` to prove
+    /// the emit-after-commit gate by absence).
+    pub fn with_durability(writer: Box<dyn Durability>) -> CommitStream {
+        CommitStream {
             writer,
             generation_durable_pos: -1,
             committed_sampler_checkpoint_id: 0,
             next_commit_id: 1,
             last_commit_id: 0,
-        })
+        }
     }
 
     pub fn generation_durable_pos(&self) -> i64 {
@@ -133,7 +157,7 @@ impl CommitStream {
         self.last_commit_id
     }
     pub fn durable_len(&self) -> u64 {
-        self.writer.len()
+        self.writer.durable_len()
     }
 
     /// `INITIAL_COMMIT` — admission metadata (the three hashes) + the config-defined initial
