@@ -74,6 +74,24 @@ Mut4 `AbortFinality`, **Mut1 `PostDecisionLoss`**); baseline safety exploring to
 zero violations; Mut3 + baseline liveness runs in progress." Nothing stronger until Mut3 fires
 and the baseline runs reach fixpoint.
 
+### Gate run — 2026-07-13 (CI run 29222085672, v0.10.4 model, `.github/workflows/tlc.yml` `long`)
+First `long`-job run on the F-LIVENESS-FAIR-repaired model (headSha `9372ee1`). Read via the
+rule-12 semantic log-read (the Classify `verdict=` lines, **not** the run-status page). Verbatim
+receipt: `ci-results/run-29222085672.md`. Inner time-box `timeout 320m`, `-checkpoint 60`.
+
+| Run | Config | Verdict | Detail |
+|---|---|---|---|
+| Mutation 1 | `Mut1Unservable.cfg` | **GREEN — fires as designed on v0.10.4** | `violated=1`; temporal property violated, 23-state stuttering lasso; 467,199 distinct. |
+| Baseline safety | `BaselineSafety.cfg` | **INCONCLUSIVE (time-boxed)** | `violated=0 complete=0`; 327.9M distinct, 380,964 states on queue at the 320m kill — **no fixpoint**. Checkpoint uploaded → `recover=true`. |
+| Baseline liveness | `BaselineLiveness.cfg` | **INCONCLUSIVE (time-boxed)** | `violated=0 complete=0`; 25.0M distinct, 758,325 on queue — **no clean drain** (the v0.10.4 repair means no early counterexample stop, so the drain is CI-scale). Checkpoint uploaded → `recover=true`. |
+| Mutation 3 | `Mut3AttemptFence.cfg` | **INCONCLUSIVE (time-boxed)** | `violated=0 complete=0`; 379.7M distinct, 390,911 on queue — **did NOT fire, no clean drain** → contingency ladder NOT triggered (needs a genuine `complete` with no violation). Checkpoint uploaded → `recover=true`. |
+
+**Consequence:** this run did **not** conclude the M1 full-flip gate. Only Mut1 is green on the
+new model; baseline-safety→fixpoint, baseline-live→clean drain, and Mut3→fire remain **pending**,
+to be reached by re-dispatching `recover=true` (which also exercises the `-recover` round-trip for
+the first time). **No certification claim beyond the paragraph above is licensed** — in particular
+"all configs conclusive on v0.10.4" is NOT yet true.
+
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),
   GENERATION_COMMIT alignment (I19), sampler rollback/installation (I15/I17),
