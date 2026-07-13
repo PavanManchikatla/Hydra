@@ -51,18 +51,19 @@ async fn two_worker_teacher_forced_no_sample_bit_exact() {
     let s1_cfg = WorkerConfig {
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
+        sampler_config: None,
     };
     let s2_cfg = WorkerConfig {
         keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
+        sampler_config: None,
     };
     let s1_addr = hydra_worker::pair::spawn_endpoint(s1_cfg, cluster.ca.server_config(&s1_id).unwrap());
     let s2_addr = hydra_worker::pair::spawn_endpoint(s2_cfg, cluster.ca.server_config(&s2_id).unwrap());
 
     let connector = cluster.coordinator_connector().unwrap();
-    let digest = run_teacher_forced_pipeline(&connector, s1_addr, "worker-s1", s2_addr, "worker-s2", &keys, &tokens)
-        .await
-        .expect("pipeline");
+    let ep = hydra_worker::pair::Endpoints::new(s1_addr, "worker-s1", s2_addr, "worker-s2");
+    let digest = run_teacher_forced_pipeline(&connector, &ep, &keys, &tokens).await.expect("pipeline");
 
     assert_eq!(
         digest, golden,
@@ -89,6 +90,7 @@ async fn subprocess_worker_survives_kill_9_and_restart() {
         cfg: WorkerConfig {
             keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: 0, model_path: None, n_gpu_layers: 0, n_ctx: 64,
+            sampler_config: None,
         },
     };
 

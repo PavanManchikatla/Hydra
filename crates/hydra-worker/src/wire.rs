@@ -79,7 +79,16 @@ pub enum Msg {
     ActivationCommitAbort { aborted_attempt: AttemptId },
     BeginRecovery { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
     RecoveryAck { applied_input_pos: i64 },
-    /// `ERR_*` (e.g. `ERR_FENCED` from an F2 rejection).
+    // --- sampler plane (spec §2.6a/§2.6b, M2 slice 3) ---
+    /// `SAMPLE_NEXT{output_pos, sampling_config_hash, expected_sampler_checkpoint_id}` (I14).
+    SampleNext { output_pos: i64, sampling_config_hash: Vec<u8>, expected_sampler_checkpoint_id: u64 },
+    /// `SAMPLED{q}` carrying `post_sample_state_snapshot(q)` (spec §2.6a).
+    Sampled { output_pos: i64, token_id: u32, post_sample_snapshot: Vec<u8>, sampler_state_digest: Vec<u8> },
+    /// `INSTALL_SAMPLER_CHECKPOINT{checkpoint_id, snapshot}` (I17).
+    InstallSamplerCheckpoint { checkpoint_id: u64, snapshot: Vec<u8> },
+    /// `SAMPLER_CHECKPOINT_INSTALLED{checkpoint_id, resulting_state_digest, sampled_output_pos}`.
+    SamplerCheckpointInstalled { checkpoint_id: u64, sampled_output_pos: i64, resulting_state_digest: Vec<u8> },
+    /// `ERR_*` (e.g. `ERR_FENCED` from an F2 rejection, `ERR_CHECKPOINT_MISMATCH` from sampler drift).
     Err { code: u16 },
 }
 
@@ -195,6 +204,35 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         Body::RecoveryAck => {
             let r = frame.body_as_recovery_ack().ok_or(WireError::Malformed("RecoveryAck".into()))?;
             Ok(Msg::RecoveryAck { applied_input_pos: r.applied_input_pos() })
+        }
+        Body::SampleNext => {
+            let s = frame.body_as_sample_next().ok_or(WireError::Malformed("SampleNext".into()))?;
+            Ok(Msg::SampleNext {
+                output_pos: s.output_pos(),
+                sampling_config_hash: s.sampling_config_hash().bytes().to_vec(),
+                expected_sampler_checkpoint_id: s.expected_sampler_checkpoint_id(),
+            })
+        }
+        Body::Sampled => {
+            let s = frame.body_as_sampled().ok_or(WireError::Malformed("Sampled".into()))?;
+            Ok(Msg::Sampled {
+                output_pos: s.output_pos(),
+                token_id: s.token_id(),
+                post_sample_snapshot: s.post_sample_snapshot().bytes().to_vec(),
+                sampler_state_digest: s.sampler_state_digest().bytes().to_vec(),
+            })
+        }
+        Body::InstallSamplerCheckpoint => {
+            let i = frame.body_as_install_sampler_checkpoint().ok_or(WireError::Malformed("InstallSamplerCheckpoint".into()))?;
+            Ok(Msg::InstallSamplerCheckpoint { checkpoint_id: i.checkpoint_id(), snapshot: i.snapshot().bytes().to_vec() })
+        }
+        Body::SamplerCheckpointInstalled => {
+            let i = frame.body_as_sampler_checkpoint_installed().ok_or(WireError::Malformed("SamplerCheckpointInstalled".into()))?;
+            Ok(Msg::SamplerCheckpointInstalled {
+                checkpoint_id: i.checkpoint_id(),
+                sampled_output_pos: i.sampled_output_pos(),
+                resulting_state_digest: i.resulting_state_digest().bytes().to_vec(),
+            })
         }
         Body::Error => {
             let e = frame.body_as_error().ok_or(WireError::Malformed("Error".into()))?;
@@ -389,6 +427,55 @@ pub fn encode_recovery_ack(keys: &SessionKeys, epoch: Epoch, recovery_id: Recove
     let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::RecoveryAck::create(&mut fbb, &proto::RecoveryAckArgs { applied_input_pos });
     finish_frame(&mut fbb, fence, proto::Body::RecoveryAck, body.as_union_value())
+}
+
+pub fn encode_sample_next(keys: &SessionKeys, epoch: Epoch, output_pos: i64, sampling_config_hash: &[u8], expected_sampler_checkpoint_id: u64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let cfg = fbb.create_vector(sampling_config_hash);
+    let body = proto::SampleNext::create(
+        &mut fbb,
+        &proto::SampleNextArgs { output_pos, sampling_config_hash: Some(cfg), expected_sampler_checkpoint_id },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::SampleNext, body.as_union_value())
+}
+
+pub fn encode_sampled(keys: &SessionKeys, epoch: Epoch, output_pos: i64, token_id: u32, snapshot: &[u8], state_digest: &[u8]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let snap = fbb.create_vector(snapshot);
+    let dig = fbb.create_vector(state_digest);
+    let body = proto::Sampled::create(
+        &mut fbb,
+        &proto::SampledArgs {
+            output_pos,
+            token_id,
+            topk_ids: None,
+            topk_logprobs: None,
+            post_sample_snapshot: Some(snap),
+            sampler_state_digest: Some(dig),
+        },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::Sampled, body.as_union_value())
+}
+
+pub fn encode_install_sampler_checkpoint(keys: &SessionKeys, epoch: Epoch, checkpoint_id: u64, snapshot: &[u8]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let snap = fbb.create_vector(snapshot);
+    let body = proto::InstallSamplerCheckpoint::create(&mut fbb, &proto::InstallSamplerCheckpointArgs { checkpoint_id, snapshot: Some(snap) });
+    finish_frame(&mut fbb, fence, proto::Body::InstallSamplerCheckpoint, body.as_union_value())
+}
+
+pub fn encode_sampler_checkpoint_installed(keys: &SessionKeys, epoch: Epoch, checkpoint_id: u64, sampled_output_pos: i64, state_digest: &[u8]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let dig = fbb.create_vector(state_digest);
+    let body = proto::SamplerCheckpointInstalled::create(
+        &mut fbb,
+        &proto::SamplerCheckpointInstalledArgs { checkpoint_id, resulting_state_digest: Some(dig), sampled_output_pos },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::SamplerCheckpointInstalled, body.as_union_value())
 }
 
 pub fn encode_error(keys: &SessionKeys, epoch: Epoch, attempt: AttemptId, code: u16) -> Vec<u8> {

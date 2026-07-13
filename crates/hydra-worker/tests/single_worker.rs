@@ -69,6 +69,7 @@ async fn control_plane_activation_round_trips_through_the_real_stage_sm() {
         model_path: None, // control-plane only — no engine needed
         n_gpu_layers: 0,
         n_ctx: 64,
+        sampler_config: None,
     };
     let addr = spawn_worker(cfg, ca.server_config(&worker_id).unwrap());
 
@@ -144,6 +145,7 @@ async fn data_plane_apply_token_echo_over_mtls() {
         model_path: Some(path),
         n_gpu_layers: 0,
         n_ctx: 64,
+        sampler_config: None,
     };
     let addr = spawn_worker(cfg, ca.server_config(&worker_id).unwrap());
 

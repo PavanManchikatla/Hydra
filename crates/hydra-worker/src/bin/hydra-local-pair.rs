@@ -10,7 +10,7 @@
 
 use hydra_engine_sys::Model;
 use hydra_worker::bootstrap::Bootstrap;
-use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster, SubprocessWorker};
+use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster, Endpoints, SubprocessWorker};
 use hydra_worker::wire::SessionKeys;
 use hydra_worker::worker::WorkerConfig;
 
@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_path: Some(model_path.clone()),
         n_gpu_layers: 0,
         n_ctx: tokens.len() as i32 + 8,
+        sampler_config: None,
     };
 
     let s1 = SubprocessWorker::spawn(&binary, &boot(&s1_id, base(0, 0, k, false, true)))?;
@@ -77,7 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("S1 pid-endpoint {}  S2 pid-endpoint {}", s1.addr, s2.addr);
 
     let connector = cluster.coordinator_connector()?;
-    let digest = run_teacher_forced_pipeline(&connector, s1.addr, "worker-s1", s2.addr, "worker-s2", &keys, &tokens)
+    let ep = Endpoints::new(s1.addr, "worker-s1", s2.addr, "worker-s2");
+    let digest = run_teacher_forced_pipeline(&connector, &ep, &keys, &tokens)
         .await
         .map_err(|e| format!("pipeline: {e}"))?;
     let exact = digest == golden;

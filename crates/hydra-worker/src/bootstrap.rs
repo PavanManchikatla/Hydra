@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 
 use hydra_transport::{CertificateDer, DeviceIdentity};
 
+use crate::sampler::SamplingConfig;
 use crate::wire::{SessionKeys, CLUSTER_ID_LEN, HASH_LEN, MODEL_INSTANCE_ID_LEN, SESSION_ID_LEN};
 use crate::worker::WorkerConfig;
 
@@ -73,6 +74,17 @@ impl Bootstrap {
         w.str(self.cfg.model_path.as_deref().unwrap_or(""));
         w.i32(self.cfg.n_gpu_layers);
         w.i32(self.cfg.n_ctx);
+        match &self.cfg.sampler_config {
+            Some(s) => {
+                w.u32(1);
+                w.f32(s.temperature);
+                w.f32(s.top_p);
+                w.f32(s.repeat_penalty);
+                w.u32(s.penalty_last_n as u32);
+                w.u64(s.seed);
+            }
+            None => w.u32(0),
+        }
         w.0
     }
 
@@ -103,6 +115,17 @@ impl Bootstrap {
         let model_path = r.str()?;
         let n_gpu_layers = r.i32()?;
         let n_ctx = r.i32()?;
+        let sampler_config = if r.u32()? != 0 {
+            Some(SamplingConfig {
+                temperature: r.f32()?,
+                top_p: r.f32()?,
+                repeat_penalty: r.f32()?,
+                penalty_last_n: r.u32()? as usize,
+                seed: r.u64()?,
+            })
+        } else {
+            None
+        };
         Ok(Bootstrap {
             listen_addr,
             device_name,
@@ -121,6 +144,7 @@ impl Bootstrap {
                 model_path: (!model_path.is_empty()).then_some(model_path),
                 n_gpu_layers,
                 n_ctx,
+                sampler_config,
             },
         })
     }
@@ -133,6 +157,12 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn i32(&mut self, v: i32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn bytes(&mut self, b: &[u8]) {
@@ -157,6 +187,15 @@ impl Reader<'_> {
     }
     fn i32(&mut self) -> Result<i32, String> {
         Ok(self.u32()? as i32)
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        let end = self.i + 8;
+        let s = self.b.get(self.i..end).ok_or("truncated u64")?;
+        self.i = end;
+        Ok(u64::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn f32(&mut self) -> Result<f32, String> {
+        Ok(f32::from_bits(self.u32()?))
     }
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let n = self.u32()? as usize;
@@ -197,6 +236,7 @@ mod tests {
                 model_path: Some("/models/x.gguf".into()),
                 n_gpu_layers: 0,
                 n_ctx: 64,
+                sampler_config: Some(SamplingConfig { temperature: 0.7, top_p: 0.9, repeat_penalty: 1.1, penalty_last_n: 16, seed: 99 }),
             },
         };
         let bytes = boot.encode();
@@ -207,5 +247,7 @@ mod tests {
         assert_eq!(back.cfg.layer_last, 12);
         assert_eq!(back.cfg.model_path.as_deref(), Some("/models/x.gguf"));
         assert!(back.cfg.receives_tokens && !back.cfg.is_final);
+        assert_eq!(back.cfg.sampler_config.as_ref().map(|s| s.seed), Some(99));
+        assert_eq!(back.cfg.sampler_config.as_ref().map(|s| s.penalty_last_n), Some(16));
     }
 }

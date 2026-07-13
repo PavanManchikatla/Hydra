@@ -14,17 +14,33 @@
 //! returns reply bytes — so it is unit-testable without a socket; the async [`serve_conn`] loop is
 //! the only place bytes touch a connection.
 
+use std::collections::HashMap;
+
 use hydra_engine_sys::{Context, EngineError, Model, ENGINE_AVAILABLE};
 use hydra_state::{ActivationKind, ActivationTuple, Epoch, RecoveryId, Stage, StageEffect, StageEvent, StageRank};
 use hydra_transport::framed::Conn;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::sampler::{Sampler, SamplerError, SamplingConfig};
 use crate::wire::{self, Msg, SessionKeys, WireError};
 
 /// `ERR_FENCED` on the wire (`proto::ErrCode::ERR_FENCED`).
 const ERR_FENCED: u16 = 1;
 /// `ERR_RECOVERY_COMPLETED` (Case B′).
 const ERR_RECOVERY_COMPLETED: u16 = 3;
+/// `ERR_CHECKPOINT_MISMATCH` — sampler drift (spec §2.6b: fatal, never silently repaired).
+const ERR_CHECKPOINT_MISMATCH: u16 = 9;
+/// The config-defined initial checkpoint id the coordinator seeds S_P with (spec §1.4 boundary).
+pub const INITIAL_CHECKPOINT_ID: u64 = 1;
+
+/// One cached `SAMPLED` — the snapshot ring entry that makes a duplicate `SAMPLE_NEXT` idempotent
+/// (I14) without advancing the RNG, and carries `post_sample_state_snapshot(q)` (spec §2.6a).
+#[derive(Clone)]
+struct SampledEntry {
+    token_id: u32,
+    snapshot: Vec<u8>,
+    state_digest: [u8; 32],
+}
 
 /// Static description of one worker's role in the pipeline.
 #[derive(Clone, Debug)]
@@ -48,6 +64,9 @@ pub struct WorkerConfig {
     /// `0` = CPU (the deterministic DoD backend); `99` = GPU.
     pub n_gpu_layers: i32,
     pub n_ctx: i32,
+    /// The session sampling config — set on the **final** stage (S_P) to enable the sampler
+    /// (spec §2.6b). `None` on non-final stages and for the teacher-forced-only anchor.
+    pub sampler_config: Option<SamplingConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,32 +135,53 @@ impl Engine {
         }
     }
 
-    /// BLAKE3 digest of the retained (unsampled, I14) f32 logits for the position just applied —
-    /// the wire-transmittable witness of bit-exactness for the teacher-forced anchor. A worker
-    /// applies exactly one position per frame, so the logits live at batch-relative output index 0
+    /// The retained (unsampled, I14) f32 logits for the position just applied. A worker applies
+    /// exactly one position per frame, so the logits live at batch-relative output index 0
     /// (`hydra_logits` indexes the most recent apply's enabled outputs, not the absolute position).
-    fn last_logits_digest(&mut self) -> Result<[u8; 32], EngineError> {
-        let logits = self.ctx.logits(0)?;
-        Ok(*blake3::hash(&wire::f32_to_bytes_le(&logits)).as_bytes())
+    /// Sampling is the caller's job (I14) — the engine never samples.
+    fn last_logits(&mut self) -> Result<Vec<f32>, EngineError> {
+        self.ctx.logits(0)
     }
 }
 
-/// A running stage worker: the real `hydra-state` [`Stage`] SM + an optional engine.
+fn logits_digest(logits: &[f32]) -> [u8; 32] {
+    *blake3::hash(&wire::f32_to_bytes_le(logits)).as_bytes()
+}
+
+/// A running stage worker: the real `hydra-state` [`Stage`] SM + an optional engine, plus (on S_P)
+/// the sampler, the retained logits, and the SAMPLED snapshot ring.
 pub struct Worker {
     cfg: WorkerConfig,
     stage: Stage,
     engine: Option<Engine>,
+    /// S_P sampler (spec §2.6b); `None` on non-final stages or when no `sampler_config` is set.
+    sampler: Option<Sampler>,
+    /// The most recent position's retained logits (I14: sample only from retained logits).
+    latest_logits: Option<Vec<f32>>,
+    /// Snapshot ring / `SAMPLED` cache keyed by output position — makes a duplicate `SAMPLE_NEXT`
+    /// idempotent (I14) and holds `snapshot(q)` for each sampled q (spec §2.6a).
+    sampled_ring: HashMap<i64, SampledEntry>,
 }
 
 impl Worker {
     pub fn new(cfg: WorkerConfig) -> Result<Worker, WorkerError> {
         let stage = Stage::frozen_ready(cfg.rank, cfg.epoch, cfg.recovery_id);
         let engine = Engine::try_new(&cfg)?;
-        Ok(Worker { cfg, stage, engine })
+        // The sampler lives only on S_P (the final stage) and only when a config is provided.
+        let sampler = if cfg.is_final {
+            cfg.sampler_config.clone().map(|c| Sampler::initial(INITIAL_CHECKPOINT_ID, c))
+        } else {
+            None
+        };
+        Ok(Worker { cfg, stage, engine, sampler, latest_logits: None, sampled_ring: HashMap::new() })
     }
 
     pub fn has_engine(&self) -> bool {
         self.engine.is_some()
+    }
+
+    pub fn has_sampler(&self) -> bool {
+        self.sampler.is_some()
     }
 
     pub fn stage(&self) -> &Stage {
@@ -161,21 +201,21 @@ impl Worker {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_token(token_id as i32, input_pos as i32)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, input_pos, no_sample, &boundary)]),
-                    None => {
-                        let digest = eng.last_logits_digest()?;
-                        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, view.epoch, input_pos, &digest)])
-                    }
+                    None => self.retain_and_ack(view.epoch, input_pos),
                 }
             }
             Msg::Fwd { first_input_pos, no_sample, activations } => {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_boundary(&activations, first_input_pos as i32)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, first_input_pos, no_sample, &boundary)]),
-                    None => {
-                        let digest = eng.last_logits_digest()?;
-                        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, view.epoch, first_input_pos, &digest)])
-                    }
+                    None => self.retain_and_ack(view.epoch, first_input_pos),
                 }
+            }
+            Msg::SampleNext { output_pos, sampling_config_hash, expected_sampler_checkpoint_id } => {
+                self.on_sample_next(view.epoch, output_pos, &sampling_config_hash, expected_sampler_checkpoint_id)
+            }
+            Msg::InstallSamplerCheckpoint { checkpoint_id, snapshot } => {
+                self.on_install_sampler_checkpoint(view.epoch, checkpoint_id, &snapshot)
             }
             Msg::CommitActivation(t) => Ok(self.step_control(StageEvent::RecvCommit { tuple: t })),
             Msg::FinalizeActivation { attempt } => Ok(self.step_control(StageEvent::RecvFinalize { attempt })),
@@ -183,10 +223,82 @@ impl Worker {
             Msg::BeginRecovery { base, target, recovery_id, truncate_to } => {
                 Ok(self.step_control(StageEvent::RecvBegin { base, target, recovery_id, truncate_to }))
             }
-            // Acks / errors are coordinator-inbound; a worker never receives them.
-            Msg::ActivationCommitted(_) | Msg::ActivationFinalized | Msg::RecoveryAck { .. } | Msg::AppliedAck { .. } | Msg::Err { .. } => {
-                Ok(vec![])
+            // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them.
+            Msg::ActivationCommitted(_)
+            | Msg::ActivationFinalized
+            | Msg::RecoveryAck { .. }
+            | Msg::AppliedAck { .. }
+            | Msg::Sampled { .. }
+            | Msg::SamplerCheckpointInstalled { .. }
+            | Msg::Err { .. } => Ok(vec![]),
+        }
+    }
+
+    /// Final-stage apply tail: retain the position's logits (for a later `SAMPLE_NEXT`, I14) and
+    /// ack with their digest (the teacher-forced bit-exact anchor's witness).
+    fn retain_and_ack(&mut self, epoch: Epoch, pos: i64) -> Result<Vec<Vec<u8>>, WorkerError> {
+        let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
+        let logits = eng.last_logits()?;
+        let digest = logits_digest(&logits);
+        self.latest_logits = Some(logits);
+        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, epoch, pos, &digest)])
+    }
+
+    /// `SAMPLE_NEXT` (spec §3, I14): fence the checkpoint id + config hash (drift is fatal), serve a
+    /// duplicate from the snapshot ring **without advancing the RNG**, else sample from the retained
+    /// logits and cache the result.
+    fn on_sample_next(
+        &mut self,
+        epoch: Epoch,
+        output_pos: i64,
+        config_hash: &[u8],
+        expected_checkpoint_id: u64,
+    ) -> Result<Vec<Vec<u8>>, WorkerError> {
+        let keys = &self.cfg.keys;
+        let Some(sampler) = self.sampler.as_mut() else {
+            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+        };
+        // Fatal drift → reject loudly, never silently repair (spec §2.6b).
+        if sampler.check_fence(expected_checkpoint_id, config_hash).is_err() {
+            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+        }
+        // I14: a duplicate SAMPLE_NEXT is served from the SAMPLED cache; the RNG never re-advances.
+        if let Some(entry) = self.sampled_ring.get(&output_pos) {
+            return Ok(vec![wire::encode_sampled(keys, epoch, output_pos, entry.token_id, &entry.snapshot, &entry.state_digest)]);
+        }
+        let Some(logits) = self.latest_logits.as_ref() else {
+            // No retained logits for this position (I14: sample only from retained logits).
+            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+        };
+        let out = sampler.sample(output_pos, logits);
+        self.sampled_ring.insert(
+            output_pos,
+            SampledEntry { token_id: out.token_id, snapshot: out.snapshot.clone(), state_digest: out.state_digest },
+        );
+        Ok(vec![wire::encode_sampled(keys, epoch, output_pos, out.token_id, &out.snapshot, &out.state_digest)])
+    }
+
+    /// `INSTALL_SAMPLER_CHECKPOINT` (I17): install the exact state into S_P's sampler (idempotent),
+    /// then ack. The sampler must exist (a final stage with a config).
+    fn on_install_sampler_checkpoint(
+        &mut self,
+        epoch: Epoch,
+        checkpoint_id: u64,
+        snapshot: &[u8],
+    ) -> Result<Vec<Vec<u8>>, WorkerError> {
+        let keys = &self.cfg.keys;
+        let Some(sampler) = self.sampler.as_mut() else {
+            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+        };
+        match sampler.install(snapshot) {
+            Ok(()) => {
+                let digest = *blake3::hash(snapshot).as_bytes();
+                Ok(vec![wire::encode_sampler_checkpoint_installed(keys, epoch, checkpoint_id, sampler.sampled_pos(), &digest)])
             }
+            Err(SamplerError::BadChecksum) | Err(SamplerError::BadSnapshot(_)) | Err(SamplerError::ConfigDrift) => {
+                Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)])
+            }
+            Err(_) => Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]),
         }
     }
 

@@ -16,6 +16,7 @@
 
 pub mod bootstrap;
 pub mod pair;
+pub mod sampler;
 pub mod wire;
 pub mod worker;
 

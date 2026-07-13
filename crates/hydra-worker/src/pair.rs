@@ -26,8 +26,9 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::{ClusterCa, DeviceIdentity};
 
 use crate::bootstrap::Bootstrap;
+use crate::sampler::SamplingConfig;
 use crate::wire::{self, Msg, SessionKeys};
-use crate::worker::{serve_conn, Worker, WorkerConfig};
+use crate::worker::{serve_conn, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
 
 /// A cluster CA + issued identities for the coordinator and workers (dev/local-pair pairing).
 pub struct Cluster {
@@ -91,20 +92,32 @@ pub fn golden_digest(model: &Model, tokens: &[u32]) -> Result<[u8; 32], hydra_en
     Ok(*blake3::hash(&wire::f32_to_bytes_le(&last)).as_bytes())
 }
 
+/// The two pipeline endpoints (address + certificate identity) a coordinator connects to.
+#[derive(Clone, Debug)]
+pub struct Endpoints {
+    pub s1_addr: SocketAddr,
+    pub s1_name: String,
+    pub s2_addr: SocketAddr,
+    pub s2_name: String,
+}
+
+impl Endpoints {
+    pub fn new(s1_addr: SocketAddr, s1_name: &str, s2_addr: SocketAddr, s2_name: &str) -> Self {
+        Endpoints { s1_addr, s1_name: s1_name.to_string(), s2_addr, s2_name: s2_name.to_string() }
+    }
+}
+
 /// Drive the teacher-forced NO_SAMPLE prefill through two connected workers and return the digest
 /// of the final position's logits (as reported by S2's `APPLIED_ACK`). `keys` must match the
 /// workers' session identity (F1).
 pub async fn run_teacher_forced_pipeline(
     connector: &TcpMtls,
-    s1_addr: SocketAddr,
-    s1_name: &str,
-    s2_addr: SocketAddr,
-    s2_name: &str,
+    ep: &Endpoints,
     keys: &SessionKeys,
     tokens: &[u32],
 ) -> Result<[u8; 32], String> {
-    let mut c1 = connector.connect(s1_addr, s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
-    let mut c2 = connector.connect(s2_addr, s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
 
     let mut last_digest = [0u8; 32];
     for (pos, &tok) in tokens.iter().enumerate() {
@@ -134,6 +147,127 @@ pub async fn run_teacher_forced_pipeline(
         }
     }
     Ok(last_digest)
+}
+
+/// The unsplit greedy next token: apply `tokens` one-at-a-time to the full model and take the
+/// argmax of the final logits — the exact-tier reference for greedy sampling across the pipeline
+/// (test (a): sampling at the end of a teacher-forced run stays bit-exact vs unsplit).
+pub fn golden_next_token(model: &Model, tokens: &[u32]) -> Result<u32, hydra_engine_sys::EngineError> {
+    let n_ctx = tokens.len() as i32 + 8;
+    let mut ctx = model.context(0, -1, false, n_ctx, n_ctx)?;
+    let mut last = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        ctx.apply_tokens(&[tok as i32], pos as i32, None)?;
+        last = ctx.logits(0)?;
+    }
+    let mut bi = 0usize;
+    for i in 1..last.len() {
+        if last[i] > last[bi] {
+            bi = i;
+        }
+    }
+    Ok(bi as u32)
+}
+
+async fn prefill<S>(c1: &mut hydra_transport::framed::Conn<S>, c2: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys, tokens: &[u32]) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for (pos, &tok) in tokens.iter().enumerate() {
+        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill s1 send: {e}"))?;
+        let boundary = expect_fwd(c1, keys, pos as i64).await?;
+        c2.send(0, &wire::encode_fwd(keys, 0, pos as i64, true, &boundary)).await.map_err(|e| format!("prefill s2 send: {e}"))?;
+        expect_applied_ack(c2, keys).await?;
+    }
+    Ok(())
+}
+
+async fn expect_fwd<S>(c: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys, pos: i64) -> Result<Vec<f32>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let f = c.recv().await.map_err(|e| format!("recv fwd: {e}"))?;
+    match wire::decode(&f.payload, keys).map_err(|e| format!("decode fwd: {e}"))?.1 {
+        Msg::Fwd { activations, .. } => Ok(activations),
+        other => Err(format!("pos {pos}: expected FWD, got {other:?}")),
+    }
+}
+
+async fn expect_applied_ack<S>(c: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let a = c.recv().await.map_err(|e| format!("recv ack: {e}"))?;
+    match wire::decode(&a.payload, keys).map_err(|e| format!("decode ack: {e}"))?.1 {
+        Msg::AppliedAck { .. } => Ok(()),
+        other => Err(format!("expected APPLIED_ACK, got {other:?}")),
+    }
+}
+
+/// Drive prompt prefill (NO_SAMPLE) then `n_steps` autoregressive sample steps through the two-worker
+/// pipeline, returning the generated token sequence. The coordinator owns **no** sampler state — it
+/// only issues `SAMPLE_NEXT` and feeds sampled tokens back (spec §1.4 ownership boundary); every
+/// snapshot is produced at S_P.
+pub async fn run_generation(
+    connector: &TcpMtls,
+    ep: &Endpoints,
+    keys: &SessionKeys,
+    config: &SamplingConfig,
+    prompt_tokens: &[u32],
+    n_steps: usize,
+) -> Result<Vec<u32>, String> {
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    let cfg_hash = config.hash();
+
+    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+
+    let mut out = Vec::with_capacity(n_steps);
+    let mut input_pos = prompt_tokens.len() as i64;
+    for step in 0..n_steps {
+        c2.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+            .await
+            .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
+        let s = c2.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?;
+        let token = match wire::decode(&s.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+            Msg::Sampled { token_id, .. } => token_id,
+            Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
+            other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
+        };
+        out.push(token);
+
+        // Feed the sampled token back autoregressively (except after the final step).
+        if step + 1 < n_steps {
+            c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+            let boundary = expect_fwd(&mut c1, keys, input_pos).await?;
+            c2.send(0, &wire::encode_fwd(keys, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
+            expect_applied_ack(&mut c2, keys).await?;
+            input_pos += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Prefill, then issue `SAMPLE_NEXT` for output position 0 **twice**, returning both decoded
+/// `SAMPLED` replies — the directed idempotence probe (I14): the duplicate must be byte-identical
+/// (served from the SAMPLED cache) and the RNG must not have advanced.
+pub async fn sample_next_twice(
+    connector: &TcpMtls,
+    ep: &Endpoints,
+    keys: &SessionKeys,
+    config: &SamplingConfig,
+    prompt_tokens: &[u32],
+) -> Result<(Msg, Msg), String> {
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+    let cfg_hash = config.hash();
+    let fire = || wire::encode_sample_next(keys, 0, 0, &cfg_hash, INITIAL_CHECKPOINT_ID);
+    c2.send(0, &fire()).await.map_err(|e| format!("send SAMPLE_NEXT #1: {e}"))?;
+    let first = wire::decode(&c2.recv().await.map_err(|e| format!("recv #1: {e}"))?.payload, keys).map_err(|e| format!("decode #1: {e}"))?.1;
+    c2.send(0, &fire()).await.map_err(|e| format!("send SAMPLE_NEXT #2: {e}"))?;
+    let second = wire::decode(&c2.recv().await.map_err(|e| format!("recv #2: {e}"))?.payload, keys).map_err(|e| format!("decode #2: {e}"))?.1;
+    Ok((first, second))
 }
 
 /// Load the small dev model (or return `None` if the engine/model is unavailable — both dev-env

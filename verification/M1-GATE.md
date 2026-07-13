@@ -53,7 +53,7 @@ Mut5 is the monotone-mutation left behind by F-UNSERVABLE (§7.10): it reintrodu
 | Abort-then-retry, same reconstruction (attempt monotonicity, I21) | ✅ | `coordinator.rs::abort_returns_to_ready_at_next_attempt` |
 | Torn commit record (WAL-FORMAT §5) | ✅ | `wal_disk.rs::torn_pending_write_is_discarded_all_variants` + `hydra-wal/tests/torn_write.rs` (M0) |
 | **Uncommitted segment candidate (I24)** | ⏸ **DEFERRED → M3** | segment-checkpoint SM not built at M1 (BLUEPRINT scopes it to M3); binding §8 owed-item incl. future `mutation_candidate_leak`. Model-layer coverage: TLA+ `CandidateIsolation` |
-| **Duplicated SAMPLE_NEXT — retained-logits idempotency (I14 data-plane)** | ⏸ **DEFERRED → M2** | ledger structural exactly-once covered (see teacher-forcing above); retained-logits idempotent re-serve is M2 data-plane (§8 owed-item) |
+| **Duplicated SAMPLE_NEXT — retained-logits idempotency (I14 data-plane)** | ✅ **CLOSED (M2 slice 3, 2026-07-13)** | ledger structural exactly-once covered (see teacher-forcing above); the retained idempotent re-serve is now implemented at S_P (SAMPLED snapshot ring, no RNG re-advance) + directed test `hydra-worker/tests/sampler_pipeline.rs::duplicate_sample_next_is_idempotent_and_does_not_advance_rng` |
 
 ## (d) TLC counterexample replays — event-sequence fidelity
 
@@ -103,7 +103,7 @@ Each invariant → the executable check (function / test), or an explicit deferr
 | I11 | transition replay idempotence | `invariants::check_stage` (CaseBPure) + `stage.rs::commit_replay_is_idempotent` |
 | I12 | rebuild isolation | partial — `stage::RebuildStep` (Strategy B); full fresh-context isolation → M2/M3 |
 | I13 | position discipline | type-level `InputPos`/`OutputPos` newtypes (`hydra-proto`; I13 violations don't compile) |
-| I14 | exactly-once sampling | structural (`ledger::sample_next`); SAMPLE_NEXT retained-logits idempotency → M2 (§8) |
+| I14 | exactly-once sampling | structural (`ledger::sample_next`); SAMPLE_NEXT retained-logits idempotency **CLOSED M2 slice 3** (`sampler_pipeline.rs::duplicate_sample_next_is_idempotent_and_does_not_advance_rng`) |
 | I15 | sampler rollback | `ledger::rollback_provisional` + `provisional_window_rolls_back_on_recovery` |
 | I16 | completion follows all COMMITTED | `invariants::check` (ServiceSafety) |
 | I17 | sampler installation before activation | partial — `sampler_checkpoint_id` bound in the activation tuple; real install → M2 |
@@ -116,7 +116,7 @@ Each invariant → the executable check (function / test), or an explicit deferr
 | I24 | candidate isolation | ⏸ **M3** (segment-checkpoint SM); partial now: checkpoint advances only via a durable commit record; model-layer TLA+ `CandidateIsolation` (§8 binding owed-item) |
 | I25 | abort finality | `invariants::check` (I25 AbortFinality) + `tlc1_…` / `mut4_…` |
 
-**Deferred-with-layer (permitted by the gate spec):** I1, I10b (data-plane halves), I12/I17 (partial), I14 (retention half) → **M2**; I24 → **M3** (binding §8 owed-item). All are explicitly layer-tagged; none are silently dropped.
+**Deferred-with-layer (permitted by the gate spec):** I1, I10b (data-plane halves), I12/I17 (partial) → **M2** (**I14 retention half + I17 sampler install/consume now CLOSED in M2 slice 3**); I24 → **M3** (binding §8 owed-item). All are explicitly layer-tagged; none are silently dropped.
 
 ---
 
@@ -126,7 +126,7 @@ Each invariant → the executable check (function / test), or an explicit deferr
 |---|---|
 | (a) randomized 10M+/≥1000 seeds, 0 violations | ✅ **CI green** (run 29182450338, 10M × {2,3} stages) + local |
 | (b) all mutation parities caught | ✅ **5/5 at 200/200** (Mut1–Mut4 + Mut5 F-UNSERVABLE monotone-mutation) |
-| (c) directed scenarios | ✅ except I24 (→M3) and SAMPLE_NEXT retention (→M2), both deferred-with-owed-item |
+| (c) directed scenarios | ✅ except I24 (→M3, deferred-with-owed-item); SAMPLE_NEXT retention **CLOSED in M2 slice 3** (`sampler_pipeline.rs::duplicate_sample_next_is_idempotent_and_does_not_advance_rng`) |
 | (d) 4 TLC-trace replays | ✅ 4/4, event-sequence fidelity |
 | (e) TLC six configs | ⚠️ **REVISED (correction):** BaselineLiveness is **NOT** clean — `Progress` fairness artifact (F-LIVENESS-FAIR §7.13), escalated + paused for ratification. Mut1/Mut2/Mut4 conclusive-good; baseline-safety fixpoint + Mut3 pending (CI, `-recover` chain now working) |
 | (f) I1–I25 coverage map | ✅ complete; no unmapped invariant |
