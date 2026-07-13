@@ -51,7 +51,7 @@ fn truncate_at_every_offset() {
             continue;
         }
         let scan = scan.unwrap_or_else(|e| panic!("t={t}: scan failed: {e}"));
-        let last_b = *boundaries.iter().filter(|&&b| b <= t as u64).last().unwrap();
+        let last_b = *boundaries.iter().rfind(|&&b| b <= t as u64).unwrap();
         let complete = boundaries.iter().filter(|&&b| b <= t as u64).count() - 1;
         assert_eq!(scan.records.len(), complete, "t={t}: record count");
         assert_eq!(scan.durable_len, last_b, "t={t}: durable_len");
