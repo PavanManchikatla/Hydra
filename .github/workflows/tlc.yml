@@ -138,14 +138,27 @@ jobs:
       - name: Classify result
         working-directory: verification
         run: |
+          # Semantic classification (F-LIVENESS-FAIR hardening): assert the TLC OUTCOME per config;
+          # NEVER map job-step success to GREEN. A results table may say GREEN only when this step
+          # writes verdict=GREEN. Time-boxed exits are an explicit INCONCLUSIVE, not a pass.
           log=ci-results/${{ matrix.name }}.log
           violated=$(grep -cE "Invariant .* is violated|Temporal properties were violated" "$log" || true)
-          complete=$(grep -cE "Model checking completed. No error" "$log" || true)
-          echo "expect=${{ matrix.expect }} violated=$violated complete=$complete" | tee ci-results/${{ matrix.name }}.status
-          if [ "${{ matrix.expect }}" = "violation" ] && [ "$violated" -ge 1 ]; then exit 0; fi
-          if [ "${{ matrix.expect }}" = "clean" ] && [ "$complete" -ge 1 ]; then exit 0; fi
-          # Not yet conclusive (timed out at the 6 h boundary): upload checkpoint and continue next dispatch.
-          echo "INCONCLUSIVE — checkpoint uploaded; re-dispatch with recover=true to continue."
+          complete=$(grep -cE "Model checking completed\. No error" "$log" || true)
+          verdict=INCONCLUSIVE; rc=0
+          if [ "${{ matrix.expect }}" = "violation" ]; then
+            if [ "$violated" -ge 1 ]; then verdict=GREEN            # mutation fired as designed
+            elif [ "$complete" -ge 1 ]; then verdict=MASKED-FAILURE; rc=1  # drained clean => mutation stopped firing
+            fi
+          else # expect = clean
+            if [ "$violated" -ge 1 ]; then verdict=VIOLATION; rc=1  # a "clean" config that violates: surface loudly, never green
+            elif [ "$complete" -ge 1 ]; then verdict=GREEN          # reached fixpoint / no error
+            fi
+          fi
+          echo "config=${{ matrix.name }} expect=${{ matrix.expect }} violated=$violated complete=$complete verdict=$verdict" | tee ci-results/${{ matrix.name }}.status
+          if [ "$verdict" = "INCONCLUSIVE" ]; then
+            echo "INCONCLUSIVE (time-boxed) — checkpoint uploaded; re-dispatch recover=true to continue. NOT green."
+          fi
+          exit $rc
       - name: Upload checkpoint + log
         if: always()
         uses: actions/upload-artifact@v4
