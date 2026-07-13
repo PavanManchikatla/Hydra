@@ -17,9 +17,13 @@ on:
   workflow_dispatch:
     inputs:
       recover:
-        description: 'Long run: resume from the most recent checkpoint artifact'
+        description: 'Long run: resume from a prior run''s checkpoint artifact (set run_id too)'
         type: boolean
         default: false
+      run_id:
+        description: 'Source run-id whose tlc-checkpoint-* artifacts to resume (with recover=true). Empty = this run.'
+        type: string
+        default: ''
   schedule:
     - cron: '0 6 * * 1'   # weekly Monday 06:00 UTC — kicks the long job
 
@@ -92,6 +96,9 @@ jobs:
   long:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read          # required for cross-run artifact download (§7.15 -recover fix)
     timeout-minutes: 350   # ~5.8 h, under GitHub's 6 h ceiling
     strategy:
       fail-fast: false
@@ -101,6 +108,13 @@ jobs:
           - { name: baseline-live,   cfg: BaselineLiveness.cfg, expect: clean }
           - { name: mut1,            cfg: Mut1Unservable.cfg,    expect: violation }
           - { name: mut3,            cfg: Mut3AttemptFence.cfg,  expect: violation }
+          # §7.15/Q2 fast mutation lane: deliberately smaller SOUND bounds (MaxCrashes=1, MaxPos=1)
+          # so the F2 fencing counterexample is shallow — a mutation check only needs the violation
+          # to exist at SOME sound bounds. Paired with baseline-safety-fast at the IDENTICAL bounds
+          # (must be clean) so a Mut3Fast fire is provably mutation-induced, not bound-induced.
+          # These drain fast (well under the 320m box); no -recover needed.
+          - { name: mut3-fast,          cfg: Mut3Fast.cfg,          expect: violation }
+          - { name: baseline-safety-fast, cfg: BaselineSafetyFast.cfg, expect: clean }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -111,11 +125,16 @@ jobs:
           curl -sSL -o tla2tools.jar "$TLA_URL"
           echo "$TLA_SHA256  tla2tools.jar" | sha256sum -c -
       - name: Restore prior checkpoint (if recovering)
+        # §7.15 fix: download-artifact@v4 is CURRENT-run-scoped by default, so a fresh dispatch
+        # cannot see a prior run's checkpoint — recover=true silently started fresh. Passing
+        # run-id + github-token fetches the source run's artifact so -recover actually resumes.
         if: ${{ inputs.recover }}
         uses: actions/download-artifact@v4
         with:
           name: tlc-checkpoint-${{ matrix.name }}
           path: verification/states
+          run-id: ${{ inputs.run_id || github.run_id }}
+          github-token: ${{ github.token }}
         continue-on-error: true
       - name: Run ${{ matrix.name }} (checkpointed)
         working-directory: verification
@@ -126,6 +145,12 @@ jobs:
             CK=$(ls -dt states/*/ 2>/dev/null | head -1)
             [ -n "$CK" ] && RECOVER="-recover ${CK%/}"
           fi
+          # §7.15: make the recover decision unambiguous in the log (rule 12 — observe the
+          # round-trip: a resume must print TLC's own "Starting recovery from checkpoint" marker,
+          # not this FRESH line). recover=true + FRESH here means the cross-run fetch still failed.
+          if [ -n "$RECOVER" ]; then echo "RECOVER-DECISION: RESUMING from $RECOVER"; \
+          elif [ "${{ inputs.recover }}" = "true" ]; then echo "RECOVER-DECISION: recover=true but NO checkpoint restored — FRESH (fetch failed)"; \
+          else echo "RECOVER-DECISION: fresh run (recover not requested)"; fi
           # -checkpoint 60: snapshot every 60 min so a boundary loses at most ~1 h.
           # INNER time-box (`timeout 320m`, < the 350-min job timeout): a long config that will
           # not drain in one job must EXIT CLEANLY here (timeout rc 124, swallowed) so the Classify
