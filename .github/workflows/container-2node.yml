@@ -1,0 +1,58 @@
+name: container-2node
+
+# M2 FWD slice, seam 4 — the containerized two-node recovery test (amended M2 DoD).
+# Two `hydra-worker` CONTAINERS, real TCP+mTLS between the coordinator and each, `docker kill` as
+# the kill −9 mechanism. Permanent workflow: on push (to the relevant paths), weekly, and dispatch.
+# Rule-16 spirit: the job is GREEN only if the log proves the recovery assertion held
+# (`CONTAINER_2NODE_RECOVERY_OK`) — a container/runner exit alone is never mapped to pass.
+
+on:
+  push:
+    paths:
+      - 'crates/hydra-worker/**'
+      - 'crates/hydra-state/**'
+      - 'crates/hydra-transport/**'
+      - 'crates/hydra-proto/**'
+      - 'docker/hydra-worker.Dockerfile'
+      - '.github/workflows/container-2node.yml'
+  workflow_dispatch: {}
+  schedule:
+    - cron: '30 6 * * 1'   # weekly Monday 06:30 UTC
+
+jobs:
+  two-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # No submodule init → hydra-engine-sys degrades to its control-plane stub (no model, no C++
+      # toolchain needed); this CI exercises the two-node kill/recover machinery, not the engine.
+      - uses: actions/checkout@v4
+
+      - name: Build the control-plane hydra-worker image
+        run: docker build -f docker/hydra-worker.Dockerfile -t hydra-worker:ci .
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Build the container-2node runner (engine-stubbed, control-plane)
+        run: cargo build --release --bin hydra-2node-ci -p hydra-worker
+
+      - name: Run the two-node docker-kill recovery
+        env:
+          HYDRA_WORKER_IMAGE: hydra-worker:ci
+        run: |
+          set -o pipefail
+          ./target/release/hydra-2node-ci 2>&1 | tee ci-2node.log
+
+      - name: Assert the recovery assertion held (rule-16 spirit — the log, not the exit)
+        run: |
+          if grep -q "CONTAINER_2NODE_RECOVERY_OK" ci-2node.log; then
+            echo "verdict=GREEN (two-node docker-kill recovery held)"
+          else
+            echo "verdict=FAIL — CONTAINER_2NODE_RECOVERY_OK absent; recovery assertion did NOT hold"
+            exit 1
+          fi
+
+      - name: Cleanup containers
+        if: always()
+        run: docker rm -f hydra-ci-s1 hydra-ci-sp hydra-ci-sp2 2>/dev/null || true

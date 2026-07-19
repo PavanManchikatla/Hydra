@@ -1,0 +1,11 @@
+# Keep the docker build context small — the worker image needs only the Rust source.
+# (In CI the checkout has none of these; this protects local `docker build` from the ~14 GB trees.)
+target/
+vendor/llama.cpp/build/
+vendor/llama.cpp/**/*.o
+.git/
+models/
+*.gguf
+verification/states/
+verification/results/
+verification/tools/
