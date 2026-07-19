@@ -28,7 +28,10 @@ use hydra_transport::{ClusterCa, DeviceIdentity};
 use crate::bootstrap::Bootstrap;
 use crate::sampler::SamplingConfig;
 use crate::wire::{self, Msg, SessionKeys};
-use crate::worker::{serve_conn, serve_conn_forwarding, serve_multi_conn, shared, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
+use crate::worker::{
+    serve_conn, serve_conn_forwarding, serve_conn_forwarding_relink, serve_multi_conn, shared, DownTarget, Worker,
+    WorkerConfig, INITIAL_CHECKPOINT_ID,
+};
 
 /// A cluster CA + issued identities for the coordinator and workers (dev/local-pair pairing).
 pub struct Cluster {
@@ -102,11 +105,7 @@ pub fn spawn_multiconn_endpoint(cfg: WorkerConfig, server_cfg: rustls::ServerCon
 /// Spawn a **forwarding** S1 endpoint: it connects **out** to the downstream S2 once at startup, then
 /// serves the coordinator with [`serve_conn_forwarding`] so each `FWD` boundary travels **S1→S2
 /// directly** (worker→worker), never relayed through the coordinator. Returns S1's bound address.
-/// A shared, updatable downstream target for a forwarding endpoint. When the downstream stage is
-/// killed and replaced (a two-stage D1 recovery), the survivor re-links to the new peer on its next
-/// upstream connection — its own KV is preserved (the [`Worker`] outlives the accept loop).
-pub type DownTarget = std::sync::Arc<std::sync::Mutex<(SocketAddr, String)>>;
-
+/// ([`DownTarget`] is the shared, updatable downstream address used by the re-linking variant below.)
 pub fn spawn_forwarding_endpoint(
     cfg: WorkerConfig,
     server_cfg: rustls::ServerConfig,
@@ -129,6 +128,34 @@ pub fn spawn_forwarding_endpoint(
                     Err(_) => continue,
                 };
                 let _ = serve_conn_forwarding(&mut worker, &mut up, &mut dc).await;
+            }
+        });
+    });
+    rx.recv().expect("forwarding endpoint addr")
+}
+
+/// Spawn a **re-linking** forwarding endpoint (P1·1a): each upstream (coordinator) connection is served
+/// with [`serve_conn_forwarding_relink`], whose downstream link is **reconnectable** from the shared
+/// `down` target. If the downstream stage is killed and replaced mid-session, this survivor keeps
+/// serving its upstream on the same connection and re-links to the replacement on its next forward —
+/// the direct-FWD recovery re-link. `down_connector` presents this stage's own identity (S1 dials S2).
+/// Returns S1's bound address.
+pub fn spawn_forwarding_endpoint_relink(
+    cfg: WorkerConfig,
+    server_cfg: rustls::ServerConfig,
+    down_connector: TcpMtls,
+    down: DownTarget,
+    relink_retries: usize,
+) -> SocketAddr {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind s1");
+            tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut worker = Worker::new(cfg).expect("worker");
+            while let Ok(mut up) = listener.accept().await {
+                let _ = serve_conn_forwarding_relink(&mut worker, &mut up, &down_connector, &down, relink_retries).await;
             }
         });
     });

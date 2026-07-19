@@ -18,10 +18,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use std::net::SocketAddr;
+
 use hydra_engine_sys::{Context, EngineError, Model, ENGINE_AVAILABLE};
 use hydra_state::{ActivationKind, ActivationTuple, Epoch, RecoveryId, Stage, StageEffect, StageEvent, StageRank};
 use hydra_transport::framed::Conn;
-use hydra_transport::tcp_mtls::TcpMtlsListener;
+use hydra_transport::tcp_mtls::{ClientConn, TcpMtls, TcpMtlsListener};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::sampler::{Sampler, SamplerError, SamplingConfig};
@@ -488,5 +490,105 @@ pub async fn serve_multi_conn(worker: SharedWorker, listener: TcpMtlsListener) -
                 eprintln!("hydra-worker: connection ended with error: {e}");
             }
         });
+    }
+}
+
+// --------------------------- direct-FWD recovery re-link (P1·1a) ---------------------------
+//
+// In a direct-FWD pipeline the survivor stage forwards each boundary **straight** to its downstream
+// peer (worker→worker). When that peer is killed and replaced (a two-stage D1 recovery), the survivor
+// must re-link its outbound down-link to the replacement — **without** its own upstream (coordinator)
+// connection reconnecting, and **preserving its own KV** (the `Worker` outlives the re-link). The
+// coordinator drives the replacement's rebuild (from the durable `BoundaryStore`) + activation, then
+// updates the shared [`DownTarget`]; the survivor re-links on its next forward.
+
+/// A shared, updatable downstream target (address + certificate name). The coordinator rewrites it
+/// when it brings up a replacement downstream stage; the survivor re-links to the new value.
+pub type DownTarget = std::sync::Arc<std::sync::Mutex<(SocketAddr, String)>>;
+
+/// Forward `frame` to the downstream peer named by `down` and return its response, **re-linking on
+/// failure**: if the current connection is absent or errors (the downstream died), drop it, re-read
+/// the shared `DownTarget`, and reconnect — up to `retries` attempts with a short backoff — before
+/// surfacing the error. The survivor's `Worker`/KV and its upstream connection are untouched. This is
+/// the direct-FWD recovery re-link primitive (P1·1a).
+pub async fn forward_with_relink(
+    dc: &mut Option<ClientConn>,
+    connector: &TcpMtls,
+    down: &DownTarget,
+    frame: &[u8],
+    retries: usize,
+) -> Result<Vec<u8>, WorkerError> {
+    let mut last: Option<WorkerError> = None;
+    for attempt in 0..=retries {
+        // (Re)connect from the CURRENT target — after a failure this picks up the replacement.
+        if dc.is_none() {
+            let (addr, name) = down.lock().unwrap().clone();
+            match connector.connect(addr, &name).await {
+                Ok(c) => *dc = Some(c),
+                Err(e) => {
+                    last = Some(e.into());
+                    if attempt < retries {
+                        relink_backoff(attempt).await;
+                    }
+                    continue;
+                }
+            }
+        }
+        let conn = dc.as_mut().unwrap();
+        match forward_once(conn, frame).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                *dc = None; // dead link — re-link on the next attempt
+                last = Some(e);
+                if attempt < retries {
+                    relink_backoff(attempt).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or(WorkerError::EngineUnavailable))
+}
+
+async fn forward_once(conn: &mut ClientConn, frame: &[u8]) -> Result<Vec<u8>, WorkerError> {
+    conn.send(0, frame).await?;
+    Ok(conn.recv().await?.payload)
+}
+
+/// Small bounded backoff between re-link attempts. The coordinator sequences the replacement's
+/// readiness before driving the survivor's next forward, so this only smooths a brief window.
+async fn relink_backoff(attempt: usize) {
+    tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1))).await;
+}
+
+/// Serve one upstream connection with **worker→worker direct FWD and a reconnectable downstream**:
+/// like [`serve_conn_forwarding`], but the down-link is re-established from the shared `DownTarget`
+/// on failure ([`forward_with_relink`]). A downstream stage can be killed and replaced mid-session
+/// and this survivor keeps serving its upstream on the same connection, re-linking to the replacement
+/// on its next forward (the direct-FWD recovery re-link, P1·1a). Non-`FWD` replies go straight back.
+pub async fn serve_conn_forwarding_relink<U>(
+    worker: &mut Worker,
+    up: &mut Conn<U>,
+    connector: &TcpMtls,
+    down: &DownTarget,
+    relink_retries: usize,
+) -> Result<(), WorkerError>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut dc: Option<ClientConn> = None;
+    loop {
+        let frame = match up.recv().await {
+            Ok(f) => f,
+            Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for reply in worker.on_frame(&frame.payload)? {
+            if wire::is_fwd_frame(&reply) {
+                let resp = forward_with_relink(&mut dc, connector, down, &reply, relink_retries).await?;
+                up.send(0, &resp).await?;
+            } else {
+                up.send(0, &reply).await?;
+            }
+        }
     }
 }
