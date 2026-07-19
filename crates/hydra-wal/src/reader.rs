@@ -38,6 +38,7 @@ fn is_known_type(t: u16) -> bool {
             | SEGMENT_COMMIT
             | GENERATION_COMMIT
             | INPUT_CHUNK_COMMIT
+            | BOUNDARY_COPY
             | BEGIN_RECOVERY
             | RESET_RECOVERY_ATTEMPT
             | ACTIVATION_COMMIT_INTENT

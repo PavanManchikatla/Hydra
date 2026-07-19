@@ -8,12 +8,14 @@
 //! - [`commit_stream`] (sub-slice A) — `INITIAL_COMMIT` / `GENERATION_COMMIT` on a real `hydra-wal`
 //!   disk file; `snapshot(q)` embedded from the SAMPLED ring; I19 validated on write.
 
+pub mod boundary_store;
 pub mod commit_stream;
 pub mod event_log;
 pub mod recovery;
 pub mod server;
 pub mod session;
 
+pub use boundary_store::{BoundaryError, BoundaryStore, DurableBoundary};
 pub use commit_stream::{CommitError, CommitStream, Durability, GroupBatch, GroupCommitter, WalFenceCtx};
 pub use event_log::{Event, EventLog};
 pub use recovery::{CommitStreamStats, RecoveryError, RecoveryState};

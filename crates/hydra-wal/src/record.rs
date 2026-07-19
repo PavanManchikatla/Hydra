@@ -23,6 +23,9 @@ pub mod rec_type {
     pub const SEGMENT_COMMIT: u16 = 2;
     pub const GENERATION_COMMIT: u16 = 3;
     pub const INPUT_CHUNK_COMMIT: u16 = 4;
+    /// A durably-copied stage boundary residual (D1 substrate, spec §5/§7). Payload = the
+    /// authoritative `hydra.proto.BoundaryCopy` flatbuffer (no shadow struct).
+    pub const BOUNDARY_COPY: u16 = 5;
     // control WAL
     pub const BEGIN_RECOVERY: u16 = 10;
     pub const RESET_RECOVERY_ATTEMPT: u16 = 11;
