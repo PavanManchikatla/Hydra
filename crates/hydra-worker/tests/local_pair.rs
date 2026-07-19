@@ -76,6 +76,48 @@ async fn two_worker_teacher_forced_no_sample_bit_exact() {
 }
 
 #[tokio::test]
+async fn direct_worker_to_worker_fwd_is_bit_exact() {
+    // The bit-exact anchor via WORKER→WORKER direct FWD (spec §4): the coordinator talks only to S1;
+    // S1 forwards each boundary straight to S2 (never relayed through the coordinator). S2's final
+    // logits must still match the unsplit model bit-exactly — proving direct FWD replaces the
+    // coordinator-relay interim without changing semantics.
+    let Some(path) = dev_model_path() else {
+        eprintln!("SKIP: no engine/model (dev-environment artifacts)");
+        return;
+    };
+    let (tokens, golden, n_layer) = {
+        let model = hydra_engine_sys::Model::load(&path, 0).expect("load model");
+        let tokens: Vec<u32> = model.tokenize("The capital of France is").expect("tokenize").into_iter().map(|t| t as u32).collect();
+        let golden = golden_digest(&model, &tokens).expect("golden");
+        (tokens, golden, model.n_layer())
+    };
+    let k = (n_layer / 2).max(1);
+    let keys = SessionKeys::dev(0xFD);
+    let n_ctx = tokens.len() as i32 + 8;
+
+    let cluster = Cluster::new().unwrap();
+    let s1_id = cluster.issue("worker-s1").unwrap();
+    let s2_id = cluster.issue("worker-s2").unwrap();
+    let s1_client = cluster.issue("worker-s1-client").unwrap();
+
+    let mk = |rank, lf, ll, is_final, toks| WorkerConfig {
+        keys: keys.clone(), rank, layer_first: lf, layer_last: ll, is_final,
+        receives_tokens: toks, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
+        sampler_config: None, recovery_start: false,
+    };
+    // S2 first (S1 connects to it at startup).
+    let s2_addr = hydra_worker::pair::spawn_endpoint(mk(1, k, -1, true, false), cluster.ca.server_config(&s2_id).unwrap());
+    let s1_down = hydra_transport::tcp_mtls::TcpMtls::from_config(cluster.ca.client_config(&s1_client).unwrap()).unwrap();
+    let s1_addr = hydra_worker::pair::spawn_forwarding_endpoint(
+        mk(0, 0, k, false, true), cluster.ca.server_config(&s1_id).unwrap(), s1_down, s2_addr, "worker-s2".to_string(),
+    );
+
+    let connector = cluster.coordinator_connector().unwrap();
+    let digest = hydra_worker::pair::run_direct_fwd_pipeline(&connector, s1_addr, "worker-s1", &keys, &tokens).await.expect("direct-fwd pipeline");
+    assert_eq!(digest, golden, "worker→worker direct FWD must reproduce the unsplit logits bit-exactly (k={k}/{n_layer})");
+}
+
+#[tokio::test]
 async fn subprocess_worker_survives_kill_9_and_restart() {
     let binary = env!("CARGO_BIN_EXE_hydra-worker");
     let cluster = Cluster::new().unwrap();

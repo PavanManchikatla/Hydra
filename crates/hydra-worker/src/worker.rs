@@ -233,7 +233,10 @@ impl Worker {
                 Ok(self.step_control(StageEvent::RecvBegin { base, target, recovery_id, truncate_to }))
             }
             Msg::CatchUpContext { goal_input_pos } => Ok(self.catch_up(goal_input_pos)),
-            // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them.
+            // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them. The
+            // durability-plane acks (DURABILITY_ACK / COMMIT_ACK / COMMIT_SYNC) are consumed by the
+            // release-rule logic in the serve loop, not by `on_frame`; a stage worker that is not a
+            // durability target ignores an inbound BOUNDARY_COPY (seam 2 gives the target a handler).
             Msg::ActivationCommitted(_)
             | Msg::ActivationFinalized
             | Msg::RecoveryAck { .. }
@@ -241,6 +244,10 @@ impl Worker {
             | Msg::AppliedAck { .. }
             | Msg::Sampled { .. }
             | Msg::SamplerCheckpointInstalled { .. }
+            | Msg::BoundaryCopy { .. }
+            | Msg::DurabilityAck { .. }
+            | Msg::CommitAck { .. }
+            | Msg::CommitSync { .. }
             | Msg::Err { .. } => Ok(vec![]),
         }
     }
@@ -377,6 +384,36 @@ where
         };
         for reply in worker.on_frame(&frame.payload)? {
             conn.send(0, &reply).await?;
+        }
+    }
+}
+
+/// Serve one upstream connection with **worker→worker direct FWD** (spec §4 data plane): when
+/// `on_frame` produces a `FWD` boundary, it is sent **straight to the downstream peer** over `down`
+/// — never relayed through the coordinator — and the peer's response (an `APPLIED_ACK`, or its own
+/// `FWD` for a 3-stage pipeline) is relayed back upstream. Non-`FWD` replies (control-plane acks) go
+/// straight back upstream. This replaces the coordinator-relay interim: the expensive boundary
+/// tensor travels S1→S2 directly; only the small ack traverses the coordinator edge.
+pub async fn serve_conn_forwarding<U, D>(worker: &mut Worker, up: &mut Conn<U>, down: &mut Conn<D>) -> Result<(), WorkerError>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    D: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let frame = match up.recv().await {
+            Ok(f) => f,
+            Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for reply in worker.on_frame(&frame.payload)? {
+            if wire::is_fwd_frame(&reply) {
+                // Direct S1→S2: the boundary never touches the coordinator.
+                down.send(0, &reply).await?;
+                let resp = down.recv().await?;
+                up.send(0, &resp.payload).await?;
+            } else {
+                up.send(0, &reply).await?;
+            }
         }
     }
 }

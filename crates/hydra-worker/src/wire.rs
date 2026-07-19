@@ -71,6 +71,16 @@ pub enum Msg {
     Fwd { first_input_pos: i64, no_sample: bool, activations: Vec<f32> },
     /// `APPLIED_ACK` — `output_checksum` carries the final-stage logits digest for the anchor.
     AppliedAck { cumulative_input_pos: i64, output_checksum: Vec<u8> },
+    /// `BOUNDARY_COPY` (Si -> durability target): a boundary residual chunk copied for durable D1
+    /// recovery. `boundary_id` is the edge index i (between Si and Si+1); `chunk_id` sequences chunks.
+    BoundaryCopy { boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: Vec<f32> },
+    /// `DURABILITY_ACK` — the durability target has made boundary `boundary_id` durable through
+    /// `durable_through_input_pos` (the R3′ release condition, spec §5).
+    DurabilityAck { boundary_id: u32, durable_through_input_pos: i64, storage_generation: u64 },
+    /// `COMMIT_ACK` — downstream has committed through `committed_through_output_pos`.
+    CommitAck { committed_through_output_pos: i64 },
+    /// `COMMIT_SYNC` — a piggybacked commit watermark to `commit_up_to_output_pos`.
+    CommitSync { commit_up_to_output_pos: i64 },
     // --- control plane (maps 1:1 to StageEvent) ---
     CommitActivation(ActivationTuple),
     ActivationCommitted(ActivationTuple),
@@ -136,6 +146,12 @@ pub fn decode(payload: &[u8], keys: &SessionKeys) -> Result<(FenceView, Msg), Wi
     Ok((view, msg))
 }
 
+/// Cheap peek: is this frame a `FWD`? (roots the flatbuffer, reads `body_type`, touches no tensor).
+/// Used by the forwarding serve loop to route a boundary directly to the downstream peer.
+pub fn is_fwd_frame(payload: &[u8]) -> bool {
+    flatbuffers::root::<proto::Frame>(payload).map(|f| f.body_type() == proto::Body::Fwd).unwrap_or(false)
+}
+
 fn tuple_from_wire(t: proto::ActivationTuple<'_>) -> ActivationTuple {
     ActivationTuple {
         kind: match t.kind() {
@@ -178,6 +194,35 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
                 cumulative_input_pos: a.cumulative_input_pos(),
                 output_checksum: a.output_checksum().map(|v| v.bytes().to_vec()).unwrap_or_default(),
             })
+        }
+        Body::BoundaryCopy => {
+            let b = frame.body_as_boundary_copy().ok_or(WireError::Malformed("BoundaryCopy".into()))?;
+            let t = b.activations();
+            if t.dtype() != proto::DType::F32 {
+                return Err(WireError::Malformed("BoundaryCopy activations must be F32".into()));
+            }
+            Ok(Msg::BoundaryCopy {
+                boundary_id: b.boundary_id(),
+                first_input_pos: b.first_input_pos(),
+                chunk_id: b.chunk_id(),
+                activations: bytes_to_f32_le(t.data().bytes()),
+            })
+        }
+        Body::DurabilityAck => {
+            let d = frame.body_as_durability_ack().ok_or(WireError::Malformed("DurabilityAck".into()))?;
+            Ok(Msg::DurabilityAck {
+                boundary_id: d.boundary_id(),
+                durable_through_input_pos: d.durable_through_input_pos(),
+                storage_generation: d.storage_generation(),
+            })
+        }
+        Body::CommitAck => {
+            let c = frame.body_as_commit_ack().ok_or(WireError::Malformed("CommitAck".into()))?;
+            Ok(Msg::CommitAck { committed_through_output_pos: c.committed_through_output_pos() })
+        }
+        Body::CommitSync => {
+            let c = frame.body_as_commit_sync().ok_or(WireError::Malformed("CommitSync".into()))?;
+            Ok(Msg::CommitSync { commit_up_to_output_pos: c.commit_up_to_output_pos() })
         }
         Body::CommitActivation => {
             let c = frame.body_as_commit_activation().ok_or(WireError::Malformed("CommitActivation".into()))?;
@@ -375,6 +420,46 @@ pub fn encode_applied_ack(keys: &SessionKeys, epoch: Epoch, cumulative_input_pos
         &proto::AppliedAckArgs { cumulative_input_pos, output_checksum: Some(output_checksum) },
     );
     finish_frame(&mut fbb, fence, proto::Body::AppliedAck, body.as_union_value())
+}
+
+pub fn encode_boundary_copy(keys: &SessionKeys, epoch: Epoch, boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let data = fbb.create_vector(&f32_to_bytes_le(activations));
+    let dims = fbb.create_vector(&[activations.len() as u32]);
+    let tensor = proto::Tensor::create(
+        &mut fbb,
+        &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
+    );
+    let body = proto::BoundaryCopy::create(
+        &mut fbb,
+        &proto::BoundaryCopyArgs { boundary_id, first_input_pos, n_positions: 1, chunk_id, activations: Some(tensor) },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::BoundaryCopy, body.as_union_value())
+}
+
+pub fn encode_durability_ack(keys: &SessionKeys, epoch: Epoch, boundary_id: u32, durable_through_input_pos: i64, storage_generation: u64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let body = proto::DurabilityAck::create(
+        &mut fbb,
+        &proto::DurabilityAckArgs { boundary_id, durable_through_input_pos, storage_generation },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::DurabilityAck, body.as_union_value())
+}
+
+pub fn encode_commit_ack(keys: &SessionKeys, epoch: Epoch, committed_through_output_pos: i64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let body = proto::CommitAck::create(&mut fbb, &proto::CommitAckArgs { committed_through_output_pos });
+    finish_frame(&mut fbb, fence, proto::Body::CommitAck, body.as_union_value())
+}
+
+pub fn encode_commit_sync(keys: &SessionKeys, epoch: Epoch, commit_up_to_output_pos: i64) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let body = proto::CommitSync::create(&mut fbb, &proto::CommitSyncArgs { commit_up_to_output_pos });
+    finish_frame(&mut fbb, fence, proto::Body::CommitSync, body.as_union_value())
 }
 
 pub fn encode_commit_activation(keys: &SessionKeys, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {

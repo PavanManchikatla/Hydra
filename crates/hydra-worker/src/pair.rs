@@ -28,7 +28,7 @@ use hydra_transport::{ClusterCa, DeviceIdentity};
 use crate::bootstrap::Bootstrap;
 use crate::sampler::SamplingConfig;
 use crate::wire::{self, Msg, SessionKeys};
-use crate::worker::{serve_conn, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
+use crate::worker::{serve_conn, serve_conn_forwarding, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
 
 /// A cluster CA + issued identities for the coordinator and workers (dev/local-pair pairing).
 pub struct Cluster {
@@ -75,6 +75,55 @@ pub fn spawn_endpoint(
         });
     });
     rx.recv().expect("endpoint addr")
+}
+
+/// Spawn a **forwarding** S1 endpoint: it connects **out** to the downstream S2 once at startup, then
+/// serves the coordinator with [`serve_conn_forwarding`] so each `FWD` boundary travels **S1→S2
+/// directly** (worker→worker), never relayed through the coordinator. Returns S1's bound address.
+pub fn spawn_forwarding_endpoint(
+    cfg: WorkerConfig,
+    server_cfg: rustls::ServerConfig,
+    down_connector: TcpMtls,
+    down_addr: SocketAddr,
+    down_name: String,
+) -> SocketAddr {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind s1");
+            tx.send(listener.local_addr().unwrap()).unwrap();
+            let mut worker = Worker::new(cfg).expect("worker");
+            // The S1→S2 link, established once and reused across coordinator reconnects.
+            let mut down = down_connector.connect(down_addr, &down_name).await.expect("connect downstream S2");
+            while let Ok(mut up) = listener.accept().await {
+                let _ = serve_conn_forwarding(&mut worker, &mut up, &mut down).await;
+            }
+        });
+    });
+    rx.recv().expect("forwarding endpoint addr")
+}
+
+/// Drive the teacher-forced NO_SAMPLE prefill with **worker→worker direct FWD**: the coordinator
+/// talks **only to S1**; S1 forwards each boundary straight to S2 and relays S2's `APPLIED_ACK` back.
+/// Returns the final position's logits digest (bit-exact anchor, now without the coordinator relay).
+pub async fn run_direct_fwd_pipeline(connector: &TcpMtls, s1_addr: SocketAddr, s1_name: &str, keys: &SessionKeys, tokens: &[u32]) -> Result<[u8; 32], String> {
+    let mut c = connector.connect(s1_addr, s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut last_digest = [0u8; 32];
+    for (pos, &tok) in tokens.iter().enumerate() {
+        c.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("send s1: {e}"))?;
+        let r = c.recv().await.map_err(|e| format!("recv s1: {e}"))?;
+        match wire::decode(&r.payload, keys).map_err(|e| format!("decode: {e}"))?.1 {
+            Msg::AppliedAck { cumulative_input_pos, output_checksum } => {
+                if cumulative_input_pos != pos as i64 {
+                    return Err(format!("pos mismatch: {cumulative_input_pos} != {pos}"));
+                }
+                last_digest = output_checksum.try_into().map_err(|_| "digest not 32 bytes".to_string())?;
+            }
+            other => return Err(format!("pos {pos}: expected APPLIED_ACK (relayed from S2), got {other:?}")),
+        }
+    }
+    Ok(last_digest)
 }
 
 /// The unsplit reference: apply `tokens` **one at a time** (matching the pipeline's per-position
