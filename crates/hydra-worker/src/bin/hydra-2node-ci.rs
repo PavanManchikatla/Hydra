@@ -53,15 +53,17 @@ impl ContainerWorker {
     /// accept a connection.
     fn spawn(cluster: &Cluster, name: &str, boot_path: &str) -> Result<ContainerWorker, String> {
         let _ = docker(&["rm", "-f", name]); // idempotent
+        // Mount the bootstrap to a root-level FILE path (not `/boot` — that is an existing directory
+        // in the Debian base image, and a file→directory bind mount fails).
         docker(&[
             "run", "-d", "--name", name,
-            "-v", &format!("{boot_path}:/boot:ro"),
+            "-v", &format!("{boot_path}:/hydra.boot:ro"),
             "-p", &format!("127.0.0.1:0:{CONTAINER_PORT}"),
-            &image(), "/boot",
+            &image(), "/hydra.boot",
         ])?;
-        // Read the published host port.
+        // Read the published host port (`docker port` may print several lines — take the first).
         let mapping = docker(&["port", name, &CONTAINER_PORT.to_string()])?; // e.g. "127.0.0.1:49153"
-        let host_port: u16 = mapping.rsplit(':').next().and_then(|p| p.trim().parse().ok())
+        let host_port: u16 = mapping.lines().next().unwrap_or("").rsplit(':').next().and_then(|p| p.trim().parse().ok())
             .ok_or_else(|| format!("could not parse published port from {mapping:?}"))?;
         let _ = cluster;
         Ok(ContainerWorker { name: name.to_string(), host_port })
