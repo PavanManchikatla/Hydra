@@ -128,11 +128,19 @@ jobs:
         # §7.15 fix: download-artifact@v4 is CURRENT-run-scoped by default, so a fresh dispatch
         # cannot see a prior run's checkpoint — recover=true silently started fresh. Passing
         # run-id + github-token fetches the source run's artifact so -recover actually resumes.
-        if: ${{ inputs.recover }}
+        # §7.16 fix: the Upload step bundles `states` AND `ci-results/*` under a common `verification`
+        # root, so the artifact root holds `states/` and `ci-results/`. Extracting into
+        # `verification/states` DOUBLE-NESTS (verification/states/{states,ci-results}) and
+        # `ls -dt states/*/` then picks `states/ci-results` → `-recover states/ci-results` → TLC
+        # throws at 00s. Extract into `verification` so the checkpoint lands at
+        # `verification/states/<ckpt>` where the Run step looks. Only the big legs recover: the
+        # `-fast` legs are fresh-only (no source checkpoint exists) — recovering them just fails the
+        # download, so skip Restore for them.
+        if: ${{ inputs.recover && !endsWith(matrix.name, '-fast') }}
         uses: actions/download-artifact@v4
         with:
           name: tlc-checkpoint-${{ matrix.name }}
-          path: verification/states
+          path: verification
           run-id: ${{ inputs.run_id || github.run_id }}
           github-token: ${{ github.token }}
         continue-on-error: true
