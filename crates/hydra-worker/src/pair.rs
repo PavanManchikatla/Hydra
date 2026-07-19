@@ -28,7 +28,7 @@ use hydra_transport::{ClusterCa, DeviceIdentity};
 use crate::bootstrap::Bootstrap;
 use crate::sampler::SamplingConfig;
 use crate::wire::{self, Msg, SessionKeys};
-use crate::worker::{serve_conn, serve_conn_forwarding, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
+use crate::worker::{serve_conn, serve_conn_forwarding, serve_multi_conn, shared, Worker, WorkerConfig, INITIAL_CHECKPOINT_ID};
 
 /// A cluster CA + issued identities for the coordinator and workers (dev/local-pair pairing).
 pub struct Cluster {
@@ -72,6 +72,28 @@ pub fn spawn_endpoint(
             while let Ok(mut conn) = listener.accept().await {
                 let _ = serve_conn(&mut worker, &mut conn).await;
             }
+        });
+    });
+    rx.recv().expect("endpoint addr")
+}
+
+/// Spawn an **in-process** endpoint that serves **concurrent** inbound connections against one shared
+/// `Worker` (the multi-connection serve loop, P1·1a). Unlike [`spawn_endpoint`] (one connection served
+/// to completion before the next is accepted), this lets a stage serve its upstream `FWD` **and** the
+/// coordinator's control connection at the same time (the seam-3 requirement for a direct-FWD
+/// pipeline with a coordinator-controlled S_P). Returns the bound loopback address.
+pub fn spawn_multiconn_endpoint(cfg: WorkerConfig, server_cfg: rustls::ServerConfig) -> SocketAddr {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg)
+                .await
+                .expect("bind endpoint");
+            tx.send(listener.local_addr().unwrap()).unwrap();
+            let worker = shared(Worker::new(cfg).expect("worker"));
+            let _ = serve_multi_conn(worker, listener).await;
         });
     });
     rx.recv().expect("endpoint addr")

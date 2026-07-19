@@ -14,11 +14,14 @@
 //! returns reply bytes — so it is unit-testable without a socket; the async [`serve_conn`] loop is
 //! the only place bytes touch a connection.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use hydra_engine_sys::{Context, EngineError, Model, ENGINE_AVAILABLE};
 use hydra_state::{ActivationKind, ActivationTuple, Epoch, RecoveryId, Stage, StageEffect, StageEvent, StageRank};
 use hydra_transport::framed::Conn;
+use hydra_transport::tcp_mtls::TcpMtlsListener;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::sampler::{Sampler, SamplerError, SamplingConfig};
@@ -420,4 +423,70 @@ where
 
 fn is_eof(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe)
+}
+
+// --------------------------- multi-connection serve loop (P1·1a) ---------------------------
+//
+// A worker→worker chained pipeline where the coordinator ALSO samples/controls a stage needs each
+// worker to serve **concurrent** inbound connections (seam-3 discovery): S_P serves S1's `FWD`
+// (data plane) **and** the coordinator's `SAMPLE_NEXT`/control at the same time; a mid stage serves
+// its upstream `FWD` and coordinator control likewise. The sequential accept loop (`serve_conn` in a
+// `while accept` loop) serves one connection to completion before accepting the next, so a long-lived
+// data connection starves the control connection — a deadlock for that topology.
+//
+// The engine's C context is not `Send`, so the single `Worker` cannot move between threads; instead
+// every connection shares **one** `Worker` on **one** thread behind a `RefCell`. The invariant that
+// makes this sound: the borrow is taken **only across the synchronous `on_frame`** and **never held
+// across an `.await`**. On a current-thread runtime one task runs at a time and `on_frame` awaits
+// nothing, so two connections' frames interleave at frame granularity with no double-borrow.
+
+/// A [`Worker`] shared across concurrent inbound connections on one thread (see the module note on
+/// the borrow-never-across-await invariant).
+pub type SharedWorker = Rc<RefCell<Worker>>;
+
+/// Wrap a worker for the multi-connection serve loop.
+pub fn shared(worker: Worker) -> SharedWorker {
+    Rc::new(RefCell::new(worker))
+}
+
+/// Serve one inbound connection against a **shared** worker: recv → `on_frame` (borrow scoped to the
+/// synchronous call, released before any send) → send each reply, until the peer closes. This is the
+/// concurrent-safe analogue of [`serve_conn`]; several of these run at once against one `Worker`.
+pub async fn serve_conn_shared<S>(worker: &SharedWorker, conn: &mut Conn<S>) -> Result<(), WorkerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let frame = match conn.recv().await {
+            Ok(f) => f,
+            Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Borrow scoped to the synchronous `on_frame` — the replies are owned bytes, so the borrow
+        // is dropped before we `.await` a send (the invariant that keeps the `RefCell` sound).
+        let replies = worker.borrow_mut().on_frame(&frame.payload)?;
+        for reply in replies {
+            conn.send(0, &reply).await?;
+        }
+    }
+}
+
+/// Accept inbound connections forever, serving each **concurrently** against the one shared `Worker`
+/// via `spawn_local` (so a slow/long-lived peer never blocks a second peer — the multi-connection
+/// requirement). Must be run inside a `tokio::task::LocalSet` on a current-thread runtime (the shared
+/// `Worker`/`Rc` are `!Send`). A per-connection error drops only that connection; a listener error
+/// ends the loop.
+pub async fn serve_multi_conn(worker: SharedWorker, listener: TcpMtlsListener) -> Result<(), WorkerError> {
+    loop {
+        let mut conn = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => return Err(e.into()),
+        };
+        let w = worker.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = serve_conn_shared(&w, &mut conn).await {
+                eprintln!("hydra-worker: connection ended with error: {e}");
+            }
+        });
+    }
 }
