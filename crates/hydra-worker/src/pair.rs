@@ -80,12 +80,16 @@ pub fn spawn_endpoint(
 /// Spawn a **forwarding** S1 endpoint: it connects **out** to the downstream S2 once at startup, then
 /// serves the coordinator with [`serve_conn_forwarding`] so each `FWD` boundary travels **S1→S2
 /// directly** (worker→worker), never relayed through the coordinator. Returns S1's bound address.
+/// A shared, updatable downstream target for a forwarding endpoint. When the downstream stage is
+/// killed and replaced (a two-stage D1 recovery), the survivor re-links to the new peer on its next
+/// upstream connection — its own KV is preserved (the [`Worker`] outlives the accept loop).
+pub type DownTarget = std::sync::Arc<std::sync::Mutex<(SocketAddr, String)>>;
+
 pub fn spawn_forwarding_endpoint(
     cfg: WorkerConfig,
     server_cfg: rustls::ServerConfig,
     down_connector: TcpMtls,
-    down_addr: SocketAddr,
-    down_name: String,
+    down: DownTarget,
 ) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -94,10 +98,15 @@ pub fn spawn_forwarding_endpoint(
             let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind s1");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut worker = Worker::new(cfg).expect("worker");
-            // The S1→S2 link, established once and reused across coordinator reconnects.
-            let mut down = down_connector.connect(down_addr, &down_name).await.expect("connect downstream S2");
             while let Ok(mut up) = listener.accept().await {
-                let _ = serve_conn_forwarding(&mut worker, &mut up, &mut down).await;
+                // (Re)connect the downstream S1→S2 link to the CURRENT target — so a coordinator
+                // reconnect after a downstream replacement re-links the survivor to the new peer.
+                let (addr, name) = down.lock().unwrap().clone();
+                let mut dc = match down_connector.connect(addr, &name).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let _ = serve_conn_forwarding(&mut worker, &mut up, &mut dc).await;
             }
         });
     });

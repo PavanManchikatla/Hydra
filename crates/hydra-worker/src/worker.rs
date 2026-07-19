@@ -407,7 +407,7 @@ where
         };
         for reply in worker.on_frame(&frame.payload)? {
             if wire::is_fwd_frame(&reply) {
-                // Direct S1→S2: the boundary never touches the coordinator.
+                // Direct S1→S2: the boundary tensor never traverses the coordinator on the compute path.
                 down.send(0, &reply).await?;
                 let resp = down.recv().await?;
                 up.send(0, &resp.payload).await?;

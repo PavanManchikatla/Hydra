@@ -108,8 +108,9 @@ async fn direct_worker_to_worker_fwd_is_bit_exact() {
     // S2 first (S1 connects to it at startup).
     let s2_addr = hydra_worker::pair::spawn_endpoint(mk(1, k, -1, true, false), cluster.ca.server_config(&s2_id).unwrap());
     let s1_down = hydra_transport::tcp_mtls::TcpMtls::from_config(cluster.ca.client_config(&s1_client).unwrap()).unwrap();
+    let down_target = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "worker-s2".to_string())));
     let s1_addr = hydra_worker::pair::spawn_forwarding_endpoint(
-        mk(0, 0, k, false, true), cluster.ca.server_config(&s1_id).unwrap(), s1_down, s2_addr, "worker-s2".to_string(),
+        mk(0, 0, k, false, true), cluster.ca.server_config(&s1_id).unwrap(), s1_down, down_target,
     );
 
     let connector = cluster.coordinator_connector().unwrap();
