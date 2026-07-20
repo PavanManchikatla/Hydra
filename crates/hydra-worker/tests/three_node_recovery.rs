@@ -7,12 +7,13 @@
 //!     rebuilt from **S2's durable boundaries** (D1, not token replay), sampler installed, activated;
 //!     **S2 re-links** its direct down-link to the replacement (seam 2). Closes **gate-cond-(i)**
 //!     (full recovery on the direct-FWD topology).
-//!   * **middle-stage (S2) kill** — the genuinely-new case (⚠️ **"durable-frontier kill placement"**
-//!     qualifier, §7.19): the replacement S2 is rebuilt from **S1's durable boundaries** and **S1
-//!     re-links** its direct down-link to the replacement S2. Per the §7.19 ruling the downstream
-//!     survivor S_P **must** freeze (I10b/I7b/I15); the freeze→reactivate hang is a worker-layer bug
-//!     to fix, and the adversarial sampled-ahead-window variant (where the freeze is load-bearing) is
-//!     the owed regression (b) — until it lands this case is qualified to the durable-frontier placement.
+//!   * **middle-stage (S2) kill** — the genuinely-new case, now with the **faithful survivor freeze**
+//!     (§7.19 FIXED): freeze → **catch-up to FROZEN_READY** (the hang was a skipped catch-up, an
+//!     orchestration omission — the SM correctly gates RecvCommit on FROZEN_READY) → reinstall (I17)
+//!     → reactivate. The replacement S2 is rebuilt from **S1's durable boundaries** and **S1 re-links**
+//!     to it. A second test covers the **sampled-ahead** placement (a provisional sampled output the
+//!     freeze discards, I7b). ⚠️ The observably-load-bearing **KV-ahead** variant (provisional feedback
+//!     advancing the survivor's KV) needs surviving-sampler logits regeneration — the one owed piece.
 //!
 //! Assertions (both): (a) SSE id continuity (commit stream dense, every output position once);
 //! (b) committed prefix ⊕ resumed suffix == an uninterrupted seeded run, **byte-for-byte**; (c) disk
@@ -426,17 +427,17 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
 
     // ---- kill the MIDDLE stage S2 ----
     let t_detect = Instant::now();
-    // ⚠️ QUALIFIED — "durable-frontier kill placement" only (§7.19, owner-ruled 2026-07-19).
-    // The spec (I10b) freezes ALL survivors on Case A, and S_P's freeze is load-bearing at a placement
-    // this test does NOT hit: if S2 dies while S_P holds provisional sampled-ahead state beyond
-    // generation_durable_pos, that tail must be discarded (I7a/I7b) + the sampler restored (I15). Here
-    // S_P is AT the durable frontier (no sampled-ahead tail), so its committed KV is intact and it
-    // continues — a valid demonstration for THIS placement, NOT general. The owner REJECTED "survivor
-    // continues" as the general rule: freezing+re-activating the active sampler survivor hangs, and
-    // that is a WORKER-LAYER BUG to fix (§7.19 regressions (a) looped freeze→reinstall→reactivate and
-    // (b) the adversarial sampled-ahead-window middle-kill), not a semantics change. This test's
-    // genuinely-new substance — replacement S2 rebuilt from S1's upstream durable boundaries + the
-    // S1-side re-link — is exercised below and stands on the durable-frontier qualifier until (b) lands.
+    // Downstream survivor S_P freezes (Case A) — the ratified survivor path (§7.19). The §7.19 hang
+    // was an ORCHESTRATION omission: a Case-A freeze leaves the stage FROZEN, and `RecvCommit` needs
+    // FROZEN_READY, reached via **catch-up** (RebuildStep). The survivor's KV is intact, so the
+    // catch-up re-applies nothing (applied ≥ goal → immediate FROZEN_READY). freeze → catch-up →
+    // reinstall → reactivate — the fix proven by `survivor_reactivate.rs` (100×).
+    begin_recovery(&mut cp, &keys, input_pos).await.unwrap();
+    cp.send(0, &wire::encode_catch_up_context(&keys, 1, 1, input_pos - 1)).await.unwrap();
+    match wire::decode(&cp.recv().await.unwrap().payload, &keys).unwrap().1 {
+        Msg::CatchUpReady { .. } => {}
+        o => panic!("survivor S_P catch-up to FROZEN_READY: expected CATCH_UP_READY, got {o:?}"),
+    }
 
     // Replacement S2: rebuild from S1's DURABLE boundaries, its outputs going to a discard SINK
     // (S_P already holds those positions). During rebuild its down-link points at the sink.
@@ -461,6 +462,11 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
 
     // Rebuild done → point the replacement S2's down-link at the real (survivor) S_P.
     *rs2_down.lock().unwrap() = (pl.sp_addr, "sp".to_string());
+    // Re-activate the frozen survivor S_P (I17: reinstall the sampler checkpoint before activation),
+    // then S1 re-links to the replacement S2.
+    cp.send(0, &wire::encode_install_sampler_checkpoint(&keys, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
+    activate(&mut cp, &keys, ActivationKind::Recovery, 1, 1).await.unwrap();
     // S1 re-links its direct down-link to the replacement S2 (the seam-2 re-link, middle-stage).
     *pl.s1_down.lock().unwrap() = (rs2_addr, "s2".to_string());
     let detect_to_resumed = t_detect.elapsed();
@@ -494,5 +500,155 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     assert_eq!(stats.max_position, n as i64 - 1);
 
     eprintln!("seam C (kill MIDDLE S2): detection→resumed {detect_to_resumed:?} (HONESTY: in-process local, NOT the <15s LAN/M3 D1 target)");
+    let _ = std::fs::remove_dir_all(&pl.dir);
+}
+
+/// §7.19 regression (b) — the **adversarial sampled-ahead / KV-ahead** middle-kill: the placement
+/// where the downstream survivor's Case-A freeze is **load-bearing** (I7a/I7b/I15). S_P samples q=m
+/// AND a provisional feedback is applied (S1/S2/S_P KV advance to input position `prompt+m`) **beyond
+/// generation_durable_pos** — none of it committed. Then S2 dies. The replacement S2 rebuilds only to
+/// the **durable frontier** (`prompt+m-1`), so the survivor S_P (and S1) **must** truncate their KV +
+/// discard the provisional sampled tail back to that frontier — otherwise their KV outruns the
+/// rebuilt pipeline and the re-applied position `prompt+m` is a duplicate → wrong logits. WITHOUT the
+/// §7.19 worker truncation fix (`kv_truncate` + `sampled_ring.clear()` on `BEGIN_RECOVERY`) this test
+/// fails; WITH it the resumed stream is byte-identical. This is the regression that removes the
+/// "durable-frontier kill placement" qualifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_identical() {
+    let Some(model) = dev_model_path() else {
+        eprintln!("SKIP: no engine/model (dev-environment artifacts)");
+        return;
+    };
+    let (prompt, n_layer) = {
+        let m = hydra_engine_sys::Model::load(&model, 0).expect("load");
+        let p: Vec<u32> = m.tokenize("The capital of France is").expect("tok").into_iter().map(|t| t as u32).collect();
+        (p, m.n_layer())
+    };
+    let (k1, k2) = split3(n_layer);
+    let n = 8usize;
+    let m = 3usize; // commit m, then sample+feed ONE provisional position beyond the durable frontier
+    let n_ctx = prompt.len() as i32 + n as i32 + 8;
+    let keys = SessionKeys::dev(0x7B);
+    let cfg_hash = greedy().hash();
+
+    let reference = unsplit_greedy(&model, &prompt, n, n_ctx);
+
+    let pl = build_pipeline(&model, &keys, k1, k2, n_ctx);
+    let cs_path = pl.dir.join("commit.wal");
+    let mut cs = CommitStream::create(&cs_path, CLUSTER_ID, SESSION_ID).unwrap();
+    cs.append_initial_commit(&fence(), &admission(&prompt), &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()), 1).unwrap();
+    let mut group = GroupCommitter::new(2);
+
+    let connector = pl.cluster.coordinator_connector().unwrap();
+    let mut c1 = connector.connect(pl.s1_addr, "s1").await.unwrap();
+    let mut cp = connector.connect(pl.sp_addr, "sp").await.unwrap();
+
+    activate(&mut c1, &keys, ActivationKind::Initial, 0, 0).await.unwrap();
+    activate(&mut cp, &keys, ActivationKind::Initial, 0, 0).await.unwrap();
+
+    for (i, &t) in prompt.iter().enumerate() {
+        chain_apply(&mut c1, &keys, i as i64, t, true).await.unwrap();
+    }
+    // Commit m outputs (durable).
+    let mut committed: Vec<u32> = Vec::new();
+    let mut input_pos = prompt.len() as i64;
+    for q in 0..m as i64 {
+        let (tok, snap) = sample(&mut cp, &keys, q, &cfg_hash).await.unwrap();
+        committed.push(tok);
+        group.push(q, tok, snap);
+        if group.count_ready() {
+            let b = group.take().unwrap();
+            cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
+        }
+        chain_apply(&mut c1, &keys, input_pos, tok, false).await.unwrap();
+        input_pos += 1;
+    }
+    if let Some(b) = group.take() {
+        cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
+    }
+    // The durable input frontier (last committed feedback) is input_pos-1.
+    let durable_frontier = input_pos - 1;
+
+    // PROVISIONAL SAMPLED-AHEAD (d1_recovery's SampledAhead semantics, I7b): S_P **samples** q=m
+    // (a provisional output beyond generation_durable_pos, buffered in the sampled ring) but the
+    // token is **not committed and not fed back** — so no KV advances. This is the provisional
+    // sampler state the survivor's Case-A freeze must discard (sampled_ring cleared), then re-sample.
+    // (The stronger KV-ahead variant — a provisional *feedback* advancing the survivor's KV — needs
+    // surviving-sampler logits regeneration; see §7.19 note. This test covers the sampled-ahead form.)
+    let (prov_tok, _snap) = sample(&mut cp, &keys, m as i64, &cfg_hash).await.unwrap();
+
+    // S1's durable boundaries (rebuild source). Settle first.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let boundaries = BoundaryStore::read(&pl.store1).unwrap();
+
+    // ---- kill the MIDDLE stage S2 ----
+    let t_detect = Instant::now();
+    // Freeze survivors S1 + S_P at the DURABLE frontier — the fix truncates their KV + sampled tail
+    // back from the provisional position (I7a/I7b). truncate_to = durable_frontier.
+    begin_recovery(&mut c1, &keys, durable_frontier).await.unwrap();
+    begin_recovery(&mut cp, &keys, durable_frontier).await.unwrap();
+    cp.send(0, &wire::encode_catch_up_context(&keys, 1, 1, durable_frontier)).await.unwrap();
+    assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::CatchUpReady { .. }));
+
+    // Replacement S2: rebuild from S1's durable boundaries ONLY to the durable frontier (drop the
+    // provisional boundary at `provisional_pos`).
+    let sink = spawn_sink(&pl.cluster, "sink", keys.clone());
+    let rs2_id = pl.cluster.issue("s2").unwrap();
+    let rs2_down: DownTarget = Arc::new(Mutex::new((sink, "sink".to_string())));
+    let rs2_addr = spawn_multiconn_forwarding_durable_endpoint(
+        s2_cfg(&pl.model, &keys, k1, k2, n_ctx, true), pl.cluster.ca.server_config(&rs2_id).unwrap(),
+        TcpMtls::from_config(pl.cluster.ca.client_config(&rs2_id).unwrap()).unwrap(), rs2_down.clone(), 20,
+        TcpMtls::from_config(pl.cluster.ca.client_config(&rs2_id).unwrap()).unwrap(),
+        spawn_durability(&pl.cluster, "dur2b", pl.dir.join("s2b.wal"), keys.clone()), "dur2b",
+        true, 4,
+    );
+    let mut rc2 = connector.connect(rs2_addr, "s2").await.unwrap();
+    begin_recovery(&mut rc2, &keys, 0).await.unwrap();
+    for b in boundaries.iter().filter(|b| b.first_input_pos <= durable_frontier).take((durable_frontier + 1) as usize) {
+        rebuild_apply(&mut rc2, &keys, b.first_input_pos, &b.activations).await.unwrap();
+    }
+    rc2.send(0, &wire::encode_catch_up_context(&keys, 0, 1, durable_frontier)).await.unwrap();
+    assert!(matches!(wire::decode(&rc2.recv().await.unwrap().payload, &keys).unwrap().1, Msg::CatchUpReady { .. }));
+    activate(&mut rc2, &keys, ActivationKind::Recovery, 1, 1).await.unwrap();
+
+    *rs2_down.lock().unwrap() = (pl.sp_addr, "sp".to_string());
+    cp.send(0, &wire::encode_install_sampler_checkpoint(&keys, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
+    activate(&mut cp, &keys, ActivationKind::Recovery, 1, 1).await.unwrap();
+    *pl.s1_down.lock().unwrap() = (rs2_addr, "s2".to_string());
+    let detect_to_resumed = t_detect.elapsed();
+
+    // Resume from q=m. No KV was advanced provisionally, so input_pos is unchanged (== durable
+    // frontier + 1); the survivor S_P re-samples q=m (the provisional was discarded by the freeze).
+    let mut resumed = Vec::new();
+    for q in (m as i64)..n as i64 {
+        let (tok, snap) = sample(&mut cp, &keys, q, &cfg_hash).await.unwrap();
+        resumed.push(tok);
+        group.push(q, tok, snap);
+        if group.count_ready() {
+            let b = group.take().unwrap();
+            cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
+        }
+        if (q as usize + 1) < n {
+            chain_apply(&mut c1, &keys, input_pos, tok, false).await.unwrap();
+            input_pos += 1;
+        }
+    }
+    if let Some(b) = group.take() {
+        cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
+    }
+    drop(cs);
+
+    // The discarded provisional was re-sampled identically from the restored checkpoint (I15).
+    assert_eq!(resumed[0], prov_tok, "the discarded provisional sampled-ahead token is re-sampled identically after truncation (I15)");
+    let mut full = committed.clone();
+    full.extend(resumed);
+    assert_eq!(full, reference, "sampled-ahead middle-kill: survivor truncates the provisional tail (I7a/I7b) → byte-identical to uninterrupted greedy");
+    let stats = hydra_coordinator::recovery::verify(&cs_path).unwrap();
+    assert_eq!(stats.committed_positions, n);
+    assert!(stats.positions_strictly_increasing);
+    assert_eq!(stats.max_position, n as i64 - 1);
+
+    eprintln!("seam C §7.19(b) (sampled-ahead middle-kill, survivor truncates): detection→resumed {detect_to_resumed:?} (HONESTY: in-process local)");
     let _ = std::fs::remove_dir_all(&pl.dir);
 }

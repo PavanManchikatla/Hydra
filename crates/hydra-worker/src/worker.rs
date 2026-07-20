@@ -236,7 +236,21 @@ impl Worker {
             Msg::FinalizeActivation { attempt } => Ok(self.step_control(StageEvent::RecvFinalize { attempt })),
             Msg::ActivationCommitAbort { aborted_attempt } => Ok(self.step_control(StageEvent::RecvAbort { attempt: aborted_attempt })),
             Msg::BeginRecovery { base, target, recovery_id, truncate_to } => {
-                Ok(self.step_control(StageEvent::RecvBegin { base, target, recovery_id, truncate_to }))
+                let effects = self.stage.step(StageEvent::RecvBegin { base, target, recovery_id, truncate_to });
+                // I7a/I7b (§7.19 (b)): if the freeze is ACCEPTED, a **surviving** stage must discard the
+                // provisional tail the rest of the pipeline — rebuilt only to the durable frontier — can
+                // no longer justify. Mirror the SM's `applied`-truncation into the engine KV (`kv_truncate`
+                // drops positions ≥ its arg, so keep `[0, truncate_to]`), and drop provisional sampled
+                // outputs (the sampler itself is restored by the subsequent `INSTALL_SAMPLER_CHECKPOINT`,
+                // I15). A killed+replaced stage starts empty, so this is a no-op there; it is load-bearing
+                // only for a survivor (e.g. the downstream S_P on a middle-stage kill).
+                if effects.iter().any(|e| matches!(e, StageEffect::RecoveryAck { .. })) {
+                    if let Some(eng) = self.engine.as_mut() {
+                        eng.ctx.kv_truncate((truncate_to + 1).max(0) as i32)?;
+                    }
+                    self.sampled_ring.clear();
+                }
+                Ok(effects.into_iter().filter_map(|eff| self.encode_effect(eff)).collect())
             }
             Msg::CatchUpContext { goal_input_pos } => Ok(self.catch_up(goal_input_pos)),
             // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them. The
