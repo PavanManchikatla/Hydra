@@ -7,9 +7,12 @@
 //!     rebuilt from **S2's durable boundaries** (D1, not token replay), sampler installed, activated;
 //!     **S2 re-links** its direct down-link to the replacement (seam 2). Closes **gate-cond-(i)**
 //!     (full recovery on the direct-FWD topology).
-//!   * **middle-stage (S2) kill** — the genuinely-new case: the replacement S2 is rebuilt from
-//!     **S1's durable boundaries**, the downstream survivor S_P is frozen (Case A), and **S1 re-links**
-//!     its direct down-link to the replacement S2.
+//!   * **middle-stage (S2) kill** — the genuinely-new case (⚠️ **"durable-frontier kill placement"**
+//!     qualifier, §7.19): the replacement S2 is rebuilt from **S1's durable boundaries** and **S1
+//!     re-links** its direct down-link to the replacement S2. Per the §7.19 ruling the downstream
+//!     survivor S_P **must** freeze (I10b/I7b/I15); the freeze→reactivate hang is a worker-layer bug
+//!     to fix, and the adversarial sampled-ahead-window variant (where the freeze is load-bearing) is
+//!     the owed regression (b) — until it lands this case is qualified to the durable-frontier placement.
 //!
 //! Assertions (both): (a) SSE id continuity (commit stream dense, every output position once);
 //! (b) committed prefix ⊕ resumed suffix == an uninterrupted seeded run, **byte-for-byte**; (c) disk
@@ -423,15 +426,17 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
 
     // ---- kill the MIDDLE stage S2 ----
     let t_detect = Instant::now();
-    // FINDING (escalated, §7.19): the ratified design freezes the downstream survivor S_P via Case A.
-    // But a MIDDLE-stage (upstream) kill leaves S_P's committed KV intact — nothing to truncate — and
-    // freezing then RE-ACTIVATING the *already-active sampler* survivor (freeze→reinstall→reactivate)
-    // did NOT converge in this harness (it hangs, distinct from activating a *fresh* replacement,
-    // which the S_P-kill case does cleanly). So the downstream survivor CONTINUES here: its committed
-    // state is valid and only its upstream (the replacement S2) changed. The three assertions all hold.
-    // Owner to rule: worker fix for active-survivor re-activation, or ratify "downstream survivor
-    // continues" for an upstream-stage kill. The S1-side re-link + upstream-boundary rebuild — the
-    // genuinely-new substance — is fully exercised below.
+    // ⚠️ QUALIFIED — "durable-frontier kill placement" only (§7.19, owner-ruled 2026-07-19).
+    // The spec (I10b) freezes ALL survivors on Case A, and S_P's freeze is load-bearing at a placement
+    // this test does NOT hit: if S2 dies while S_P holds provisional sampled-ahead state beyond
+    // generation_durable_pos, that tail must be discarded (I7a/I7b) + the sampler restored (I15). Here
+    // S_P is AT the durable frontier (no sampled-ahead tail), so its committed KV is intact and it
+    // continues — a valid demonstration for THIS placement, NOT general. The owner REJECTED "survivor
+    // continues" as the general rule: freezing+re-activating the active sampler survivor hangs, and
+    // that is a WORKER-LAYER BUG to fix (§7.19 regressions (a) looped freeze→reinstall→reactivate and
+    // (b) the adversarial sampled-ahead-window middle-kill), not a semantics change. This test's
+    // genuinely-new substance — replacement S2 rebuilt from S1's upstream durable boundaries + the
+    // S1-side re-link — is exercised below and stands on the durable-frontier qualifier until (b) lands.
 
     // Replacement S2: rebuild from S1's DURABLE boundaries, its outputs going to a discard SINK
     // (S_P already holds those positions). During rebuild its down-link points at the sink.
