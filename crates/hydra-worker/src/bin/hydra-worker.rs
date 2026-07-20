@@ -13,10 +13,13 @@
 
 use std::net::SocketAddr;
 
-use hydra_transport::server_config_with_ca;
-use hydra_transport::tcp_mtls::TcpMtlsListener;
+use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
+use hydra_transport::{client_config_with_ca, server_config_with_ca};
 use hydra_worker::bootstrap::Bootstrap;
-use hydra_worker::worker::{serve_multi_conn, shared, Worker};
+use hydra_worker::worker::{
+    serve_multi_conn, serve_multi_conn_forwarding_durable, shared, shared_down, DownstreamState, Worker,
+};
+use hydra_worker::DurableForwarder;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,18 +35,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (rank, lf, ll, is_final, toks) =
         (boot.cfg.rank, boot.cfg.layer_first, boot.cfg.layer_last, boot.cfg.is_final, boot.cfg.receives_tokens);
+    let keys = boot.cfg.keys.clone();
+    let epoch = boot.cfg.epoch;
+    // A forwarding stage dials its downstream + durability target as a client (presenting its own
+    // identity, trusting the cluster CA). Capture the mTLS material as owned values BEFORE moving
+    // `boot.cfg` into the (non-Send) Worker.
+    let forwarding = boot.forwarding.clone();
+    let ca_cert = boot.ca_cert();
+    let identity = boot.identity();
+    let client_cfg = move || client_config_with_ca(&ca_cert, &identity);
+
+    let device_name = boot.device_name.clone();
     let worker = Worker::new(boot.cfg)?;
     eprintln!(
-        "hydra-worker {} rank={rank} layers=[{lf},{ll}] final={is_final} tokens={toks} engine={}",
-        boot.device_name,
-        worker.has_engine()
+        "hydra-worker {device_name} rank={rank} layers=[{lf},{ll}] final={is_final} tokens={toks} engine={} forwarding={}",
+        worker.has_engine(),
+        forwarding.is_some(),
     );
 
     // Concurrent connections share the one (non-Send) Worker on this thread via a LocalSet.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            if let Err(e) = serve_multi_conn(shared(worker), listener).await {
+            let r = match forwarding {
+                // Forwarding stage (S1/S2): multi-conn + direct worker→worker FWD + durable copy.
+                Some(f) => {
+                    let down_conn = TcpMtls::from_config(client_cfg()?)?;
+                    let down = down_conn.connect(f.down_addr.parse()?, &f.down_name).await?;
+                    let dur_conn = TcpMtls::from_config(client_cfg()?)?;
+                    let dur = dur_conn.connect(f.dur_addr.parse()?, &f.dur_name).await?;
+                    eprintln!("hydra-worker: forwarding down→{} durability→{}", f.down_addr, f.dur_addr);
+                    let forwarder = DurableForwarder::new(keys.clone(), epoch, f.require_durable, f.capacity as usize);
+                    let down_state = shared_down(DownstreamState { down, dur, forwarder });
+                    serve_multi_conn_forwarding_durable(shared(worker), down_state, keys, listener).await
+                }
+                // Final stage (S_P): multi-conn (samples; never forwards).
+                None => serve_multi_conn(shared(worker), listener).await,
+            };
+            if let Err(e) = r {
                 eprintln!("hydra-worker: serve loop ended with error: {e}");
                 return Err::<(), Box<dyn std::error::Error>>(e.into());
             }

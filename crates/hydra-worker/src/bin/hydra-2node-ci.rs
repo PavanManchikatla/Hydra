@@ -100,6 +100,7 @@ fn write_boot(cluster: &Cluster, name: &str, dir: &std::path::Path, recovery_sta
             receives_tokens: true, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None, recovery_start,
         },
+        forwarding: None,
     };
     let path = dir.join(format!("{name}.boot")).to_string_lossy().into_owned();
     boot.write_to(&path).unwrap();

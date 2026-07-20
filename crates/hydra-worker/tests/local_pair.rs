@@ -138,6 +138,7 @@ async fn subprocess_worker_survives_kill_9_and_restart() {
             sampler_config: None,
             recovery_start: false,
         },
+        forwarding: None,
     };
 
     let mut proc = SubprocessWorker::spawn(binary, &boot).expect("spawn worker process");

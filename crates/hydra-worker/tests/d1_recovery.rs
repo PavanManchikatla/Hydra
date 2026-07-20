@@ -96,6 +96,7 @@ fn boot(cluster: &Cluster, name: &str, cfg: WorkerConfig) -> Bootstrap {
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg,
+        forwarding: None,
     }
 }
 

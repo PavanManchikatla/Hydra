@@ -77,8 +77,9 @@ async fn a_recovery_needed_boundary_is_never_released_early_in_the_live_serve_pa
     let connector = TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap();
     let mut dur = connector.connect(dur_addr, DUR_NAME).await.expect("connect durability");
 
-    // D1 forwarding stage: require_durable = true.
-    let mut fwd = DurableForwarder::new(keys.clone(), 0, true);
+    // D1 forwarding stage: require_durable = true. Capacity 8 (comfortably above the 3 boundaries
+    // here — this test exercises the release gate, not the backpressure bound).
+    let mut fwd = DurableForwarder::new(keys.clone(), 0, true, 8);
 
     // Forward + copy three boundaries (real BOUNDARY_COPY over mTLS; the endpoint persists each).
     let boundaries: Vec<Vec<f32>> = (0..3).map(|p| vec![p as f32, p as f32 + 0.5, -1.0]).collect();

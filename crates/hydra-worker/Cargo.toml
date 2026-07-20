@@ -24,11 +24,13 @@ blake3.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Promoted dev→regular (P1·1b seam B, 2026-07-19): the `hydra-3node-wan` runner bin hosts the
+# coordinator's `BoundaryStore` durability target on the compute path, so it needs the coordinator at
+# runtime, not only in tests. One-way edge — hydra-coordinator does NOT depend on hydra-worker (its
+# deps are proto/wal/state/tokenizer), so no cycle. A crate-dep change, NOT a package decision
+# (classified per standing rule 5): proceed + log (§7/§12).
+hydra-coordinator = { path = "../hydra-coordinator" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-# D1 recovery harness (sub-slice C, seam 2b): the coordinator's real commit stream + recovery
-# reader, driven against a real subprocess S_P. One-way dev edge — hydra-coordinator does not
-# depend on hydra-worker, so there is no cycle.
-hydra-coordinator = { path = "../hydra-coordinator" }
 hydra-tokenizer = { path = "../hydra-tokenizer" }

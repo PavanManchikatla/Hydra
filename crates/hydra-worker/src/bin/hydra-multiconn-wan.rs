@@ -119,6 +119,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32) -> Bo
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.to_string()),
             n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false,
         },
+        forwarding: None,
     }
 }
 

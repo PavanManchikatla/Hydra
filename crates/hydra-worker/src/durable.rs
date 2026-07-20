@@ -27,13 +27,28 @@ pub struct DurableForwarder {
     retain: R3Buffer,
     /// Monotone id assigned to each forwarded boundary (correlates its `DURABILITY_ACK`).
     next_boundary_id: u32,
+    /// R3′ retention bound (spec §5: buffers ≤ max(in-flight window, one durability chunk)). Durability
+    /// copies are background-class and must never block the forward path — **but** an unbounded copy
+    /// queue silently grows R3′ retention (a killed durability target would let the survivor retain
+    /// forever). At this bound the serve loop **backpressures the forward path** on `DURABILITY_ACK`
+    /// rather than dropping a copy: a dropped copy is a future recovery hole, so slower is safe and
+    /// lossy is not. See [`DurableForwarder::is_at_capacity`].
+    capacity: usize,
 }
 
 impl DurableForwarder {
     /// `require_durable = true` is D1 (release gates on `DURABILITY_ACK` too); `false` is D0 (release
-    /// on the downstream ack alone).
-    pub fn new(keys: SessionKeys, epoch: Epoch, require_durable: bool) -> DurableForwarder {
-        DurableForwarder { keys, epoch, retain: R3Buffer::new(require_durable), next_boundary_id: 0 }
+    /// on the downstream ack alone). `capacity` is the R3′ retention bound (spec §5: ≤ max(in-flight
+    /// window, one durability chunk)) — the point at which the forward path backpressures on durability
+    /// rather than growing retention without bound; it must be ≥ 1.
+    pub fn new(keys: SessionKeys, epoch: Epoch, require_durable: bool, capacity: usize) -> DurableForwarder {
+        DurableForwarder {
+            keys,
+            epoch,
+            retain: R3Buffer::new(require_durable),
+            next_boundary_id: 0,
+            capacity: capacity.max(1),
+        }
     }
 
     /// Emit a `BOUNDARY_COPY` for `boundary` on the durability connection (the background-class copy,
@@ -78,5 +93,25 @@ impl DurableForwarder {
     /// All currently-retained input positions, ascending.
     pub fn retained(&self) -> Vec<i64> {
         self.retain.retained()
+    }
+
+    /// The R3′ retention bound.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Is retention at the R3′ bound? When true, the serve loop must **backpressure the forward path**
+    /// — block on the next `DURABILITY_ACK` (advancing `durable_through`, which releases a boundary and
+    /// frees a slot) before forwarding+copying the next boundary. It must **never drop** a copy to make
+    /// room: a dropped copy is a recovery hole. Retention can exceed the bound only transiently between
+    /// a retain and the backpressure drain, never silently and never permanently.
+    pub fn is_at_capacity(&self) -> bool {
+        self.retain.retained().len() >= self.capacity
+    }
+
+    /// A retained boundary's activations, for a recovery replay (seam C rebuilds a replacement stage
+    /// from these). `None` if it was already released.
+    pub fn retained_boundary(&self, input_pos: i64) -> Option<&[f32]> {
+        self.retain.get(input_pos)
     }
 }

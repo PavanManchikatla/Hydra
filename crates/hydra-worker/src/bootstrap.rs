@@ -15,6 +15,24 @@ use crate::sampler::SamplingConfig;
 use crate::wire::{SessionKeys, CLUSTER_ID_LEN, HASH_LEN, MODEL_INSTANCE_ID_LEN, SESSION_ID_LEN};
 use crate::worker::WorkerConfig;
 
+/// The downstream + durability wiring a **forwarding** stage (S1/S2 in a chained pipeline) needs to
+/// run [`crate::worker::serve_multi_conn_forwarding_durable`]: where to send each boundary directly
+/// (the down-link) and where to copy it for durability (P1·1b seam B). Absent for a final stage (S_P),
+/// which samples and never forwards.
+#[derive(Clone)]
+pub struct ForwardingBootstrap {
+    /// Downstream peer address + presented cert name (the direct S1→S2 / S2→S_P boundary link).
+    pub down_addr: String,
+    pub down_name: String,
+    /// Durability target address + presented cert name (`BOUNDARY_COPY` out / `DURABILITY_ACK` back).
+    pub dur_addr: String,
+    pub dur_name: String,
+    /// D1 (release gated on `DURABILITY_ACK`) vs D0 (downstream ack alone).
+    pub require_durable: bool,
+    /// R3′ retention bound (spec §5) — where the forward path backpressures on durability.
+    pub capacity: u32,
+}
+
 /// Everything a worker process needs to come up and serve.
 pub struct Bootstrap {
     pub listen_addr: String,
@@ -24,6 +42,9 @@ pub struct Bootstrap {
     pub cert_chain_der: Vec<Vec<u8>>,
     pub key_pkcs8_der: Vec<u8>,
     pub cfg: WorkerConfig,
+    /// Present ⇒ this is a forwarding stage (durable worker→worker FWD); absent ⇒ a final stage.
+    /// Appended to the wire format (append-only), so an older bootstrap without it decodes to `None`.
+    pub forwarding: Option<ForwardingBootstrap>,
 }
 
 impl Bootstrap {
@@ -86,6 +107,19 @@ impl Bootstrap {
             }
             None => w.u32(0),
         }
+        // Forwarding block (append-only): presence flag then the fields.
+        match &self.forwarding {
+            Some(f) => {
+                w.u32(1);
+                w.str(&f.down_addr);
+                w.str(&f.down_name);
+                w.str(&f.dur_addr);
+                w.str(&f.dur_name);
+                w.u32(f.require_durable as u32);
+                w.u32(f.capacity);
+            }
+            None => w.u32(0),
+        }
         w.0
     }
 
@@ -128,12 +162,26 @@ impl Bootstrap {
         } else {
             None
         };
+        // Forwarding block (append-only): older bootstraps end here → decode to `None`.
+        let forwarding = if r.remaining() && r.u32()? != 0 {
+            Some(ForwardingBootstrap {
+                down_addr: r.str()?,
+                down_name: r.str()?,
+                dur_addr: r.str()?,
+                dur_name: r.str()?,
+                require_durable: r.u32()? != 0,
+                capacity: r.u32()?,
+            })
+        } else {
+            None
+        };
         Ok(Bootstrap {
             listen_addr,
             device_name,
             ca_cert_der,
             cert_chain_der,
             key_pkcs8_der,
+            forwarding,
             cfg: WorkerConfig {
                 keys,
                 rank,
@@ -182,6 +230,10 @@ struct Reader<'a> {
     i: usize,
 }
 impl Reader<'_> {
+    /// Any bytes left to read? (Used for append-only optional trailing blocks.)
+    fn remaining(&self) -> bool {
+        self.i < self.b.len()
+    }
     fn u32(&mut self) -> Result<u32, String> {
         let end = self.i + 4;
         let s = self.b.get(self.i..end).ok_or("truncated u32")?;
@@ -242,6 +294,7 @@ mod tests {
                 sampler_config: Some(SamplingConfig { temperature: 0.7, top_p: 0.9, repeat_penalty: 1.1, penalty_last_n: 16, seed: 99 }),
                 recovery_start: false,
             },
+            forwarding: None,
         };
         let bytes = boot.encode();
         let back = Bootstrap::decode(&bytes).unwrap();
@@ -253,5 +306,47 @@ mod tests {
         assert!(back.cfg.receives_tokens && !back.cfg.is_final);
         assert_eq!(back.cfg.sampler_config.as_ref().map(|s| s.seed), Some(99));
         assert_eq!(back.cfg.sampler_config.as_ref().map(|s| s.penalty_last_n), Some(16));
+        assert!(back.forwarding.is_none());
+    }
+
+    #[test]
+    fn bootstrap_round_trips_with_forwarding() {
+        let boot = Bootstrap {
+            listen_addr: "127.0.0.1:0".into(),
+            device_name: "s2".into(),
+            ca_cert_der: vec![1],
+            cert_chain_der: vec![vec![2]],
+            key_pkcs8_der: vec![3],
+            cfg: WorkerConfig {
+                keys: SessionKeys::dev(8),
+                rank: 1,
+                layer_first: 14,
+                layer_last: 21,
+                is_final: false,
+                receives_tokens: false,
+                epoch: 0,
+                recovery_id: 0,
+                model_path: Some("/m.gguf".into()),
+                n_gpu_layers: 0,
+                n_ctx: 64,
+                sampler_config: None,
+                recovery_start: false,
+            },
+            forwarding: Some(ForwardingBootstrap {
+                down_addr: "10.0.0.5:41999".into(),
+                down_name: "sp".into(),
+                dur_addr: "100.64.0.1:42000".into(),
+                dur_name: "coordinator".into(),
+                require_durable: true,
+                capacity: 64,
+            }),
+        };
+        let back = Bootstrap::decode(&boot.encode()).unwrap();
+        let f = back.forwarding.expect("forwarding block round-trips");
+        assert_eq!(f.down_addr, "10.0.0.5:41999");
+        assert_eq!(f.down_name, "sp");
+        assert_eq!(f.dur_name, "coordinator");
+        assert!(f.require_durable);
+        assert_eq!(f.capacity, 64);
     }
 }
