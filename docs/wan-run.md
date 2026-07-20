@@ -226,3 +226,27 @@ cargo run --bin hydra-multiconn-wan     # Mac; provisions the multi-conn S_P on 
   three-assertion bar) is proven in-process by `tests/three_node_recovery.rs`; this run banks the
   real-hardware heterogeneity + WAN **throughput/agreement** data point. After 2026-08-05 (VMs die)
   this result is historical/banked.
+
+---
+
+## Real 3-node S_P kill-window over Tailscale (P1·1b — owner-owed VM-window run, 2026-07-19)
+
+`hydra-3node-kill` — the seam-C S_P kill on **real hardware** (the clean, §7.19-independent path),
+re-confirming **gate-cond-(i)** on real nodes. Same topology as the pipeline-only run (Mac arm64 S1
+`[0,14)` → myVm-2 x86 S2 `[14,21)` → myVm-1 x86 S_P `[21,24)`, cap-weighted 4.0/2.1/1.0).
+
+- **Kill sequence:** generate 4 tokens; **real `pkill -9`** of myVm-1's S_P; survivors S1 (Mac) +
+  S2 (myVm-2) freeze via `BEGIN_RECOVERY` Case A; a **replacement S_P starts on myVm-1 at the same
+  address**, rebuilt from **S2's durable boundaries** (D1, not token replay) + sampler-installed +
+  activated; **S2 re-links** to the replacement on its next forward (its dead socket to the killed
+  S_P fails → `forward_with_relink` reconnects to the same address → the replacement); resume.
+- **Result — `THREENODE_KILL_OK`, all three assertions held:** (a) SSE id continuity — commit stream
+  `committed_positions=8`, strictly-increasing, `max_position=7`; (b) recovered stream (committed ⊕
+  resumed) == the Mac unsplit greedy reference, **8/8 argmax agreement** (mixed tier, cross-arch,
+  spec I8); (c) disk truth — commit stream I19-valid, no output position twice.
+- **Timing:** detection→resumed **23.8 s** — **WAN/Tailscale, real `kill -9`**; NOT the <15 s LAN/M3
+  D1 target (that is a wired-LAN number, still owed §8). Cross-WAN cold replacement (start remote
+  worker + model load + rebuild from durable boundaries) dominates.
+- The in-process seam-C tests (`tests/three_node_recovery.rs`) prove the byte-identical guarantee;
+  this run proves the same recovery machinery on **three genuinely-different machines** with a real
+  process kill. After 2026-08-05 (VMs die) this is historical/banked; the machinery is VM-independent.

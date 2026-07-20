@@ -30,7 +30,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # deps are proto/wal/state/tokenizer), so no cycle. A crate-dep change, NOT a package decision
 # (classified per standing rule 5): proceed + log (§7/§12).
 hydra-coordinator = { path = "../hydra-coordinator" }
+# Promoted dev→regular (P1·1b real-node kill runner, 2026-07-19): the `hydra-3node-kill` runner bin
+# constructs an `Admission` for the coordinator commit stream at runtime. One-way edge — hydra-tokenizer
+# deps are hydra-engine-sys only, no cycle. Classified crate-dep change (proceed+log).
+hydra-tokenizer = { path = "../hydra-tokenizer" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-hydra-tokenizer = { path = "../hydra-tokenizer" }
