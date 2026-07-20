@@ -142,3 +142,60 @@ cargo run --bin hydra-wan            # Mac; connects to the VM over Tailscale
   real machines over a real WAN; a perf datapoint; real machine-death recovery over the WAN).
 - **Still owed (M3 gate):** the **wired-LAN performance envelope** — no wired-LAN number is implied
   by any figure above (honesty rule, §8).
+
+---
+
+## M3 Phase 1 — P1·1a: the multi-connection serve loop on the real 2-node pair (2026-07-19)
+
+> **What this adds.** M3 Phase 1 opened with a third node (`myVm-2`, B2als_v2, 4 GiB, x86-64,
+> Tailscale `100.73.205.31`). Gate condition (i)'s **substrate** is the *multi-connection serve loop*:
+> a worker→worker chained pipeline where the coordinator ALSO samples/controls a stage requires each
+> worker to serve **concurrent** inbound connections. Seam 3 demonstrates it on real heterogeneous
+> hardware over Tailscale. Same honesty banner: **WAN/Tailscale, cross-arch (arm64↔x86-64),
+> mixed-backend tier — not a wired-LAN, not a bit-exact number.**
+
+### Topology (direct FWD, unlike `hydra-wan`'s coordinator relay)
+
+```
+   Mac (arm64)                                    myVm-2 (x86-64, 4 GiB)
+   coordinator + S1 = [0,12)  ──── FWD (direct, worker→worker) ────▶  S_P = [12,24) + sampler
+   100.93.110.78    │                                                 100.73.205.31
+                    └──────────────── SAMPLE_NEXT (control) ─────────▶  (same S_P)
+```
+
+The coordinator sends `APPLY_TOKEN` to S1 (a **forwarding endpoint**) and `SAMPLE_NEXT` to S_P over a
+**separate, concurrent** connection; S1 forwards each boundary **straight to S_P** (worker→worker). So
+**S_P must serve two inbound connections at once** — S1's `FWD` and the coordinator's control. Under
+the old sequential accept loop S_P would serve S1's connection and never accept the coordinator's,
+**deadlocking `SAMPLE_NEXT`**; the multi-connection serve loop (`worker::serve_multi_conn`, now the
+`hydra-worker` binary's serve path) is what makes it work.
+
+### Run
+
+```bash
+cargo run --bin hydra-multiconn-wan     # Mac; provisions the multi-conn S_P on myVm-2 over Tailscale
+```
+
+### Results — 2026-07-19 (Qwen2.5-0.5B fp16, greedy, `hydra-multiconn-wan`)
+
+- **`MULTICONN_WAN_OK`** — S_P served S1's direct FWD **and** the coordinator's `SAMPLE_NEXT`
+  concurrently over Tailscale.
+- **Greedy argmax agreement: 12/12 steps** vs the Mac's unsplit reference (mixed-backend tier;
+  cross-arch, so argmax-agreement not bit-exactness — spec I8).
+- **Deterministic replay (fresh workers, same placement): IDENTICAL.**
+- **Perf: 12 tokens in 9.96 s → ~1.20 tok/s** over Tailscale (latency-bound small-model datapoint;
+  **WAN/Tailscale, arm64↔x86-64 — NOT a wired-LAN number**).
+
+### What this closes / what stays owed
+- **Demonstrates** gate condition (i)'s **multi-connection serve loop** on the real 2-node pair
+  (`serve_multi_conn`, seam 1) over Tailscale. The **direct-FWD recovery re-link** mechanism (seam 2,
+  `forward_with_relink`) is unit-tested (CI-safe).
+- **Deferred to P1·1b:** the full byte-identical **direct-FWD kill/recover/resume** demonstration. A
+  split S_P rebuilds its KV from **boundaries**, so it needs boundary-durability wired into the serve
+  loop (`R3Buffer`/`BoundaryStore` are pure policy today, populated only by the coordinator relay in
+  `d1_two_stage`) — a data-plane-durability concern (spec §7 durability target) that lands with P1·1b
+  rather than being rushed here. The re-link real-kill demo pairs with it.
+- **Node facts:** `myVm-2` is Tailscale-only (`DenyAllInBound`); services bind the Tailscale IP only.
+  Its VNet-private address (`10.0.0.5`) makes the myVm-1↔myVm-2 leg a **cloud-VNet (LAN-grade)** link —
+  annotate any such measurement separately; a VNet number never substitutes for the wired-LAN owed
+  item (§8).
