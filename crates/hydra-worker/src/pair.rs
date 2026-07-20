@@ -167,19 +167,22 @@ pub fn spawn_forwarding_endpoint_relink(
 /// Spawn a **multi-conn + forwarding + durable** stage endpoint (P1·1b seam B): it serves concurrent
 /// inbound connections against one shared `Worker` (so a mid stage accepts its upstream `FWD` **and**
 /// the coordinator's control at once), and on each `FWD` reply forwards the boundary **directly** to
-/// its downstream peer *and* copies it to the durability target under the R3′ bound. The endpoint
-/// dials its downstream (`down_*`) and durability target (`dur_*`) once at startup; both live behind
-/// one shared `tokio::sync::Mutex<DownstreamState>` (the async lock held across the forward await —
-/// see the serve-loop concurrency contract). `capacity` is the R3′ retention bound. Returns the
-/// stage's bound address. Runs on a `LocalSet` current-thread runtime (the `Worker`/downstream `Rc`s
-/// are `!Send`).
+/// its downstream peer *and* copies it to the durability target under the R3′ bound.
+///
+/// The down-link is **re-linkable** (seam 2): `down_target` is a shared, updatable `(addr, name)` —
+/// the coordinator rewrites it when it brings up a replacement downstream on recovery, and the
+/// survivor re-links on its next forward (seam C). A run with no recovery just never updates it. The
+/// durability target (`dur_*`) is dialed once at startup. All of it lives behind one shared
+/// `tokio::sync::Mutex<DownstreamState>` (the async lock held across the forward await — see the
+/// serve-loop concurrency contract). `capacity` is the R3′ retention bound. Returns the stage's bound
+/// address. Runs on a `LocalSet` current-thread runtime (the `Worker`/downstream `Rc`s are `!Send`).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_multiconn_forwarding_durable_endpoint(
     cfg: WorkerConfig,
     server_cfg: rustls::ServerConfig,
     down_connector: TcpMtls,
-    down_addr: SocketAddr,
-    down_name: &str,
+    down_target: DownTarget,
+    relink_retries: usize,
     dur_connector: TcpMtls,
     dur_addr: SocketAddr,
     dur_name: &str,
@@ -188,7 +191,6 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
 ) -> SocketAddr {
     let keys = cfg.keys.clone();
     let epoch = cfg.epoch;
-    let down_name = down_name.to_string();
     let dur_name = dur_name.to_string();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -197,11 +199,18 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
         local.block_on(&rt, async move {
             let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind stage");
             tx.send(listener.local_addr().unwrap()).unwrap();
-            // Dial the downstream (direct S1→S2 boundary link) and the durability target once.
-            let down = down_connector.connect(down_addr, &down_name).await.expect("connect downstream");
+            // Dial the durability target once; the down-link connects lazily (and re-links) per forward.
             let dur = dur_connector.connect(dur_addr, &dur_name).await.expect("connect durability");
             let forwarder = DurableForwarder::new(keys.clone(), epoch, require_durable, capacity);
-            let down_state = shared_down(DownstreamState { down, dur, forwarder });
+            let down_state = shared_down(DownstreamState {
+                down: None,
+                down_connected_to: None,
+                down_connector,
+                down_target,
+                relink_retries,
+                dur,
+                forwarder,
+            });
             let worker = shared(Worker::new(cfg).expect("worker"));
             let _ = serve_multi_conn_forwarding_durable(worker, down_state, keys, listener).await;
         });

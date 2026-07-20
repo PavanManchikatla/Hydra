@@ -127,18 +127,20 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
 
     // S2: middle forwarding+durable stage, down = S_P, dur = dur2.
     let s2_id = ca.issue("s2").unwrap();
+    let s2_down = std::sync::Arc::new(std::sync::Mutex::new((sp_addr, "sp".to_string())));
     let s2_addr = spawn_multiconn_forwarding_durable_endpoint(
         s2_cfg(&model, &keys, k1, k2, n_ctx), ca.server_config(&s2_id).unwrap(),
-        TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap(), sp_addr, "sp",
+        TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap(), s2_down, 8,
         TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap(), dur2, "dur2",
         true, 64,
     );
 
     // S1: first forwarding+durable stage, down = S2, dur = dur1.
     let s1_id = ca.issue("s1").unwrap();
+    let s1_down = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
         s1_cfg(&model, &keys, k1, n_ctx), ca.server_config(&s1_id).unwrap(),
-        TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap(), s2_addr, "s2",
+        TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap(), s1_down, 8,
         TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap(), dur1, "dur1",
         true, 64,
     );

@@ -254,9 +254,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
         n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false,
     };
+    let s1_down = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
         s1_cfg, cluster.ca.server_config(&s1_id)?,
-        TcpMtls::from_config(cluster.ca.client_config(&cluster.issue("s1-down")?)?)?, s2_addr, "s2",
+        TcpMtls::from_config(cluster.ca.client_config(&cluster.issue("s1-down")?)?)?, s1_down, 8,
         TcpMtls::from_config(cluster.ca.client_config(&cluster.issue("s1-dur")?)?)?, dur1, "dur1",
         true, 64,
     );

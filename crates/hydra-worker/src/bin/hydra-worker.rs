@@ -17,7 +17,7 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::{client_config_with_ca, server_config_with_ca};
 use hydra_worker::bootstrap::Bootstrap;
 use hydra_worker::worker::{
-    serve_multi_conn, serve_multi_conn_forwarding_durable, shared, shared_down, DownstreamState, Worker,
+    serve_multi_conn, serve_multi_conn_forwarding_durable, shared, shared_down, DownTarget, DownstreamState, Worker,
 };
 use hydra_worker::DurableForwarder;
 
@@ -60,13 +60,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let r = match forwarding {
                 // Forwarding stage (S1/S2): multi-conn + direct worker→worker FWD + durable copy.
                 Some(f) => {
-                    let down_conn = TcpMtls::from_config(client_cfg()?)?;
-                    let down = down_conn.connect(f.down_addr.parse()?, &f.down_name).await?;
+                    let down_connector = TcpMtls::from_config(client_cfg()?)?;
+                    let down_target: DownTarget = std::sync::Arc::new(std::sync::Mutex::new((f.down_addr.parse()?, f.down_name.clone())));
                     let dur_conn = TcpMtls::from_config(client_cfg()?)?;
                     let dur = dur_conn.connect(f.dur_addr.parse()?, &f.dur_name).await?;
-                    eprintln!("hydra-worker: forwarding down→{} durability→{}", f.down_addr, f.dur_addr);
+                    eprintln!("hydra-worker: forwarding down→{} (re-linkable) durability→{}", f.down_addr, f.dur_addr);
                     let forwarder = DurableForwarder::new(keys.clone(), epoch, f.require_durable, f.capacity as usize);
-                    let down_state = shared_down(DownstreamState { down, dur, forwarder });
+                    let down_state = shared_down(DownstreamState {
+                        down: None,
+                        down_connected_to: None,
+                        down_connector,
+                        down_target,
+                        relink_retries: 40,
+                        dur,
+                        forwarder,
+                    });
                     serve_multi_conn_forwarding_durable(shared(worker), down_state, keys, listener).await
                 }
                 // Final stage (S_P): multi-conn (samples; never forwards).

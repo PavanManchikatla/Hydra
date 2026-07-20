@@ -220,13 +220,14 @@ async fn concurrent_control_connections_are_each_served() {
     // Two dialers (TcpMtls is not Clone): one for the down-link, one for the durability link.
     let s2_down_dialer = TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap();
     let s2_dur_dialer = TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap();
+    let s2_down = std::sync::Arc::new(std::sync::Mutex::new((down_addr, "down".to_string())));
 
     let addr = spawn_multiconn_forwarding_durable_endpoint(
         control_fwd_cfg(keys.clone()),
         ca.server_config(&s2_id).unwrap(),
         s2_down_dialer,
-        down_addr,
-        "down",
+        s2_down,
+        4,
         s2_dur_dialer,
         dur_addr,
         "dur",
@@ -314,13 +315,14 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
     // Slow downstream (15 ms per FWD → the forward is genuinely in flight) + absorbing durability.
     let down_addr = spawn_slow_downstream(ca.server_config(&down_id).unwrap(), keys.clone(), Duration::from_millis(15));
     let dur_addr = spawn_absorbing_durability(ca.server_config(&dur_id).unwrap(), keys.clone());
+    let s1_down = std::sync::Arc::new(std::sync::Mutex::new((down_addr, "down".to_string())));
 
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
         s1_fwd_cfg(&model, &keys, k, n_ctx),
         ca.server_config(&s1_id).unwrap(),
         s1_down_dialer,
-        down_addr,
-        "down",
+        s1_down,
+        4,
         s1_dur_dialer,
         dur_addr,
         "dur",

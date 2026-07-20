@@ -589,13 +589,33 @@ async fn forward_once(conn: &mut ClientConn, frame: &[u8]) -> Result<Vec<u8>, Wo
 // │  (block on `DURABILITY_ACK`, never drop a copy).
 // └─────────────────────────────────────────────────────────────────────────────────────────────────
 
-/// The shared downstream state for a durable forwarding stage: the direct S1→S2 down-link, the
-/// background durability connection, and the R3′ [`DurableForwarder`]. Behind a `tokio::sync::Mutex`
-/// (async) because the forward `send`/`recv` is held across an `.await` — a `RefCell` would be unsound
-/// there (see the serve-loop contract). Only the `FWD`-carrying connection ever locks it.
+/// The shared downstream state for a durable forwarding stage: the direct S1→S2 down-link (which is
+/// **re-linkable** — seam 2), the background durability connection, and the R3′ [`DurableForwarder`].
+/// Behind a `tokio::sync::Mutex` (async) because the forward `send`/`recv` is held across an `.await`
+/// — a `RefCell` would be unsound there (see the serve-loop contract). Only the `FWD`-carrying
+/// connection ever locks it.
+///
+/// The down-link is a re-establishable [`forward_with_relink`] pair (`Option<ClientConn>` +
+/// connector + updatable [`DownTarget`]), not a fixed connection: when the coordinator kills a
+/// downstream stage and brings up a replacement, it rebuilds the replacement from the durable
+/// boundaries and rewrites the shared `down_target`; the survivor re-links on its next forward,
+/// preserving its own KV and upstream connection (seam C). A run with no recovery simply never
+/// updates the target.
 pub struct DownstreamState {
-    /// Direct worker→worker down-link (the boundary tensor travels here, never via the coordinator).
-    pub down: ClientConn,
+    /// The current direct down-link (lazily (re)connected from `down_target`). `None` until the first
+    /// forward, and reset to `None` on a forward failure so the next attempt re-links.
+    pub down: Option<ClientConn>,
+    /// The `(addr, name)` the current `down` connection was opened to — so a forward can detect that
+    /// the coordinator **rewrote** `down_target` (a recovery re-target) and re-link proactively, not
+    /// only on a hard connection failure. In a real `kill -9` both happen; detecting the target change
+    /// makes the re-link correct even when the killed peer's socket has not yet errored.
+    pub down_connected_to: Option<(SocketAddr, String)>,
+    /// Dials the downstream presenting this stage's identity (trusting the cluster CA).
+    pub down_connector: TcpMtls,
+    /// The (updatable) downstream address + cert name — the coordinator rewrites it on recovery.
+    pub down_target: DownTarget,
+    /// Bounded re-link retries before a forward surfaces an error (never hangs).
+    pub relink_retries: usize,
     /// Background-class durability connection (`BOUNDARY_COPY` out, `DURABILITY_ACK` back).
     pub dur: ClientConn,
     /// R3′ retention + copy policy (seam A).
@@ -635,14 +655,27 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
         d.forwarder.release();
     }
 
-    // Direct S1→S2: the boundary tensor travels worker→worker, never via the coordinator.
-    let DownstreamState { down, dur, forwarder } = d;
-    down.send(0, reply).await?;
-    let resp = down.recv().await?;
+    // Re-target detection (seam 2): if the coordinator rewrote `down_target` since we last connected
+    // (a recovery brought up a replacement downstream), drop the cached link so the forward re-links
+    // to the new peer — even if the old socket has not yet errored (the in-process / not-yet-dead
+    // case). A hard failure is still handled inside `forward_with_relink`.
+    {
+        let target = d.down_target.lock().unwrap().clone();
+        if d.down_connected_to.as_ref() != Some(&target) {
+            d.down = None;
+            d.down_connected_to = Some(target);
+        }
+    }
+
+    // Direct S1→S2 with re-link (seam 2): the boundary tensor travels worker→worker, never via the
+    // coordinator; on a down-link failure (a killed+replaced downstream) it re-reads `down_target`
+    // and reconnects to the replacement, bounded, without touching the upstream connection or KV.
+    let DownstreamState { down, down_connector, down_target, relink_retries, dur, forwarder, .. } = d;
+    let resp_payload = forward_with_relink(down, down_connector, down_target, reply, *relink_retries).await?;
 
     // The downstream's response to a boundary FWD is its APPLIED_ACK — advance the R3′ downstream
     // frontier from it so release can proceed.
-    if let Ok((_, Msg::AppliedAck { cumulative_input_pos, .. })) = wire::decode(&resp.payload, keys) {
+    if let Ok((_, Msg::AppliedAck { cumulative_input_pos, .. })) = wire::decode(&resp_payload, keys) {
         forwarder.on_applied_ack(cumulative_input_pos);
     }
 
@@ -652,7 +685,7 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
     forwarder.copy_and_retain(dur, input_pos, &boundary).await?;
     forwarder.release();
 
-    Ok(resp.payload)
+    Ok(resp_payload)
 }
 
 /// Serve one inbound connection against a **shared** worker with **durable worker→worker forwarding**:
