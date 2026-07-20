@@ -76,7 +76,8 @@ fn sh(args: &[&str]) -> Result<String, String> {
 }
 
 /// scp the S_P bootstrap to the VM and start `hydra-worker` bound to the Tailscale IP:port, detached.
-/// Waits until the worker advertises `HYDRA_WORKER_LISTENING`.
+/// Waits until the worker reports `engine=true` (i.e. bound AND the model finished loading — see the
+/// poll note; `HYDRA_WORKER_LISTENING` alone races the model load).
 fn start_remote_sp(local_boot: &str) -> Result<(), String> {
     kill_remote_sp();
     std::thread::sleep(std::time::Duration::from_millis(800));
@@ -89,23 +90,24 @@ fn start_remote_sp(local_boot: &str) -> Result<(), String> {
                   setsid env LD_LIBRARY_PATH={VM_LIBDIR} {VM_WORKER} {VM_BOOT} </dev/null >~/hydra/sp.log 2>&1 & \
                   echo started; exit 0"),
     ])?;
-    // Poll for the listening line (engine load + bind).
-    for _ in 0..60 {
+    // The binary prints HYDRA_WORKER_LISTENING on bind but the `engine=` line only AFTER Worker::new
+    // finishes loading the model (seconds on a small/cold VM). Wait for `engine=`, not just LISTENING,
+    // else we race the model load and see a false engine=false.
+    for _ in 0..120 {
         let log = sh(&["ssh", VM_SSH, "cat ~/hydra/sp.log 2>/dev/null || true"]).unwrap_or_default();
-        if log.contains("HYDRA_WORKER_LISTENING") {
-            let engine = log.contains("engine=true");
-            eprintln!("[vm] S_P listening on {VM_IP}:{VM_PORT} (engine={engine})");
-            if !engine {
-                return Err("remote S_P came up with engine=false (model/libs not linked)".into());
-            }
+        if log.contains("engine=true") {
+            eprintln!("[vm] S_P listening on {VM_IP}:{VM_PORT} (engine=true, model loaded)");
             return Ok(());
+        }
+        if log.contains("engine=false") {
+            return Err("remote S_P came up with engine=false (model/libs not linked)".into());
         }
         if log.contains("panic") || log.contains("Error") {
             return Err(format!("remote S_P failed to start:\n{log}"));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Err("remote S_P did not advertise HYDRA_WORKER_LISTENING within 30s".into())
+    Err("remote S_P did not report engine= within 60s".into())
 }
 
 fn kill_remote_sp() {
