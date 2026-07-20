@@ -15,6 +15,7 @@
 //!   later D1 recovery DoD runs against an existing kill-switch).
 
 pub mod bootstrap;
+pub mod durable;
 pub mod pair;
 pub mod retain;
 pub mod sampler;
@@ -22,5 +23,6 @@ pub mod wire;
 pub mod worker;
 
 pub use bootstrap::Bootstrap;
+pub use durable::DurableForwarder;
 pub use wire::{Msg, SessionKeys, WireError};
 pub use worker::{serve_conn, Worker, WorkerConfig, WorkerError};
