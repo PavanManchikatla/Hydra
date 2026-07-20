@@ -49,6 +49,22 @@ weights Mac : myVm-2 : myVm-1 = 41.5 : 22.0 : 10.4 (sum 73.9):
 | myVm-2 | 30 % | `[14, 21)` |
 | myVm-1 | 14 % | `[21, 24)` |
 
+### This set empirically validates capability-weighted placement
+
+The measured asymmetry is large enough that **a naïve uniform split is badly wasteful** — the concrete
+justification for weighting by measured capability (and for P2·1/P2·3 existing at all):
+
+| Split | Mac stage | myVm-2 stage | myVm-1 stage | pipeline TPOT (bottleneck) |
+|---|---|---|---|---|
+| **uniform** 8/8/8 | 8.0 ms/tok | 15.1 ms/tok | **32.1 ms/tok** | ~32 ms/tok |
+| **capability-weighted** 14/7/3 | 14.1 ms/tok | 13.3 ms/tok | 12.1 ms/tok | ~14 ms/tok |
+
+(stage time = layers × ms/layer-token). Pipeline throughput is set by the **slowest stage**: the
+uniform split lets the slow myVm-1 stage bottleneck the whole pipeline at ~32 ms/token, whereas the
+capability-weighted split balances every stage to ~13–14 ms/token — a **~2.3× throughput loss
+avoided** on this set (and the raw per-node capability spread is **4×**, Mac vs myVm-1). Uniform
+placement would waste that 2–4× on the slowest stage; measured-capability weighting recovers it.
+
 Caveats the solver (P2·3) must fold in and this compute-only number does **not** capture:
 - **Link cost.** Mac↔VM is WAN/Tailscale (~high latency); myVm-1↔myVm-2 is cloud-VNet (sub-ms). A
   layer split should also minimize the number/size of boundary crossings on slow links — favor
