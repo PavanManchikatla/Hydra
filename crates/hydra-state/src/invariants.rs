@@ -6,6 +6,7 @@
 //! defect), decision monotonicity (I10a/WAL), and evidence-based serviceability (I16/I18).
 
 use crate::coordinator::{Coordinator, CoordState};
+use crate::segment::SegmentCheckpoint;
 use crate::stage::{Stage, StageState};
 use crate::WalRecord;
 
@@ -52,6 +53,21 @@ pub fn check_ledger(l: &crate::Ledger) -> Vec<Violation> {
         if l.provisional_len() != 0 {
             v.push(Violation { invariant: "I9 CancelCutoff", detail: "provisional tokens survived cancellation".into() });
         }
+    }
+    v
+}
+
+/// Check the segment-checkpoint SM's **I24 candidate isolation** (the Mut6 detector). Mirrors the
+/// TLA+ `CandidateIsolation == installedCkpt ∈ segCommitted`: the installed live sampler checkpoint is
+/// always a durably-committed one; `mutation_candidate_leak` installs an uncommitted candidate,
+/// tripping this.
+pub fn check_segment(s: &SegmentCheckpoint) -> Vec<Violation> {
+    let mut v = Vec::new();
+    if !s.candidate_isolation_holds() {
+        v.push(Violation {
+            invariant: "I24 CandidateIsolation",
+            detail: format!("installed checkpoint {} is not durably committed (uncommitted candidate leaked into live state)", s.installed()),
+        });
     }
     v
 }

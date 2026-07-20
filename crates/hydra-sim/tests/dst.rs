@@ -30,7 +30,8 @@ fn randomized_runs_are_violation_free() {
     feature = "mutation_no_unservable",
     feature = "mutation_label_reset",
     feature = "mutation_no_attempt_fence",
-    feature = "mutation_unservable_restart"
+    feature = "mutation_unservable_restart",
+    feature = "mutation_candidate_leak"
 ))]
 fn detection_stats(k: u64, budget: u64) -> (u64, u64, u64) {
     let mut steps: Vec<u64> = Vec::new();
@@ -66,6 +67,14 @@ fn mut1_post_decision_loss_caught_by_randomized_runs() {
 fn mut2_caseb_caught_by_randomized_runs() {
     let (caught, total, median) = detection_stats(200, 20_000);
     println!("Mut2 (CaseBPure): {caught}/{total} seeds caught; median steps-to-detection = {median}");
+    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+}
+
+#[cfg(feature = "mutation_candidate_leak")]
+#[test]
+fn mut6_candidate_isolation_caught_by_randomized_runs() {
+    let (caught, total, median) = detection_stats(200, 20_000);
+    println!("Mut6 (I24 CandidateIsolation): {caught}/{total} seeds caught; median steps-to-detection = {median}");
     assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
 }
 

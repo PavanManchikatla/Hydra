@@ -27,6 +27,7 @@
 //! is deliberately kept separate here so the proven Mut1/Mut4 catch behavior is not disturbed.
 
 use hydra_state::coordinator::WalKindTag;
+use hydra_state::segment::{SegmentCheckpoint, SegmentEvent};
 use hydra_state::stage::{StageEvent, StageState};
 use hydra_state::{
     invariants, ActivationKind, ActivationTuple, ControlMsg, CoordEvent, CoordState, Coordinator,
@@ -42,7 +43,7 @@ use wal_disk::VirtualWal;
 /// so result provenance is mechanically visible if the adversarial scheduler ever changes (a
 /// median or catch-rate is only comparable within one scheduler version). Bump on any change to
 /// candidate generation, intent set, round structure, or the torn-write model.
-pub const SCHED_VERSION: &str = "sched-v2 (5-intent: coord {happy,abort-crash,complete-lose} + stage {reset-after-catchup, stale-fence}; real hydra-wal torn-write disk)";
+pub const SCHED_VERSION: &str = "sched-v3 (6-intent: coord {happy,abort-crash,complete-lose} + stage {reset-after-catchup, stale-fence} + candidate {prepare→commit/drop/crash, I24}; real hydra-wal torn-write disk)";
 
 /// A detected failure, fully reproducible from `(seed, schedule)`.
 #[derive(Debug, Clone)]
@@ -73,6 +74,8 @@ impl std::fmt::Display for Failure {
 enum Action {
     Coord(CoordEvent),
     Stage(usize, StageEvent),
+    /// Segment-checkpoint SM event (candidate-track intent 5 — I24 candidate isolation / Mut6).
+    Segment(SegmentEvent),
 }
 
 /// The simulated world: one coordinator + an abstract stage environment (ack emitters) for the
@@ -118,9 +121,16 @@ pub struct World {
     rec_target: Epoch,
     rec_truncate: i64,
     rec_goal: i64,
+    /// The segment-checkpoint SM (candidate-track intent 5 / I24). Its `PrepareCandidate →
+    /// {CommitSegmentAndInstall | DropCandidate | CoordCrash}` is driven through the crash/cancel
+    /// window between `SEGMENT_CHECKPOINT_READY` and `SEGMENT_COMMIT`-durable; `mutation_candidate_leak`
+    /// installs the candidate pre-commit and the per-step `check_segment` (I24) catches it.
+    segment: SegmentCheckpoint,
+    /// A monotone segment id for the current round's PREPAREs (labelling only).
+    next_segment_id: u64,
 }
 
-const N_INTENTS: usize = 5;
+const N_INTENTS: usize = 6;
 
 impl World {
     pub fn new(seed: u64, n_stages: u16) -> Self {
@@ -143,6 +153,8 @@ impl World {
             rec_target: 1,
             rec_truncate: 1,
             rec_goal: 3,
+            segment: SegmentCheckpoint::initial(),
+            next_segment_id: 1,
         };
         w.setup_stages();
         w
@@ -161,6 +173,7 @@ impl World {
         self.commit_acks.clear();
         self.finalize_acks.clear();
         self.lost.clear();
+        self.segment = SegmentCheckpoint::initial();
         self.setup_stages();
         self.schedule.push(format!("--- new round {} (intent {}) ---", self.round, self.round_intent));
     }
@@ -258,6 +271,12 @@ impl World {
     fn candidates(&mut self) -> Vec<Action> {
         use CoordEvent::*;
         let mut c: Vec<Action> = Vec::new();
+        if self.round_intent == 5 {
+            // candidate-track round: drive the segment-checkpoint SM through the crash/cancel window
+            // (Mut6 / I24 candidate isolation).
+            self.candidate_candidates(&mut c);
+            return c;
+        }
         if self.round_intent >= 3 {
             // stage-track round: the scheduler focuses on the stage sequence (Mut2/Mut3).
             self.stage_candidates(&mut c);
@@ -320,6 +339,30 @@ impl World {
             c.push(Action::Coord(StageLost { rank: self.lost_candidate()[0] }));
         }
         c
+    }
+
+    /// Candidate-track (intent 5) generation: drive the segment-checkpoint SM through `PREPARE` and
+    /// the **crash/cancel window** between `SEGMENT_CHECKPOINT_READY` and `SEGMENT_COMMIT`-durable —
+    /// the exact place an uncommitted candidate must leave no trace (I24). `mutation_candidate_leak`
+    /// installs the candidate at `PREPARE`, so any candidate-track round that prepares trips
+    /// `check_segment` immediately.
+    fn candidate_candidates(&mut self, c: &mut Vec<Action>) {
+        match self.segment.candidate() {
+            // No candidate in flight → prepare one (clone-advance-return; live state untouched).
+            None => c.push(Action::Segment(SegmentEvent::Prepare { segment_id: self.next_segment_id })),
+            // A candidate is pending: commit it (happy path) OR — the adversarial window — drop it
+            // (admission fail / cancel) or crash the coordinator before commit. All three offered; the
+            // seeded RNG picks. Biased toward the crash/cancel window so reachability is robust.
+            Some(_) => {
+                c.push(Action::Segment(SegmentEvent::Commit));
+                c.push(Action::Segment(SegmentEvent::Drop));
+                c.push(Action::Segment(SegmentEvent::CoordCrash));
+                if self.rng.chance(1, 2) {
+                    c.push(Action::Segment(SegmentEvent::Drop));
+                    c.push(Action::Segment(SegmentEvent::CoordCrash));
+                }
+            }
+        }
     }
 
     /// Stage-track candidate generation. For intent 3 it walks `stages[0]` through
@@ -489,9 +532,15 @@ impl World {
                     st.step(ev);
                 }
             }
+            Action::Segment(ev) => {
+                if matches!(ev, SegmentEvent::Prepare { .. }) {
+                    self.next_segment_id += 1;
+                }
+                self.segment.step(ev);
+            }
         }
 
-        // ---- invariant check after every step (spec §2.7): coordinator + every real stage ----
+        // ---- invariant check after every step (spec §2.7): coordinator + every real stage + I24 ----
         if let Some(v) = invariants::check(&self.coord).into_iter().next() {
             return Some(self.fail(v.invariant, v.detail));
         }
@@ -499,6 +548,11 @@ impl World {
             if let Some(v) = invariants::check_stage(st).into_iter().next() {
                 return Some(self.fail(v.invariant, v.detail));
             }
+        }
+        // I24 candidate isolation (the Mut6 detector): the installed sampler checkpoint is always a
+        // durably-committed one; a leaked (pre-commit-installed) candidate trips this.
+        if let Some(v) = invariants::check_segment(&self.segment).into_iter().next() {
+            return Some(self.fail(v.invariant, v.detail));
         }
         None
     }

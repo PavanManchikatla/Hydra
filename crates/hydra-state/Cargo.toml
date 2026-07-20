@@ -21,3 +21,7 @@ mutation_unservable_restart = [] # Mut5 (F-UNSERVABLE): omit the durable ACTIVAT
                                  #   record in self.wal, so restart misclassifies out of the
                                  #   superseding window (the exact defect the WAL-codec cross-check
                                  #   found); the sim must re-find it (monotone-mutation rule)
+mutation_candidate_leak = []     # Mut6 (I24): PREPARE_SEGMENT_CHECKPOINT installs the candidate into
+                                 #   live sampler state pre-commit (installedCkpt becomes an
+                                 #   uncommitted candidate), violating CandidateIsolation; the sim
+                                 #   must catch it (monotone-mutation rule, P2·9)
