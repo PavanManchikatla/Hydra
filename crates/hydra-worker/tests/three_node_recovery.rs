@@ -7,13 +7,14 @@
 //!     rebuilt from **S2's durable boundaries** (D1, not token replay), sampler installed, activated;
 //!     **S2 re-links** its direct down-link to the replacement (seam 2). Closes **gate-cond-(i)**
 //!     (full recovery on the direct-FWD topology).
-//!   * **middle-stage (S2) kill** — the genuinely-new case, now with the **faithful survivor freeze**
-//!     (§7.19 FIXED): freeze → **catch-up to FROZEN_READY** (the hang was a skipped catch-up, an
-//!     orchestration omission — the SM correctly gates RecvCommit on FROZEN_READY) → reinstall (I17)
+//!   * **middle-stage (S2) kill** — the genuinely-new case, with the **faithful survivor freeze**
+//!     (§7.19 FIXED + CLOSED): freeze → **catch-up to FROZEN_READY** (the hang was a skipped catch-up,
+//!     an orchestration omission — the SM correctly gates RecvCommit on FROZEN_READY) → reinstall (I17)
 //!     → reactivate. The replacement S2 is rebuilt from **S1's durable boundaries** and **S1 re-links**
-//!     to it. A second test covers the **sampled-ahead** placement (a provisional sampled output the
-//!     freeze discards, I7b). ⚠️ The observably-load-bearing **KV-ahead** variant (provisional feedback
-//!     advancing the survivor's KV) needs surviving-sampler logits regeneration — the one owed piece.
+//!     to it. A second test covers the observably-load-bearing **KV-ahead** placement (S_P's KV runs one
+//!     position past the durable frontier): the survivor sampler regenerates fresh head logits by
+//!     **truncate-and-replay** (roll applied to goal-1, re-apply position goal teacher-forced with S2's
+//!     durable boundary — Strategy-A/B's next_logits_ready; no new machinery). Qualifier removed.
 //!
 //! Assertions (both): (a) SSE id continuity (commit stream dense, every output position once);
 //! (b) committed prefix ⊕ resumed suffix == an uninterrupted seeded run, **byte-for-byte**; (c) disk
@@ -503,16 +504,16 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     let _ = std::fs::remove_dir_all(&pl.dir);
 }
 
-/// §7.19 regression (b) — the **adversarial sampled-ahead / KV-ahead** middle-kill: the placement
-/// where the downstream survivor's Case-A freeze is **load-bearing** (I7a/I7b/I15). S_P samples q=m
-/// AND a provisional feedback is applied (S1/S2/S_P KV advance to input position `prompt+m`) **beyond
-/// generation_durable_pos** — none of it committed. Then S2 dies. The replacement S2 rebuilds only to
-/// the **durable frontier** (`prompt+m-1`), so the survivor S_P (and S1) **must** truncate their KV +
-/// discard the provisional sampled tail back to that frontier — otherwise their KV outruns the
-/// rebuilt pipeline and the re-applied position `prompt+m` is a duplicate → wrong logits. WITHOUT the
-/// §7.19 worker truncation fix (`kv_truncate` + `sampled_ring.clear()` on `BEGIN_RECOVERY`) this test
-/// fails; WITH it the resumed stream is byte-identical. This is the regression that removes the
-/// "durable-frontier kill placement" qualifier.
+/// §7.19 regression (b) — the observably-**load-bearing KV-ahead** middle-kill (the placement that
+/// makes the survivor's Case-A freeze load-bearing, I7a/I7b/I15). S_P samples q=m AND its feedback is
+/// applied — S1/S2/S_P KV advance one position **beyond generation_durable_pos**, none committed. Then
+/// S2 dies. The replacement S2 rebuilds only to the **durable frontier**, so the survivors must
+/// discard the provisional tail back to it. The survivor sampler S_P regenerates its stale head logits
+/// by **truncate-and-replay** (owner-ruled, no new machinery): roll applied to goal-1, then re-apply
+/// position goal teacher-forced with S2's durable boundary — the last application regenerates fresh
+/// logits as a side effect (Strategy A/B's next_logits_ready). WITHOUT the §7.19 fix + this replay the
+/// survivor samples the wrong position; WITH them the stream is byte-identical. **This is the
+/// regression that removes the "durable-frontier kill placement" qualifier.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_identical() {
     let Some(model) = dev_model_path() else {
@@ -569,24 +570,35 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     // The durable input frontier (last committed feedback) is input_pos-1.
     let durable_frontier = input_pos - 1;
 
-    // PROVISIONAL SAMPLED-AHEAD (d1_recovery's SampledAhead semantics, I7b): S_P **samples** q=m
-    // (a provisional output beyond generation_durable_pos, buffered in the sampled ring) but the
-    // token is **not committed and not fed back** — so no KV advances. This is the provisional
-    // sampler state the survivor's Case-A freeze must discard (sampled_ring cleared), then re-sample.
-    // (The stronger KV-ahead variant — a provisional *feedback* advancing the survivor's KV — needs
-    // surviving-sampler logits regeneration; see §7.19 note. This test covers the sampled-ahead form.)
+    // PROVISIONAL **KV-AHEAD** (the observably-load-bearing placement): S_P samples q=m AND its
+    // feedback is applied — S1/S2/S_P KV advance to `provisional_pos = durable_frontier + 1`, beyond
+    // generation_durable_pos, and none of it is committed. This is the tail the survivors' Case-A
+    // freeze must discard (I7a/I7b): the replacement S2 rebuilds only to the durable frontier, so a
+    // survivor whose KV outruns it produces WRONG logits unless truncated back.
     let (prov_tok, _snap) = sample(&mut cp, &keys, m as i64, &cfg_hash).await.unwrap();
+    chain_apply(&mut c1, &keys, input_pos, prov_tok, false).await.unwrap();
+    let provisional_pos = input_pos; // = durable_frontier + 1
 
-    // S1's durable boundaries (rebuild source). Settle first.
+    // Durable boundaries. Settle the WAN-class copies first. S1's outputs rebuild the replacement S2;
+    // S2's output boundary at the frontier is what the survivor S_P re-applies to regenerate logits.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let boundaries = BoundaryStore::read(&pl.store1).unwrap();
+    let boundaries_s2 = BoundaryStore::read(&pl.store2).unwrap();
+    let frontier_boundary = boundaries_s2.iter().find(|b| b.first_input_pos == durable_frontier)
+        .expect("S2's durable output boundary at the frontier").activations.clone();
 
     // ---- kill the MIDDLE stage S2 ----
     let t_detect = Instant::now();
-    // Freeze survivors S1 + S_P at the DURABLE frontier — the fix truncates their KV + sampled tail
-    // back from the provisional position (I7a/I7b). truncate_to = durable_frontier.
+    // Freeze survivors. S1 (forwarder) truncates its KV to the durable frontier (drops the provisional
+    // position); it re-forwards the re-applied position on resume, so it needs no logits regen.
     begin_recovery(&mut c1, &keys, durable_frontier).await.unwrap();
-    begin_recovery(&mut cp, &keys, durable_frontier).await.unwrap();
+    // S_P (sampler) — TRUNCATE-AND-REPLAY (owner-ruled, no new machinery): roll applied to goal-1
+    // (durable_frontier-1), then re-apply position `durable_frontier` teacher-forced with S2's durable
+    // boundary. The last application regenerates FRESH head logits as a side effect (exactly how
+    // Strategy A/B guarantee next_logits_ready) — its previously-retained logits came from the (now
+    // truncated) provisional application and are stale.
+    begin_recovery(&mut cp, &keys, durable_frontier - 1).await.unwrap();
+    rebuild_apply(&mut cp, &keys, durable_frontier, &frontier_boundary).await.unwrap();
     cp.send(0, &wire::encode_catch_up_context(&keys, 1, 1, durable_frontier)).await.unwrap();
     assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::CatchUpReady { .. }));
 
@@ -618,8 +630,9 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     *pl.s1_down.lock().unwrap() = (rs2_addr, "s2".to_string());
     let detect_to_resumed = t_detect.elapsed();
 
-    // Resume from q=m. No KV was advanced provisionally, so input_pos is unchanged (== durable
-    // frontier + 1); the survivor S_P re-samples q=m (the provisional was discarded by the freeze).
+    // Resume from q=m, RE-APPLYING the provisional position that was truncated (S_P/S1 are back at the
+    // durable frontier, replacement S2 rebuilt to it, so re-applying `provisional_pos` is consistent).
+    input_pos = provisional_pos;
     let mut resumed = Vec::new();
     for q in (m as i64)..n as i64 {
         let (tok, snap) = sample(&mut cp, &keys, q, &cfg_hash).await.unwrap();
