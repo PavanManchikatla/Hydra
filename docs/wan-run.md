@@ -199,3 +199,30 @@ cargo run --bin hydra-multiconn-wan     # Mac; provisions the multi-conn S_P on 
   Its VNet-private address (`10.0.0.5`) makes the myVm-1↔myVm-2 leg a **cloud-VNet (LAN-grade)** link —
   annotate any such measurement separately; a VNet number never substitutes for the wired-LAN owed
   item (§8).
+
+---
+
+## 3-node chained direct-FWD over Tailscale (P1·1b seam B, part 2 — 2026-07-19)
+
+`hydra-3node-wan` on the live 3-node heterogeneity set, capability-weighted split (P1·2 ratios
+**4.0 : 2.1 : 1.0** → layer fractions 0.563/0.296/0.141 → the 24-layer 0.5B model splits `[0,14)`/
+`[14,21)`/`[21,24)`):
+
+- **Topology:** coordinator + **S1 on the Mac (arm64, 4.0)** `[0,14)` → **S2 on myVm-2 (x86-64, 2.1)**
+  `[14,21)` → **S_P on myVm-1 (x86-64, 1.0)** `[21,24)` + sampler. Each boundary travels
+  worker→worker (S1→S2→S_P direct FWD, never via the coordinator); S1 and S2 each **durably copy**
+  their boundary to a `BoundaryStore` the coordinator hosts on the Mac (seam B
+  `serve_multi_conn_forwarding_durable`). S_P serves S2's `FWD` **and** the coordinator's
+  `SAMPLE_NEXT` concurrently (the multi-conn substrate).
+- **Result — `THREENODE_WAN_OK`:** cross-machine greedy **12/12 argmax agreement** vs the Mac's
+  unsplit reference (mixed-backend tier — cross-arch boundaries are not bit-exact, spec I8);
+  **~0.81 tok/s** (12 tokens in 14.86 s). Durability wired across the chain: **both edges** (S1→S2 and
+  S2→S_P) captured **16 strictly-increasing boundaries** — the D1 recovery substrate on real hardware.
+- **Link classes (honesty rule, §9):** every leg **WAN/Tailscale** (Mac↔VM inherently; the VM↔VM leg
+  S2→S_P is also routed over Tailscale here so every listener binds its Tailscale IP — never 0.0.0.0,
+  NSG `DenyAllInBound`). The cloud-VNet fast path (`10.0.0.x`, sub-ms) between the VMs is **available
+  but not exercised** this run — a future optimization. **Not a wired-LAN number** (§8).
+- **Gate-cond-(i) note:** the byte-identical **recovery** on this direct-FWD topology (both kills, the
+  three-assertion bar) is proven in-process by `tests/three_node_recovery.rs`; this run banks the
+  real-hardware heterogeneity + WAN **throughput/agreement** data point. After 2026-08-05 (VMs die)
+  this result is historical/banked.
