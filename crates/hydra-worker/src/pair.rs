@@ -355,6 +355,56 @@ pub async fn run_generation(
     Ok(out)
 }
 
+/// Drive prefill + `n_steps` sampling through a **direct-FWD** two-worker pipeline (P1·1a): the
+/// coordinator sends `APPLY_TOKEN` to **S1** (a forwarding endpoint whose downstream is S_P, so each
+/// boundary travels **S1→S_P directly**) and `SAMPLE_NEXT` to **S_P** over a **separate, concurrent**
+/// connection. S_P therefore serves S1's `FWD` **and** the coordinator's control at once — the
+/// multi-connection serve loop is *required* (under the old sequential accept S_P would serve S1's
+/// connection and never accept the coordinator's, deadlocking `SAMPLE_NEXT`). Returns the generated
+/// tokens. The coordinator holds **no** sampler state (spec §1.4); every snapshot is produced at S_P.
+pub async fn run_direct_fwd_generation(
+    connector: &TcpMtls,
+    ep: &Endpoints,
+    keys: &SessionKeys,
+    config: &SamplingConfig,
+    prompt_tokens: &[u32],
+    n_steps: usize,
+) -> Result<Vec<u32>, String> {
+    // `ep.s2` is S_P here. Connecting to S1 makes S1 dial its downstream (S_P). The coordinator's own
+    // S_P control connection is the SECOND concurrent inbound connection S_P must serve.
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut cp = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s_p (control): {e}"))?;
+    let cfg_hash = config.hash();
+
+    // Prefill (teacher-forced NO_SAMPLE): C→S1 APPLY_TOKEN; S1 forwards the boundary direct to S_P;
+    // S_P's APPLIED_ACK is relayed back up S1→C.
+    for (pos, &tok) in prompt_tokens.iter().enumerate() {
+        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill send s1: {e}"))?;
+        expect_applied_ack(&mut c1, keys).await?;
+    }
+
+    let mut out = Vec::with_capacity(n_steps);
+    let mut input_pos = prompt_tokens.len() as i64;
+    for step in 0..n_steps {
+        cp.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+            .await
+            .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
+        let token = match wire::decode(&cp.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+            Msg::Sampled { token_id, .. } => token_id,
+            Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
+            other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
+        };
+        out.push(token);
+
+        if step + 1 < n_steps {
+            c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+            expect_applied_ack(&mut c1, keys).await?;
+            input_pos += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Prefill, then issue `SAMPLE_NEXT` for output position 0 **twice**, returning both decoded
 /// `SAMPLED` replies — the directed idempotence probe (I14): the duplicate must be byte-identical
 /// (served from the SAMPLED cache) and the RNG must not have advanced.

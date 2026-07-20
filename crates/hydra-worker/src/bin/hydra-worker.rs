@@ -2,18 +2,21 @@
 //!
 //! Reads its provisioning [`Bootstrap`] (mTLS material + role) from the file named by `argv[1]`,
 //! binds a TCP+mTLS listener, and serves one long-lived [`Worker`] (the real `hydra-state` stage
-//! SM + engine). Connections are accepted **sequentially** so the single-session worker keeps its
-//! stage + KV state across a coordinator reconnect (spec §1.4: one active session per instance).
+//! SM + engine) with the **multi-connection serve loop** (`serve_multi_conn`): concurrent inbound
+//! connections share the one `Worker`, so a stage can serve its upstream `FWD` **and** the
+//! coordinator's control/`SAMPLE_NEXT` at once (P1·1a — the seam-3 requirement for a direct-FWD
+//! pipeline). The single-session stage + KV state is preserved across a coordinator reconnect (spec
+//! §1.4: one active session per instance) because every connection shares the same `Worker`.
 //!
-//! Run on a **current-thread** runtime: the engine's C context is not `Send`, and a worker owns it
-//! on exactly one thread.
+//! Run on a **current-thread** runtime inside a `LocalSet`: the engine's C context is not `Send`, and
+//! a worker owns it on exactly one thread; the per-connection tasks are `spawn_local`.
 
 use std::net::SocketAddr;
 
 use hydra_transport::server_config_with_ca;
 use hydra_transport::tcp_mtls::TcpMtlsListener;
 use hydra_worker::bootstrap::Bootstrap;
-use hydra_worker::worker::{serve_conn, Worker};
+use hydra_worker::worker::{serve_multi_conn, shared, Worker};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,24 +32,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (rank, lf, ll, is_final, toks) =
         (boot.cfg.rank, boot.cfg.layer_first, boot.cfg.layer_last, boot.cfg.is_final, boot.cfg.receives_tokens);
-    let mut worker = Worker::new(boot.cfg)?;
+    let worker = Worker::new(boot.cfg)?;
     eprintln!(
         "hydra-worker {} rank={rank} layers=[{lf},{ll}] final={is_final} tokens={toks} engine={}",
         boot.device_name,
         worker.has_engine()
     );
 
-    loop {
-        match listener.accept().await {
-            Ok(mut conn) => {
-                if let Err(e) = serve_conn(&mut worker, &mut conn).await {
-                    eprintln!("hydra-worker: connection ended with error: {e}");
-                }
+    // Concurrent connections share the one (non-Send) Worker on this thread via a LocalSet.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            if let Err(e) = serve_multi_conn(shared(worker), listener).await {
+                eprintln!("hydra-worker: serve loop ended with error: {e}");
+                return Err::<(), Box<dyn std::error::Error>>(e.into());
             }
-            Err(e) => {
-                eprintln!("hydra-worker: accept failed: {e}");
-                return Err(e.into());
-            }
-        }
-    }
+            Ok(())
+        })
+        .await
 }
