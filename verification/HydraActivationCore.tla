@@ -3,6 +3,19 @@
 (* Hydra Session Protocol v0.10 — transition core (package v0.10.1).                   *)
 (*                                                                                     *)
 (* CHANGELOG                                                                            *)
+(*   2026-08-22 — Mutation 3 made CONSISTENT. `CommitAcks`/`FinalAcks` now gate their    *)
+(*     attempt filter on `AttemptFencing` (`(AttemptFencing => m.a = a)`). Repairs       *)
+(*     F-MUT3-UNREACHABLE (PROJECT_STATE §7.22): the sabotage disabled the stage-side    *)
+(*     checks but left these coordinator-side filters hard-coded, so a stale-attempt     *)
+(*     stage never produced a countable ack, COMPLETE blocked, and ack-counting alone    *)
+(*     reconstituted the guarantee — the designed violation was unreachable BY           *)
+(*     CONSTRUCTION (12 complete exhaustions to 4 239 954 distinct states found nothing, *)
+(*     while the DST catches the same sabotage at median 187 steps). Authorized under    *)
+(*     the mutation framework's too-abstract clause: this STRENGTHENS THE DETECTOR, it   *)
+(*     does not adjust the model to make a check pass. With AttemptFencing = TRUE the    *)
+(*     implication is equivalent to the old equality, so the faithful model is           *)
+(*     behaviourally UNCHANGED; only the mutant differs. Rule 13 still voids every prior *)
+(*     checkpoint — moot for the reasons recorded under MaxCkpt below.                   *)
 (*   2026-08-22 — MaxCkpt added (CONSTANT + `installedCkpt < MaxCkpt` guard on          *)
 (*     PrepareCandidate). Repairs F-UNBOUNDED-SEGMENT (PROJECT_STATE §7.21): the        *)
 (*     candidate-checkpoint dimension was the one unbounded-in-reality dimension        *)
@@ -127,10 +140,31 @@ StateConstraint == Cardinality(msgs) <= 20
 Send(m)  == msgs' = msgs \cup {m}
 Wal(r)   == wal'  = wal  \cup {r}
 
+\* ReadyAcks is round-scoped (r), NOT attempt-scoped, so it carries no `m.a` filter and is not
+\* part of the fencing surface below.
 ReadyAcks     == { m \in msgs : m.t = "READY"     /\ m.tgt = recTarget /\ m.r = rId }
+\* [HYDRA 2026-08-22, §7.22 F-MUT3-UNREACHABLE] The attempt filter on the coordinator's evidence
+\* sets is GATED ON THE SAME SWITCH as the stage-side checks.
+\*
+\* Why: Mutation 3 (`AttemptFencing = FALSE`) was an INCONSISTENT sabotage. It disabled the
+\* stage-side attempt checks but left these two coordinator-side filters hard-coded to `m.a = a`.
+\* A stale-attempt stage therefore never yielded a countable ack, `AllCommitted` never held,
+\* `CoordWriteComplete` blocked, and ack-counting alone reconstituted the guarantee the mutation
+\* was supposed to remove — so the designed violation was unreachable BY CONSTRUCTION. Twelve
+\* complete exhaustions (to 4 239 954 distinct states) found no counterexample, while the
+\* implementation-level DST catches the same sabotage at median 187 steps: the model's sabotage
+\* was not modelling the implementation's defect (stale acks COUNTED — TLC-1's class).
+\*
+\* Those exhaustions are kept as a positive result, not discarded: at this abstraction, consistent
+\* ack discipline SUBSUMES attempt fencing (defence in depth, §7.22).
+\*
+\* With `AttemptFencing = TRUE` the implication `(TRUE => m.a = a)` is equivalent to `m.a = a`, so
+\* the FAITHFUL model is behaviourally unchanged; only the mutant differs. This strengthens the
+\* detector — it does not adjust the model to make a check pass (rule 6 untouched).
 CommitAcks(a) == { m \in msgs : m.t = "COMMITTED" /\ m.tgt = recTarget /\ m.r = rId
-                                                   /\ m.a = a }
-FinalAcks(a)  == { m \in msgs : m.t = "FINALIZED" /\ m.tgt = recTarget /\ m.a = a }
+                                                   /\ (AttemptFencing => m.a = a) }
+FinalAcks(a)  == { m \in msgs : m.t = "FINALIZED" /\ m.tgt = recTarget
+                                                   /\ (AttemptFencing => m.a = a) }
 AcksFrom(S)   == { m.s : m \in S }
 
 AllReady      == AcksFrom(ReadyAcks)        = Stages
