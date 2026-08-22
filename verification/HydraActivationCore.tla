@@ -2,6 +2,18 @@
 (***************************************************************************************)
 (* Hydra Session Protocol v0.10 — transition core (package v0.10.1).                   *)
 (*                                                                                     *)
+(* CHANGELOG                                                                            *)
+(*   2026-08-22 — MaxCkpt added (CONSTANT + `installedCkpt < MaxCkpt` guard on          *)
+(*     PrepareCandidate). Repairs F-UNBOUNDED-SEGMENT (PROJECT_STATE §7.21): the        *)
+(*     candidate-checkpoint dimension was the one unbounded-in-reality dimension        *)
+(*     without a bounding constant, so prepare→commit formed an unbounded self-loop and *)
+(*     TLC hit its 65535-state behaviour-length ceiling before ANY baseline could reach *)
+(*     fixpoint. A model-bounding omission of the TLC-3 class — the transitions         *)
+(*     themselves are faithful (the protocol does permit unboundedly many segments) and *)
+(*     the SPEC is unchanged. Rule 13: this voids every prior TLC checkpoint, which is  *)
+(*     moot by construction — `-recover` chaining is dead (§8, closed as superseded)    *)
+(*     and the tier-2 certification configs are designed to DRAIN inside one time-box.  *)
+(*                                                                                     *)
 (* Models ONLY: BEGIN_RECOVERY Cases A/B/B'/C, catch-up/rebuild (abstracted),          *)
 (* RESET_RECOVERY_ATTEMPT, the activation transaction (intent / commit / abort /       *)
 (* complete / finalize), post-decision participant loss + ACTIVATION_UNSERVABLE +      *)
@@ -31,7 +43,39 @@ CONSTANTS
     MaxAttempt,        \* bound on activation attempts      (e.g. 2)
     MaxPos,            \* bound on abstract applied positions (e.g. 2)
     MaxCrashes,        \* bound on total crash events => EventuallyStable holds
+    MaxCkpt,           \* bound on segment/sampler checkpoint ids (see the note below)
     EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled
+
+(***************************************************************************************)
+(* MaxCkpt — the model-bounding constant added 2026-08-22 (F-UNBOUNDED-SEGMENT,        *)
+(* PROJECT_STATE §7.21). Classification: a model-bounding OMISSION of the TLC-3 class,  *)
+(* not a protocol defect and not a certification-config tweak.                          *)
+(*                                                                                     *)
+(* `PrepareCandidate`/`CommitSegmentAndInstall` are FAITHFUL to the protocol: a real    *)
+(* session may commit unboundedly many segment checkpoints, and `installedCkpt` is a    *)
+(* monotonically increasing id. But model checking requires every dimension that is     *)
+(* unbounded-in-reality to carry a bounding constant, exactly as MaxEpoch / MaxRId /    *)
+(* MaxAttempt / MaxPos / MaxCrashes already do. Checkpoint count is the same class and  *)
+(* was simply missed when the candidate abstraction landed — so without a bound the     *)
+(* prepare→commit pair is an unbounded self-loop, every behaviour can be extended       *)
+(* forever, and TLC dies on its 65535-state behaviour-length ceiling BEFORE any         *)
+(* baseline can reach fixpoint. No `|msgs|` state constraint can rescue that: the       *)
+(* obstacle is behaviour LENGTH, not state COUNT.                                       *)
+(*                                                                                     *)
+(* Value: 2–3 is sufficient. The candidate abstraction's whole behavioural repertoire   *)
+(* is prepare → {commit | drop | coordinator-crash}. Two committable ids already give   *)
+(* an installed checkpoint that a LATER candidate is prepared against (installedCkpt+1  *)
+(* is exercised as a genuine successor, not just as 0→1), plus the drop and crash arms  *)
+(* interleaved against a non-initial installed value. A third id adds a second such     *)
+(* succession without adding a new SHAPE of interleaving. Beyond that the constant only *)
+(* lengthens behaviours — which is precisely the cost this bound exists to remove.      *)
+(*                                                                                     *)
+(* This is a CORE-model change, so rule 13 voids every prior TLC checkpoint. That is    *)
+(* moot by construction: `-recover` chaining is dead (PROJECT_STATE §8, closed as       *)
+(* superseded) and the tier-2 certification strategy replaces it — the cert configs are *)
+(* designed to DRAIN inside one time-box rather than resume across many.                *)
+(***************************************************************************************)
+ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 
 ASSUME EnableUnservable \in BOOLEAN /\ ResetTruncates \in BOOLEAN
        /\ AttemptFencing \in BOOLEAN /\ AbortGuardEnabled \in BOOLEAN
@@ -440,6 +484,12 @@ CoordRestart ==             \* phase-specific restart rule (spec §6.5), driven 
 
 PrepareCandidate ==
     /\ cState = "SERVICEABLE" /\ candidateCkpt = 0
+    \* F-UNBOUNDED-SEGMENT (§7.21): bound the checkpoint dimension, exactly as MaxEpoch/MaxRId/
+    \* MaxAttempt/MaxPos/MaxCrashes bound theirs. Without this the prepare→commit pair is an
+    \* unbounded self-loop and NO baseline can ever reach fixpoint (TLC dies on its 65535-state
+    \* behaviour-length ceiling first). The protocol genuinely permits unboundedly many segments —
+    \* this bounds the MODEL, it does not narrow the protocol.
+    /\ installedCkpt < MaxCkpt
     /\ candidateCkpt' = installedCkpt + 1
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,

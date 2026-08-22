@@ -20,6 +20,7 @@ MaxRId = 1
 MaxAttempt = 2
 MaxPos = 1
 MaxCrashes = 1
+MaxCkpt = 2
 MaxMsgs = @MAXMSGS@
 EnableUnservable = FALSE
 ResetTruncates = TRUE

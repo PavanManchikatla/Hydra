@@ -11,6 +11,16 @@
 \* pairing principle, generalized to the whole cert set).
 \*
 \* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+\*
+\* MaxCkpt: the cert legs use 2, the standing large-bound configs use 3 — both inside the ratified
+\* 2–3 range (F-UNBOUNDED-SEGMENT, §7.21). 2 is the value the core module's own justification calls
+\* sufficient for every SHAPE of prepare/commit/drop/crash interleaving; 3 adds a second succession
+\* without a new shape. The cert legs must DRAIN inside the time-box, and an independent counter
+\* multiplies the space, so they take the smaller sufficient value; the standing configs are
+\* depth-bounded evidence with no drain obligation and take the larger.
+\* This is not bound-shopping: the §6 acceptance criterion is SELF-POLICING — all four mutations
+\* must still FIRE at the certified bounds, so a MaxCkpt too small to exhibit the harm makes a
+\* mutation go silent and DISQUALIFIES the bound rather than passing it.
 SPECIFICATION Spec
 
 SYMMETRY Sym
@@ -25,6 +35,7 @@ MaxRId = 1
 MaxAttempt = 2
 MaxPos = 1
 MaxCrashes = 1
+MaxCkpt = 2
 MaxMsgs = @MAXMSGS@
 EnableUnservable = TRUE
 ResetTruncates = TRUE
