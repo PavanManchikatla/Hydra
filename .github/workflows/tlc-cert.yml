@@ -32,6 +32,14 @@ on:
         description: 'Per-leg inner time-box in minutes. A leg that exits on this box is INCONCLUSIVE, never green.'
         type: string
         default: '120'
+      max_attempt:
+        description: 'MaxAttempt override (§0(b) drain-clean ladder rung (b) is MaxAttempt = 3). Empty = leave the template value.'
+        type: string
+        default: ''
+      max_crashes:
+        description: 'MaxCrashes override. Empty = leave the template value (1). Mut3''s stale-INITIAL harm may need 2.'
+        type: string
+        default: ''
 
 env:
   TLA_URL: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
@@ -76,6 +84,15 @@ jobs:
           mkdir -p ci-results
           out="ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg"
           sed 's/@MAXMSGS@/${{ matrix.msgs }}/' "cert/${{ matrix.leg.cfg }}.cfg.in" > "$out"
+          # §0(b) ladder overrides. These are BOUNDS, never model logic — they widen the space the
+          # mutation is hunted in, and they are recorded in the status line and the receipt so the
+          # certified claim always names the bounds it was certified at.
+          if [ -n "${{ inputs.max_attempt }}" ]; then
+            sed -i "s/^MaxAttempt = .*/MaxAttempt = ${{ inputs.max_attempt }}/" "$out"
+          fi
+          if [ -n "${{ inputs.max_crashes }}" ]; then
+            sed -i "s/^MaxCrashes = .*/MaxCrashes = ${{ inputs.max_crashes }}/" "$out"
+          fi
           # The bound DEFINES the certified claim, so the fully-substituted config is part of
           # the evidence (rule 16) — never inferred from a filename. Echo it into the log too.
           echo "--- $out ---"; cat "$out"
@@ -120,7 +137,9 @@ jobs:
             elif [ "$complete" -ge 1 ]; then verdict=GREEN                     # reached fixpoint / clean drain
             fi
           fi
-          echo "config=${{ matrix.leg.name }} msgs=${{ matrix.msgs }} crashes=1 expect=${{ matrix.leg.expect }} violated=$violated complete=$complete verdict=$verdict" \
+          ATT=$(grep "^MaxAttempt" "ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg" | awk "{print \$3}")
+          CR=$(grep "^MaxCrashes" "ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg" | awk "{print \$3}")
+          echo "config=${{ matrix.leg.name }} msgs=${{ matrix.msgs }} crashes=$CR attempt=$ATT expect=${{ matrix.leg.expect }} violated=$violated complete=$complete verdict=$verdict" \
             | tee ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.status
           [ "$verdict" = "INCONCLUSIVE" ] && echo "INCONCLUSIVE (time-boxed at ${{ inputs.timebox_min }}m) — this bound certifies NOTHING."
           exit $rc
