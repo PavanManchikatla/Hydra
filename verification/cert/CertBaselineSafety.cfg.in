@@ -1,0 +1,35 @@
+\* TIER-2 CERT LEG — baseline safety. EXPECT: clean, and it MUST reach FIXPOINT.
+\*
+\* Acceptance criterion (PROJECT_STATE §6): this leg is one of the two baselines that
+\* must reach a CONCLUSIVE verdict inside the time-box. "Conclusive" for this leg means
+\* TLC prints `Model checking completed. No error` — a time-box exit is INCONCLUSIVE and
+\* certifies nothing (rule 16).
+\*
+\* Bounds are IDENTICAL across all six cert legs; the ONLY difference between this file
+\* and the four mutation legs is the mutation switch. That is what makes a mutation fire
+\* here provably mutation-induced rather than bound-induced (the Mut3Fast/BaselineSafetyFast
+\* pairing principle, generalized to the whole cert set).
+\*
+\* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+SPECIFICATION Spec
+
+SYMMETRY Sym
+
+CONSTRAINT
+CertConstraint
+
+CONSTANTS
+Stages = {s1, s2}
+MaxEpoch = 1
+MaxRId = 1
+MaxAttempt = 2
+MaxPos = 1
+MaxCrashes = 1
+MaxMsgs = @MAXMSGS@
+EnableUnservable = TRUE
+ResetTruncates = TRUE
+AttemptFencing = TRUE
+AbortGuardEnabled = TRUE
+
+INVARIANTS
+Inv

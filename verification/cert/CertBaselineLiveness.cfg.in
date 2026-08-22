@@ -1,0 +1,40 @@
+\* TIER-2 CERT LEG — baseline liveness. EXPECT: clean drain, no temporal violation.
+\*
+\* Acceptance criterion (PROJECT_STATE §6): the second of the two baselines that must
+\* reach a CONCLUSIVE verdict inside the time-box. A time-box exit is INCONCLUSIVE.
+\*
+\* NO SYMMETRY: TLC's symmetry reduction is unsound for temporal-property checking, and
+\* the two temporal configs in this package (BaselineLiveness.cfg, Mut1Unservable.cfg)
+\* have always omitted it. Preserved here deliberately — do not "harmonize" it in.
+\*
+\* This leg carries the F-LIVENESS-FAIR (§7.13) repair on the v0.10.4 model: `Progress`
+\* was violated pre-repair, and the CLEAN DRAIN has never yet been observed at the large
+\* bounds. If it drains clean here, that is a certified-at-reduced-bounds result and must
+\* be stated as exactly that — it does NOT retire the large-bound obligation.
+\*
+\* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+SPECIFICATION Spec
+
+CONSTRAINT
+CertConstraint
+
+CONSTANTS
+Stages = {s1, s2}
+MaxEpoch = 1
+MaxRId = 1
+MaxAttempt = 2
+MaxPos = 1
+MaxCrashes = 1
+MaxMsgs = @MAXMSGS@
+EnableUnservable = TRUE
+ResetTruncates = TRUE
+AttemptFencing = TRUE
+AbortGuardEnabled = TRUE
+
+INVARIANTS
+Inv
+
+PROPERTIES
+Progress
+PostDecisionLoss
+EventualService

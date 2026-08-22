@@ -1,0 +1,31 @@
+\* TIER-2 CERT LEG — Mutation 4 (AbortGuardEnabled = FALSE). EXPECT: VIOLATION.
+\*
+\* Designed harm: no abort finality => the TLC-1 defect returns — a crash-after-durable-
+\* ABORT resurrects and completes an aborted activation via stale acks, violating `I25`
+\* (`AbortFinality`). This is the mutation that guards the ONE protocol defect TLC found
+\* that nine human review rounds missed (§7.3); it must fire at the certified bounds or
+\* the certification is worthless. 14-state trace at the large bounds (§6).
+\*
+\* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+SPECIFICATION Spec
+
+SYMMETRY Sym
+
+CONSTRAINT
+CertConstraint
+
+CONSTANTS
+Stages = {s1, s2}
+MaxEpoch = 1
+MaxRId = 1
+MaxAttempt = 2
+MaxPos = 1
+MaxCrashes = 1
+MaxMsgs = @MAXMSGS@
+EnableUnservable = TRUE
+ResetTruncates = TRUE
+AttemptFencing = TRUE
+AbortGuardEnabled = FALSE
+
+INVARIANTS
+Inv

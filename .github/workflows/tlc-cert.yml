@@ -1,0 +1,184 @@
+name: TLC-Cert
+
+# TIER-2 CERTIFICATION BOUND SEARCH (PROJECT_STATE §6, design-authority-authorized 2026-08-22).
+#
+# Why this exists: the large-bound `long` legs in tlc.yml have read INCONCLUSIVE since
+# 2026-07-13 — every weekly run is a FRESH time-box over a 320M+-state space, so
+# baseline-safety never reaches fixpoint and Mut3 never fires. The ratified strategy is
+# "certified-small beats forever-inconclusive-large": certify at reduced bounds that DRAIN.
+#
+# BINDING ACCEPTANCE CRITERION (PROJECT_STATE §6 — this workflow encodes it mechanically,
+# it does not re-decide it): a candidate bound certifies IFF
+#   (A) ALL FOUR mutations (Mut1, Mut2, Mut3, Mut4) FIRE at that bound, AND
+#   (B) BOTH baselines reach CONCLUSIVE verdicts at that bound inside the time-box —
+#       baseline-safety -> fixpoint, baseline-liveness -> clean drain.
+# A bound at which any mutation goes silent is a MASKED FAILURE, not a certification.
+#
+# The search sweeps several bounds in ONE dispatch (all legs at all bounds, in parallel)
+# and the `gate` job reports the SMALLEST bound that satisfies the criterion. Iterating
+# `|msgs|` upward until Mut3 fires is therefore one run, not a serial chain of dispatches.
+#
+# The model is UNTOUCHED (rule 13): HydraCert.tla is a wrapper that EXTENDS
+# HydraActivationCore and adds exactly one constant (MaxMsgs) and one state constraint.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bounds:
+        description: 'JSON array of |msgs| bounds to sweep (must each be <= 20 — the core StateConstraint)'
+        type: string
+        default: '[8, 10, 12, 14, 16]'
+      timebox_min:
+        description: 'Per-leg inner time-box in minutes. A leg that exits on this box is INCONCLUSIVE, never green.'
+        type: string
+        default: '120'
+
+env:
+  TLA_URL: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+  TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        msgs: ${{ fromJSON(inputs.bounds) }}
+        leg:
+          # Bounds are IDENTICAL across all six legs at a given `msgs`; the ONLY difference
+          # is the mutation switch. That is what makes a fire provably mutation-induced
+          # rather than bound-induced.
+          - { name: baseline-safety, cfg: CertBaselineSafety,      expect: clean     }
+          - { name: baseline-live,   cfg: CertBaselineLiveness,    expect: clean     }
+          - { name: mut1,            cfg: CertMut1Unservable,      expect: violation }
+          - { name: mut2,            cfg: CertMut2Reset,           expect: violation }
+          - { name: mut3,            cfg: CertMut3AttemptFence,    expect: violation }
+          - { name: mut4,            cfg: CertMut4AbortFinality,   expect: violation }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+
+      - name: Fetch + verify tla2tools.jar (pinned v1.7.4)
+        working-directory: verification
+        run: |
+          curl -sSL -o tla2tools.jar "$TLA_URL"
+          echo "$TLA_SHA256  tla2tools.jar" | sha256sum -c -
+
+      - name: Parse check (SANY) — the wrapper and the untouched core
+        working-directory: verification
+        run: java -cp tla2tools.jar tla2sany.SANY HydraCert.tla
+
+      - name: Materialize the cert config at |msgs| = ${{ matrix.msgs }}
+        working-directory: verification
+        run: |
+          mkdir -p ci-results
+          out="ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg"
+          sed 's/@MAXMSGS@/${{ matrix.msgs }}/' "cert/${{ matrix.leg.cfg }}.cfg.in" > "$out"
+          # The bound DEFINES the certified claim, so the fully-substituted config is part of
+          # the evidence (rule 16) — never inferred from a filename. Echo it into the log too.
+          echo "--- $out ---"; cat "$out"
+          grep -q "MaxMsgs = ${{ matrix.msgs }}" "$out" || { echo "FAIL: substitution did not take"; exit 1; }
+
+      - name: Run ${{ matrix.leg.name }} @ |msgs|=${{ matrix.msgs }}
+        working-directory: verification
+        run: |
+          cfg="ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg"
+          log="ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.log"
+          # Inner time-box strictly under the job timeout so Classify + Upload always run.
+          # rc is swallowed on purpose: the VERDICT comes from the log, never from an exit code.
+          timeout ${{ inputs.timebox_min }}m java -Xmx12g -cp tla2tools.jar tlc2.TLC \
+            -workers auto -deadlock -config "$cfg" HydraCert.tla > "$log" 2>&1 || true
+          tail -25 "$log"
+
+      - name: Classify result
+        working-directory: verification
+        run: |
+          # Rule 16: the verdict is read out of the TLC log. Job status is NEVER evidence.
+          log=ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.log
+          violated=$(grep -cE "Invariant .* is violated|Temporal properties were violated" "$log" || true)
+          complete=$(grep -cE "Model checking completed\. No error" "$log" || true)
+          # An ASSUME failure (e.g. MaxMsgs > 20) must never be read as a quiet INCONCLUSIVE.
+          assumefail=$(grep -cE "Assumption .* is false|Assumption is false" "$log" || true)
+          verdict=INCONCLUSIVE; rc=0
+          if [ "$assumefail" -ge 1 ]; then
+            verdict=ASSUME-FAILED; rc=1
+          elif [ "${{ matrix.leg.expect }}" = "violation" ]; then
+            if   [ "$violated" -ge 1 ]; then verdict=GREEN                     # mutation fired as designed
+            elif [ "$complete" -ge 1 ]; then verdict=MASKED-FAILURE; rc=1      # drained clean => mutation went SILENT
+            fi
+          else
+            if   [ "$violated" -ge 1 ]; then verdict=VIOLATION; rc=1           # a "clean" leg that violates: loud, never green
+            elif [ "$complete" -ge 1 ]; then verdict=GREEN                     # reached fixpoint / clean drain
+            fi
+          fi
+          echo "config=${{ matrix.leg.name }} msgs=${{ matrix.msgs }} crashes=1 expect=${{ matrix.leg.expect }} violated=$violated complete=$complete verdict=$verdict" \
+            | tee ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.status
+          [ "$verdict" = "INCONCLUSIVE" ] && echo "INCONCLUSIVE (time-boxed at ${{ inputs.timebox_min }}m) — this bound certifies NOTHING."
+          exit $rc
+
+      - name: Upload receipt (log + status + the substituted cfg)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-${{ matrix.leg.name }}-m${{ matrix.msgs }}
+          path: |
+            verification/ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.log
+            verification/ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.status
+            verification/ci-results/${{ matrix.leg.name }}-m${{ matrix.msgs }}.cfg
+          retention-days: 90
+
+  gate:
+    needs: cert
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every leg's status
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cert-*
+          path: statuses
+          merge-multiple: true
+
+      - name: Apply the §6 acceptance criterion
+        run: |
+          set -u
+          # Mechanically encodes PROJECT_STATE §6. Six legs must ALL read verdict=GREEN at a
+          # bound for that bound to certify. This job exists so no human (agent or authority)
+          # certifies a bound by eyeballing six check-marks — rule 16 has caught that twice.
+          LEGS="baseline-safety baseline-live mut1 mut2 mut3 mut4"
+          echo "===== TIER-2 CERTIFICATION BOUND SEARCH — quoted verdict= lines ====="
+          cat statuses/*.status 2>/dev/null | sort || true
+          echo "====================================================================="
+          bounds=$(ls statuses/*.status 2>/dev/null | sed -E 's/.*-m([0-9]+)\.status/\1/' | sort -n -u)
+          [ -z "$bounds" ] && { echo "cert-verdict=NO-RECEIPTS — no status files; nothing certified."; exit 1; }
+          certified=""
+          for b in $bounds; do
+            allgreen=1; missing=""
+            for l in $LEGS; do
+              f="statuses/$l-m$b.status"
+              if [ ! -f "$f" ]; then allgreen=0; missing="$missing $l(no-receipt)"; continue; fi
+              v=$(sed -E 's/.*verdict=([A-Z-]+).*/\1/' "$f")
+              [ "$v" = "GREEN" ] || { allgreen=0; missing="$missing $l($v)"; }
+            done
+            if [ "$allgreen" = "1" ]; then
+              echo "bound |msgs|=$b : ALL SIX GREEN — four mutations fired, both baselines conclusive"
+              [ -z "$certified" ] && certified="$b"
+            else
+              echo "bound |msgs|=$b : NOT certified —$missing"
+            fi
+          done
+          echo "====================================================================="
+          if [ -n "$certified" ]; then
+            echo "cert-verdict=CERTIFIED msgs=$certified crashes=1"
+            echo "Certified claim (verbatim form required by §6):"
+            echo "  certified at (MaxCrashes=1, |msgs|<=$certified, Stages={s1,s2}, MaxEpoch=1, MaxRId=1, MaxAttempt=2, MaxPos=1);"
+            echo "  larger bounds: depth-clean, inconclusive"
+            echo "M1 flips ONLY on the complete six-leg receipt set for this bound — see §6."
+          else
+            echo "cert-verdict=NOT-CERTIFIED — no swept bound satisfied the criterion."
+            echo "Next step per §6: iterate |msgs| UPWARD (re-dispatch with larger bounds, each <= 20)."
+            echo "NEVER lower a bound, relax the time-box, or touch model logic to obtain a pass (rules 6, 9)."
+            exit 1
+          fi

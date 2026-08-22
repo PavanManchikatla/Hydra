@@ -1,0 +1,29 @@
+\* TIER-2 CERT LEG — Mutation 2 (ResetTruncates = FALSE). EXPECT: VIOLATION.
+\*
+\* Designed harm: RESET_RECOVERY_ATTEMPT degraded to a label-only r-bump => `CaseBPure`
+\* is violated after catch-up (8-state trace at the large bounds, §6). Checks the full
+\* `Inv` (the authoritative gate's shape), not the single conjunct the smoke config uses.
+\*
+\* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+SPECIFICATION Spec
+
+SYMMETRY Sym
+
+CONSTRAINT
+CertConstraint
+
+CONSTANTS
+Stages = {s1, s2}
+MaxEpoch = 1
+MaxRId = 1
+MaxAttempt = 2
+MaxPos = 1
+MaxCrashes = 1
+MaxMsgs = @MAXMSGS@
+EnableUnservable = TRUE
+ResetTruncates = FALSE
+AttemptFencing = TRUE
+AbortGuardEnabled = TRUE
+
+INVARIANTS
+Inv

@@ -1,0 +1,37 @@
+\* TIER-2 CERT LEG — Mutation 3 (AttemptFencing = FALSE). EXPECT: VIOLATION.
+\* ***THIS IS THE BINDING LEG OF THE BOUND-SEARCH.***
+\*
+\* Designed harm: no activation_attempt_id fencing => a stale INITIAL commit violates
+\* `ServiceSafety`/`TupleSafety`. This mutation has NEVER fired at the large bounds
+\* (~380M states, `verdict=INCONCLUSIVE`, §6) — it is deep in a large space, not a doubt
+\* about the harm (the randomized sim catches the same sabotage at median 187 steps, and
+\* Mut3Fast exists precisely because smaller sound bounds make it shallow).
+\*
+\* The ratified search procedure (PROJECT_STATE §6): ITERATE `MaxMsgs` UPWARD until this
+\* leg fires. The bound that certifies is the smallest at which THIS leg fires AND the
+\* other three mutations still fire AND both baselines still reach conclusive verdicts.
+\* `MaxMsgs` is a bound, never model logic (rules 6 and 9).
+\*
+\* @MAXMSGS@ is substituted by the tlc-cert workflow from the `cert_msgs` dispatch input.
+SPECIFICATION Spec
+
+SYMMETRY Sym
+
+CONSTRAINT
+CertConstraint
+
+CONSTANTS
+Stages = {s1, s2}
+MaxEpoch = 1
+MaxRId = 1
+MaxAttempt = 2
+MaxPos = 1
+MaxCrashes = 1
+MaxMsgs = @MAXMSGS@
+EnableUnservable = TRUE
+ResetTruncates = TRUE
+AttemptFencing = FALSE
+AbortGuardEnabled = TRUE
+
+INVARIANTS
+Inv
