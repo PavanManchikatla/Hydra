@@ -340,6 +340,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-sched"
+version = "0.10.2"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "hydra-sim"
 version = "0.10.2"
 dependencies = [
@@ -398,6 +405,7 @@ dependencies = [
  "hydra-engine-sys",
  "hydra-modelsvc",
  "hydra-proto",
+ "hydra-sched",
  "hydra-state",
  "hydra-tokenizer",
  "hydra-transport",

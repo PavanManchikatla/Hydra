@@ -5,6 +5,15 @@
 > fixture for the M3 startup benchmark (P2·1) and the input the placement solver (P2·3) is validated
 > against. Produced by `cargo run --bin hydra-bench` **on each node locally** (no networking).
 >
+> **⚠️ METHODOLOGY NOTE (added 2026-08-22, P2·1).** The numbers below were produced by what is now
+> `HYDRA_BENCH_QUICK=1`: a **single 24-step decode window immediately after prefill** — a *cold*
+> window. P2·1's sustained benchmark discards warm-up and measures 30–120 s of steady state, and on
+> the Mac reads **0.674 ms/layer-tok (61.8 tok/s)** against the **1.00 (41.5 tok/s)** recorded here.
+> **These absolute numbers are warm-up-inclusive and understate steady-state capability.** The
+> **ratio** — the only thing that drives placement — **is unaffected**, because all three nodes were
+> measured with the identical workload. **Never compare a quick-mode number with a sustained-mode
+> number.** The quick path is preserved verbatim so this table stays reproducible.
+>
 > **Honesty.** CPU backend (`n_gpu_layers=0`, the deterministic DoD backend) on all three nodes for a
 > fair comparison. These are **compute-capability** numbers only — **link costs are not included**
 > (the Mac↔VM legs are WAN/Tailscale, the VM↔VM leg is cloud-VNet; link probing is P2·2). Small-model

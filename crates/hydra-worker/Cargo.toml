@@ -24,6 +24,9 @@ hydra-engine-sys = { path = "../hydra-engine-sys" }
 # runtime. One-way edge — hydra-modelsvc deps are gguf/blake3/ring/thiserror only, no cycle.
 # A crate-dep change, NOT a package decision (rule 5): proceed + log.
 hydra-modelsvc = { path = "../hydra-modelsvc" }
+# P2·1: the sustained startup benchmark feeds its windows to the pure aggregator/EWMA in
+# hydra-sched. One-way edge — hydra-sched has no deps but thiserror, so no cycle.
+hydra-sched = { path = "../hydra-sched" }
 flatbuffers.workspace = true
 blake3.workspace = true
 thiserror.workspace = true

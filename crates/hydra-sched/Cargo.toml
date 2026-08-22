@@ -1,0 +1,10 @@
+[package]
+name = "hydra-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PURE Hydra scheduling inputs: device capability measurement (P2·1 startup benchmark + EWMA), and later the link prober (P2·2) and placement solver (P2·3). No engine, no I/O, no clocks — samples are handed IN, so every decision is deterministic and CI-testable."
+
+[dependencies]
+thiserror.workspace = true
