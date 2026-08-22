@@ -322,6 +322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-modelsvc"
+version = "0.10.2"
+dependencies = [
+ "blake3",
+ "ring",
+ "thiserror",
+]
+
+[[package]]
 name = "hydra-proto"
 version = "0.10.2"
 dependencies = [
