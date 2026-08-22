@@ -12,3 +12,4 @@
 //! `hydra-bench` binary, which owns the engine dependency and feeds its samples here.
 
 pub mod capability;
+pub mod link;
