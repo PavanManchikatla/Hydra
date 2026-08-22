@@ -77,6 +77,13 @@ pub struct WorkerConfig {
     /// accept `BEGIN_RECOVERY` **Case A** through the real stage SM (spec §6.2/§6.5). Default `false`
     /// (a fresh session's worker is `FROZEN_READY`).
     pub recovery_start: bool,
+    /// P2·10b — path to the **Ed25519-signed shard manifest** (`hydra-modelsvc split` output).
+    /// When set, `model_path` is treated as a **per-stage shard** and is loaded only after the
+    /// manifest verifies (signature → this shard's entry → the shard's BLAKE3 → the entry's layer
+    /// range vs this worker's configured range). Any failure **refuses the shard** — it never
+    /// degrades to a full load or a control-plane-only worker, because a silent downgrade is
+    /// exactly the attack the signature exists to stop. `None` ⇒ the pre-P2·10b full-model load.
+    pub shard_manifest: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +94,8 @@ pub enum WorkerError {
     Engine(#[from] EngineError),
     #[error("data-plane frame but no engine linked/loaded on this worker")]
     EngineUnavailable,
+    #[error(transparent)]
+    ShardRefused(#[from] crate::shard::ShardRefused),
     #[error(transparent)]
     Transport(#[from] hydra_transport::TransportError),
 }
@@ -104,14 +113,25 @@ struct Engine {
 impl Engine {
     /// Build the engine for `cfg`, or `None` if the engine isn't linked or the model file is absent
     /// (both dev-environment artifacts — a control-plane-only worker still runs everywhere).
-    fn try_new(cfg: &WorkerConfig) -> Result<Option<Engine>, EngineError> {
+    fn try_new(cfg: &WorkerConfig) -> Result<Option<Engine>, WorkerError> {
         if !ENGINE_AVAILABLE {
             return Ok(None);
         }
         let Some(path) = cfg.model_path.as_deref().filter(|p| std::path::Path::new(p).exists()) else {
             return Ok(None);
         };
-        let model = Model::load(path, cfg.n_gpu_layers)?;
+        // P2·10b: a configured manifest makes this a SHARD worker. Verification happens before any
+        // weights are read, and a failure REFUSES — it never falls back to a full load or to a
+        // control-plane-only worker. The missing-model case above is a dev-environment artifact;
+        // this case is a trust failure, and the two must not share an outcome.
+        let model = match cfg.shard_manifest.as_deref() {
+            Some(manifest_path) => {
+                let verified =
+                    crate::shard::verify_shard(manifest_path, path, cfg.layer_first, cfg.layer_last)?;
+                crate::shard::load_verified_shard(&verified, cfg.n_gpu_layers)?
+            }
+            None => Model::load(path, cfg.n_gpu_layers)?,
+        };
         let n_embd = model.n_embd() as usize;
         let model: &'static Model = Box::leak(Box::new(model));
         // A boundary-emitting stage is an embeddings context; the final stage is a logits context.

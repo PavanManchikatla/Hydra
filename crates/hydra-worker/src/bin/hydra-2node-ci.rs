@@ -98,7 +98,7 @@ fn write_boot(cluster: &Cluster, name: &str, dir: &std::path::Path, recovery_sta
         cfg: WorkerConfig {
             keys: SessionKeys::dev(0xC1), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
-            model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None, recovery_start,
+            model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None, recovery_start, shard_manifest: None,
         },
         forwarding: None,
     };

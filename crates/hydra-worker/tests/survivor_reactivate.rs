@@ -32,7 +32,7 @@ fn sp_cfg(keys: SessionKeys) -> WorkerConfig {
     WorkerConfig {
         keys, rank: 2, layer_first: 0, layer_last: -1, is_final: true, receives_tokens: false,
         epoch: 0, recovery_id: 0, model_path: None, n_gpu_layers: 0, n_ctx: 64,
-        sampler_config: Some(greedy()), recovery_start: false,
+        sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None,
     }
 }
 

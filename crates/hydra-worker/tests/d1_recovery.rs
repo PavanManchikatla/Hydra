@@ -83,7 +83,7 @@ fn sp_config(model_path: &str, keys: &SessionKeys, n_ctx: i32, recovery_id: u32,
         n_gpu_layers: 0,
         n_ctx,
         sampler_config: Some(sampling_config()),
-        recovery_start,
+        recovery_start, shard_manifest: None,
     }
 }
 

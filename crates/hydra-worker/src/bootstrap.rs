@@ -120,6 +120,9 @@ impl Bootstrap {
             }
             None => w.u32(0),
         }
+        // P2·10b shard-manifest path (append-only, after the forwarding block): empty ⇒ this
+        // worker loads a full model, exactly as before. An older bootstrap simply ends here.
+        w.str(self.cfg.shard_manifest.as_deref().unwrap_or(""));
         w.0
     }
 
@@ -175,6 +178,13 @@ impl Bootstrap {
         } else {
             None
         };
+        // P2·10b shard-manifest path (append-only): older bootstraps end here → `None`.
+        let shard_manifest = if r.remaining() {
+            let s = r.str()?;
+            (!s.is_empty()).then_some(s)
+        } else {
+            None
+        };
         Ok(Bootstrap {
             listen_addr,
             device_name,
@@ -196,6 +206,7 @@ impl Bootstrap {
                 n_ctx,
                 sampler_config,
                 recovery_start,
+                shard_manifest,
             },
         })
     }
@@ -292,7 +303,7 @@ mod tests {
                 n_gpu_layers: 0,
                 n_ctx: 64,
                 sampler_config: Some(SamplingConfig { temperature: 0.7, top_p: 0.9, repeat_penalty: 1.1, penalty_last_n: 16, seed: 99 }),
-                recovery_start: false,
+                recovery_start: false, shard_manifest: None,
             },
             forwarding: None,
         };
@@ -330,7 +341,7 @@ mod tests {
                 n_gpu_layers: 0,
                 n_ctx: 64,
                 sampler_config: None,
-                recovery_start: false,
+                recovery_start: false, shard_manifest: None,
             },
             forwarding: Some(ForwardingBootstrap {
                 down_addr: "10.0.0.5:41999".into(),

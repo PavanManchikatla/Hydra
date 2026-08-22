@@ -52,13 +52,13 @@ async fn two_worker_teacher_forced_no_sample_bit_exact() {
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     };
     let s2_cfg = WorkerConfig {
         keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     };
     let s1_addr = hydra_worker::pair::spawn_endpoint(s1_cfg, cluster.ca.server_config(&s1_id).unwrap());
     let s2_addr = hydra_worker::pair::spawn_endpoint(s2_cfg, cluster.ca.server_config(&s2_id).unwrap());
@@ -103,7 +103,7 @@ async fn direct_worker_to_worker_fwd_is_bit_exact() {
     let mk = |rank, lf, ll, is_final, toks| WorkerConfig {
         keys: keys.clone(), rank, layer_first: lf, layer_last: ll, is_final,
         receives_tokens: toks, epoch: 0, recovery_id: 0, model_path: Some(path.clone()), n_gpu_layers: 0, n_ctx,
-        sampler_config: None, recovery_start: false,
+        sampler_config: None, recovery_start: false, shard_manifest: None,
     };
     // S2 first (S1 connects to it at startup).
     let s2_addr = hydra_worker::pair::spawn_endpoint(mk(1, k, -1, true, false), cluster.ca.server_config(&s2_id).unwrap());
@@ -136,7 +136,7 @@ async fn subprocess_worker_survives_kill_9_and_restart() {
             keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: 0, model_path: None, n_gpu_layers: 0, n_ctx: 64,
             sampler_config: None,
-            recovery_start: false,
+            recovery_start: false, shard_manifest: None,
         },
         forwarding: None,
     };

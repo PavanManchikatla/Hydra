@@ -48,13 +48,13 @@ fn split3(n_layer: i32) -> (i32, i32) {
 }
 
 fn s1_cfg(model: &str, keys: &SessionKeys, k1: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false }
+    WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
 }
 fn s2_cfg(model: &str, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false }
+    WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
 }
 fn sp_cfg(model: &str, keys: &SessionKeys, k2: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false }
+    WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None }
 }
 
 /// The unsplit greedy reference: prefill the prompt, then argmax-decode `n` tokens feeding each back

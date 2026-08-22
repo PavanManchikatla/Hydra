@@ -19,6 +19,11 @@ hydra-proto = { path = "../hydra-proto" }
 hydra-state = { path = "../hydra-state" }
 hydra-transport = { path = "../hydra-transport" }
 hydra-engine-sys = { path = "../hydra-engine-sys" }
+# Promoted to a regular dep (P2·10b, 2026-08-22): the worker verifies the Ed25519-signed shard
+# manifest before loading any shard weights (refuse-on-fail), so it needs the manifest type at
+# runtime. One-way edge — hydra-modelsvc deps are gguf/blake3/ring/thiserror only, no cycle.
+# A crate-dep change, NOT a package decision (rule 5): proceed + log.
+hydra-modelsvc = { path = "../hydra-modelsvc" }
 flatbuffers.workspace = true
 blake3.workspace = true
 thiserror.workspace = true

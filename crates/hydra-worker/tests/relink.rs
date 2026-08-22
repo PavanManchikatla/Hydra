@@ -35,7 +35,7 @@ fn control_plane_cfg(keys: SessionKeys) -> WorkerConfig {
         n_gpu_layers: 0,
         n_ctx: 64,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     }
 }
 

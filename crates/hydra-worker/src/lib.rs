@@ -19,6 +19,7 @@ pub mod durable;
 pub mod pair;
 pub mod retain;
 pub mod sampler;
+pub mod shard;
 pub mod wire;
 pub mod worker;
 

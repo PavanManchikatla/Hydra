@@ -170,7 +170,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32) -> B
         cfg: WorkerConfig {
             keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true,
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()),
-            n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false,
+            n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None,
         },
         forwarding: None,
     }
@@ -187,7 +187,7 @@ fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: 
         cfg: WorkerConfig {
             keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false,
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()),
-            n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false,
+            n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
         },
         forwarding: Some(ForwardingBootstrap {
             down_addr: format!("{VM1_TS_IP}:{SP_PORT}"),
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s1_cfg = WorkerConfig {
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
-        n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false,
+        n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
     };
     let s1_down = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(

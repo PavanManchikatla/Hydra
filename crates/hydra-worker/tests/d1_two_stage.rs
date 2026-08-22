@@ -53,10 +53,10 @@ fn temp_dir() -> std::path::PathBuf {
 }
 
 fn sp_cfg(model: &str, keys: &SessionKeys, k: i32, n_ctx: i32, recovery_start: bool) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(model.to_string()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start }
+    WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(model.to_string()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start, shard_manifest: None }
 }
 fn s1_cfg(model: &str, keys: &SessionKeys, k: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.to_string()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false }
+    WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.to_string()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
 }
 fn spawn(cluster: &Cluster, name: &str, cfg: WorkerConfig) -> std::net::SocketAddr {
     let id = cluster.issue(name).unwrap();

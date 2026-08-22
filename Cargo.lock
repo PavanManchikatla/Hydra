@@ -396,6 +396,7 @@ dependencies = [
  "flatbuffers",
  "hydra-coordinator",
  "hydra-engine-sys",
+ "hydra-modelsvc",
  "hydra-proto",
  "hydra-state",
  "hydra-tokenizer",

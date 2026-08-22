@@ -70,7 +70,7 @@ async fn control_plane_activation_round_trips_through_the_real_stage_sm() {
         n_gpu_layers: 0,
         n_ctx: 64,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     };
     let addr = spawn_worker(cfg, ca.server_config(&worker_id).unwrap());
 
@@ -147,7 +147,7 @@ async fn data_plane_apply_token_echo_over_mtls() {
         n_gpu_layers: 0,
         n_ctx: 64,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     };
     let addr = spawn_worker(cfg, ca.server_config(&worker_id).unwrap());
 

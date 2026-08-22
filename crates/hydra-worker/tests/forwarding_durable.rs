@@ -186,7 +186,7 @@ fn control_fwd_cfg(keys: SessionKeys) -> WorkerConfig {
         n_gpu_layers: 0,
         n_ctx: 64,
         sampler_config: None,
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     }
 }
 
@@ -276,7 +276,7 @@ fn s1_fwd_cfg(model: &str, keys: &SessionKeys, k: i32, n_ctx: i32) -> WorkerConf
         n_gpu_layers: 0,
         n_ctx,
         sampler_config: None, // S1 forwards; it has no sampler — a SAMPLE_NEXT here is rejected (ERR)
-        recovery_start: false,
+        recovery_start: false, shard_manifest: None,
     }
 }
 

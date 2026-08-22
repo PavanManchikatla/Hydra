@@ -18,7 +18,21 @@
 | Two-node split pipeline (S1 `[0,k)` → S_P `[k,-1)` + sampler) | ✅ | `--local-pair` two-worker teacher-forced anchor `tests/local_pair.rs::two_worker_teacher_forced_no_sample_bit_exact`; **worker→worker DIRECT FWD** `tests/local_pair.rs::direct_worker_to_worker_fwd_is_bit_exact` |
 | Sampler @ S_P (Philox, snapshots, I14/I15/I17) | ✅ | `tests/sampler_pipeline.rs` (greedy==argmax bit-exact; seeded reproducible; SAMPLE_NEXT idempotent; INSTALL round-trip) |
 | Tokenizer + UTF-8-safe incremental detok (I6) | ✅ | `hydra-tokenizer` (delegated to llama.cpp; `Utf8Streamer`); incremental==batch over emoji-split, round-trip==reference |
-| **7B model end-to-end** | ⛔ **hardware-contingent (aborted, memory)** | The engine loads full model weights per worker (windowed compute); two in-process workers each load the whole model → 7B Q4 ≈ 4.5 GB × 2 = 9 GB > 8 GB. **Aborted without ceremony** (owner-sanctioned memory-check). Proven on 0.5B; the pipeline is model-agnostic. → §8 owed (real M2 hardware) |
+| **7B model end-to-end** | ⛔ **hardware-contingent (aborted, memory)** — *caveat superseded 2026-08-22, see note* | At M2 time the engine loaded full model weights per worker (windowed compute); two in-process workers each loaded the whole model → 7B Q4 ≈ 4.5 GB × 2 = 9 GB > 8 GB. **Aborted without ceremony** (owner-sanctioned memory-check). Proven on 0.5B; the pipeline is model-agnostic. → §8 owed (real M2 hardware) |
+
+> **⚠️ CAVEAT SUPERSEDED (P2·10b, 2026-08-22).** The "engine loads full model weights per worker"
+> constraint above **no longer holds**. `hydra_model_load_shard` loads only the stage's assigned
+> layers from a per-stage shard GGUF, verified against the Ed25519-signed manifest. **Measured on the
+> real dev GGUF (engine `load_tensors` accounting): 1202.09 MiB full-load per worker → 601.04 MiB
+> per shard — −50.0 % per worker, and 2404.18 → 1202.08 MiB across the 2-worker pair.** The change is
+> **semantically invisible**: the rule-14 bit-exact anchor is green with shard-loaded weights
+> (`crates/hydra-worker/tests/shard_anchor.rs::two_worker_anchor_is_bit_exact_with_shard_loaded_weights`),
+> and at the engine layer `max_abs=0.000e0`
+> (`crates/hydra-engine-sys/tests/shard_load.rs::shard_loaded_weights_are_bit_exact_with_the_unsplit_model`).
+> **The row's verdict is left as it was at the M2 gate** — this table records what was true when the
+> gate was assembled, and the M2 verdict is not retroactively re-decided. **The 7B/70B items remain
+> hardware-contingent**, but for genuinely-hardware reasons only: the memory arithmetic that aborted
+> the 7B stretch has changed, so it is now a **re-measure**, not a known-impossible. Tracked in §8.
 
 ## (b) Two-tier equivalence
 

@@ -45,7 +45,7 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
     let cfg = WorkerConfig {
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true, receives_tokens: true,
         epoch: 0, recovery_id: 0, model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None,
-        recovery_start: true,
+        recovery_start: true, shard_manifest: None,
     };
     let addr = spawn_recovery_worker(cfg, ca.server_config(&w_id).unwrap());
     let connector = TcpMtls::from_config(ca.client_config(&c_id).unwrap()).unwrap();

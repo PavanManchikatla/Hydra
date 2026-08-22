@@ -126,7 +126,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32, reco
         listen_addr: format!("{VM1_TS_IP}:{SP_PORT}"), device_name: "sp".into(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
-        cfg: WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start },
+        cfg: WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start, shard_manifest: None },
         forwarding: None,
     }
 }
@@ -136,7 +136,7 @@ fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: 
         listen_addr: format!("{VM2_TS_IP}:{S2_PORT}"), device_name: "s2".into(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
-        cfg: WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false },
+        cfg: WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None },
         forwarding: Some(ForwardingBootstrap { down_addr: format!("{VM1_TS_IP}:{SP_PORT}"), down_name: "sp".into(), dur_addr: format!("{MAC_TS_IP}:{}", dur2.port()), dur_name: "dur2".into(), require_durable: true, capacity: 8 }),
     }
 }
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // S1 local (Mac), forwarding-durable, down = S2 (vm2), dur = dur1 (local). Re-linkable target.
     let s2_addr: SocketAddr = format!("{VM2_TS_IP}:{S2_PORT}").parse()?;
     let s1_id = cluster.issue("s1")?;
-    let s1_cfg = WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false };
+    let s1_cfg = WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None };
     let s1_down: DownTarget = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
         s1_cfg, cluster.ca.server_config(&s1_id)?,

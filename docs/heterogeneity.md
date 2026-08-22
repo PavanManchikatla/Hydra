@@ -69,9 +69,15 @@ Caveats the solver (P2·3) must fold in and this compute-only number does **not*
 - **Link cost.** Mac↔VM is WAN/Tailscale (~high latency); myVm-1↔myVm-2 is cloud-VNet (sub-ms). A
   layer split should also minimize the number/size of boundary crossings on slow links — favor
   keeping adjacent stages on the fast VNet leg where possible (P2·2 link prober feeds this).
-- **Memory.** The current engine loads **full weights per worker**, so RAM caps model size, not layer
+- **Memory.** ~~The current engine loads **full weights per worker**, so RAM caps model size, not layer
   count, for now; once weights are sharded (P2·10) the 4 GiB node's layer share becomes RAM-bounded
-  for large models. For the 0.5B here, RAM is not the binding constraint.
+  for large models.~~ **RESOLVED 2026-08-22 (P2·10b).** Weights **are** sharded now: a worker loads
+  only its assigned layers from a per-stage shard GGUF (`hydra_model_load_shard`, manifest-verified).
+  **Measured on the dev GGUF: 1202.09 MiB full-load → 601.04 MiB per shard, −50.0 % per worker.** So a
+  node's RAM now caps **its layer share**, not the whole model — which is exactly what makes the
+  capability-proportional placement above the real constraint rather than a formality. Shard-load is
+  bit-exact (rule-14 anchor green with shard-loaded weights), so this costs no accuracy. For the 0.5B
+  benchmarked here, RAM was never the binding constraint either way.
 - **Backend.** The Mac number is CPU-only; on Metal it would be faster, changing its share. Measure in
   the backend the deployment will actually use.
 

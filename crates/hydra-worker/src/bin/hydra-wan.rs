@@ -126,7 +126,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32, recov
             keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
             receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: Some(VM_MODEL.to_string()), n_gpu_layers: 0, n_ctx,
-            sampler_config: Some(greedy()), recovery_start,
+            sampler_config: Some(greedy()), recovery_start, shard_manifest: None,
         },
         forwarding: None,
     }
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = WorkerConfig {
             keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
             receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
-            n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false,
+            n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
         };
         Ok(hydra_worker::pair::spawn_endpoint(cfg, cluster.ca.server_config(&id)?))
     };
@@ -221,7 +221,7 @@ fn full_sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, recovery
             keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: Some(VM_MODEL.to_string()), n_gpu_layers: 0, n_ctx,
-            sampler_config: Some(greedy()), recovery_start,
+            sampler_config: Some(greedy()), recovery_start, shard_manifest: None,
         },
         forwarding: None,
     }
