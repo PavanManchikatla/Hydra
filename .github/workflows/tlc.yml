@@ -177,8 +177,15 @@ jobs:
           log=ci-results/${{ matrix.name }}.log
           violated=$(grep -cE "Invariant .* is violated|Temporal properties were violated" "$log" || true)
           complete=$(grep -cE "Model checking completed\. No error" "$log" || true)
+          # §7.21 (found 2026-08-22 in the tier-2 sweep, fixed here too because the same gap lives
+          # in both classifiers): a TLC *exception* is a HARD failure of the check, not a soft
+          # time-box. Reporting it as INCONCLUSIVE reads as "needs more CI time" when no amount of
+          # time would help. Corollary of rule 12 — the harness gets no presumption of correctness.
+          exception=$(grep -cE "TLC threw an unexpected exception" "$log" || true)
           verdict=INCONCLUSIVE; rc=0
-          if [ "${{ matrix.expect }}" = "violation" ]; then
+          if [ "$exception" -ge 1 ]; then
+            verdict=TLC-ERROR; rc=1
+          elif [ "${{ matrix.expect }}" = "violation" ]; then
             if [ "$violated" -ge 1 ]; then verdict=GREEN            # mutation fired as designed
             elif [ "$complete" -ge 1 ]; then verdict=MASKED-FAILURE; rc=1  # drained clean => mutation stopped firing
             fi

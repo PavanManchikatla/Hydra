@@ -101,9 +101,16 @@ jobs:
           complete=$(grep -cE "Model checking completed\. No error" "$log" || true)
           # An ASSUME failure (e.g. MaxMsgs > 20) must never be read as a quiet INCONCLUSIVE.
           assumefail=$(grep -cE "Assumption .* is false|Assumption is false" "$log" || true)
+          # §7.21: a TLC *exception* (e.g. the 65535 behaviour-length ceiling) is a HARD FAILURE of
+          # the check, not a soft "ran out of time". Classifying it as INCONCLUSIVE reads as "needs
+          # a bigger time-box" when in fact no time-box would ever help — the exact masking rule 12
+          # exists to prevent. It gets its own loud verdict and a non-zero rc.
+          exception=$(grep -cE "TLC threw an unexpected exception" "$log" || true)
           verdict=INCONCLUSIVE; rc=0
           if [ "$assumefail" -ge 1 ]; then
             verdict=ASSUME-FAILED; rc=1
+          elif [ "$exception" -ge 1 ]; then
+            verdict=TLC-ERROR; rc=1
           elif [ "${{ matrix.leg.expect }}" = "violation" ]; then
             if   [ "$violated" -ge 1 ]; then verdict=GREEN                     # mutation fired as designed
             elif [ "$complete" -ge 1 ]; then verdict=MASKED-FAILURE; rc=1      # drained clean => mutation went SILENT
