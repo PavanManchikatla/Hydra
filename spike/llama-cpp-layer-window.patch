@@ -1,8 +1,28 @@
 diff --git a/include/llama.h b/include/llama.h
-index a311ac2..287830e 100644
+index a311ac2..a4317e9 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -396,6 +396,15 @@ extern "C" {
+@@ -319,6 +319,19 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // [HYDRA P2·10b] pipeline-shard LOAD window: this file is a per-stage shard GGUF that
++        // carries weights for transformer layers [il_load_start, il_load_end) ONLY, with the
++        // architecture's own block_count left intact in its metadata. Tensors outside the window
++        // are not created (so they are neither required nor allocated), and globals (token_embd,
++        // output_norm, output) become optional — a shard carries token_embd only on the first
++        // stage and output* only on the last.
++        //   Defaults (0, -1) => whole model, unchanged behavior.
++        // Distinct from llama_context_params.il_start/il_end, which window COMPUTE on a fully
++        // loaded model. This windows the LOAD, which is what retires the "full weights per
++        // worker" memory ceiling. See BLUEPRINT M3 / PROJECT_STATE P2·10.
++        int32_t il_load_start;
++        int32_t il_load_end;   // -1 = no shard window (load everything)
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool use_mmap;        // use mmap if possible
+@@ -396,6 +409,15 @@ extern "C" {
          // a source/target/parent context
          // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
          struct llama_context * ctx_other;
@@ -54,8 +74,92 @@ index 58520ca..42fc8c4 100644
      float rope_freq_base;
      float rope_freq_scale;
  
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c8ecb0a..68ec245 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2169,6 +2169,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
+     std::array<ggml_tensor *, 2> inps;
+ 
++    // [HYDRA P2·10b] A SHARD-LOADED non-first stage never loaded token_embd — it lives only in the
++    // first stage's shard, and such a stage is fed an injected boundary residual (the embeddings
++    // input path), never raw tokens. Upstream builds BOTH input paths and selects between them at
++    // runtime, so with tok_embd == nullptr the token path would deref null while building a graph
++    // that can never be taken. Build only the embeddings path in that case.
++    // Arch-agnostic: every architecture's graph enters through this one call.
++    if (tok_embd == nullptr) {
++        ggml_tensor * cur = inp->embd;
++        if (n_embd_inp != n_embd) {
++            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
++        }
++        res->t_inp_embd = cur;
++        cb(cur, "embd", -1);
++        res->add_input(std::move(inp));
++        ggml_build_forward_expand(gf, cur);
++        return cur;
++    }
++
+     // token embeddings path (ubatch.token != nullptr)
+     {
+         auto & cur = inps[0];
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 7dea38c..ff98447 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1488,7 +1488,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
+-    ml.done_getting_tensors();
++    // [HYDRA P2·10b] under a shard LOAD window the file legitimately holds tensors this stage does
++    // not create (e.g. a global replicated to every shard by the splitter), so the exact-count
++    // check would reject a well-formed shard. `partial` downgrades it to an informational log.
++    // It is NOT loosened for a normal full load — that path still demands the exact count.
++    ml.done_getting_tensors(/*partial=*/ params.il_load_end >= 0);
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -1642,6 +1646,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ }
+ 
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
++    // [HYDRA P2·10b] pipeline-shard LOAD window. Every architecture's load_arch_tensors() funnels
++    // through this one call, so the window is enforced ARCH-AGNOSTICALLY here rather than being
++    // re-patched per architecture (unlike the M-1 compute window, which had to live in each
++    // arch's graph builder). Two rules, both purely subtractive:
++    //   1. a block tensor (bid >= 0) outside the window is NOT created — so it is neither
++    //      required from the file nor allocated in any buffer. This is what makes the shard
++    //      load only its own layers' weights.
++    //   2. a global (bid == -1: token_embd / output_norm / output) becomes OPTIONAL, because a
++    //      shard carries token_embd only on the first stage and output* only on the last. It is
++    //      still created when the file HAS it, so the last stage keeps its real lm_head.
++    // Nothing here changes what any tensor MEANS or how it is computed — a shard-loaded model
++    // that is asked to run layers it did not load will null-deref rather than silently compute
++    // something wrong, and the caller (hydra_context_new) is what keeps the compute window
++    // inside the load window.
++    if (params.il_load_end >= 0) {
++        if (tn.bid >= 0 && (tn.bid < params.il_load_start || tn.bid >= params.il_load_end)) {
++            return nullptr;
++        }
++        if (tn.bid == -1) {
++            flags |= TENSOR_NOT_REQUIRED;
++        }
++    }
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+     return ml.create_tensor(
+         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+@@ -2309,6 +2335,8 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.il_load_start               =*/ 0,    // [HYDRA P2·10b] no shard window by default
++        /*.il_load_end                 =*/ -1,   // [HYDRA P2·10b] -1 => load the whole model
+         /*.vocab_only                  =*/ false,
+         /*.use_mmap                    =*/ true,
+         /*.use_direct_io               =*/ false,
 diff --git a/src/models/llama.cpp b/src/models/llama.cpp
-index 4bfebc8..4be32de 100644
+index 4bfebc8..4a76447 100644
 --- a/src/models/llama.cpp
 +++ b/src/models/llama.cpp
 @@ -123,7 +123,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
@@ -83,11 +187,20 @@ index 4bfebc8..4be32de 100644
              cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
              inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
          }
-@@ -227,12 +234,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+@@ -227,12 +234,23 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
          inpL = cur;
      }
      cur = inpL;
 +    ggml_tensor * hydra_boundary = cur;   // [HYDRA M-1] raw residual entering layer l1
++
++    // [HYDRA P2·10b] see the matching comment in models/qwen2.cpp: a SHARD-LOADED boundary stage
++    // never loaded output_norm / output, so the tail must not be built at all (nullptr deref).
++    // The raw pre-norm residual it exports is unchanged, so bit-exactness is unaffected.
++    if (model.output_norm == nullptr) {
++        res->t_embd = hydra_boundary;
++        ggml_build_forward_expand(gf, hydra_boundary);
++        return;
++    }
  
      cur = build_norm(cur,
              model.output_norm, NULL,
@@ -98,7 +211,7 @@ index 4bfebc8..4be32de 100644
      res->t_embd = cur;
  
      if constexpr (!embed) {
-@@ -241,6 +250,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+@@ -241,6 +259,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
  
          cb(cur, "result_output", -1);
          res->t_logits = cur;
@@ -110,7 +223,7 @@ index 4bfebc8..4be32de 100644
  
      ggml_build_forward_expand(gf, cur);
 diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
-index e9c2ea8..7bf0354 100644
+index e9c2ea8..6abcc83 100644
 --- a/src/models/qwen2.cpp
 +++ b/src/models/qwen2.cpp
 @@ -68,7 +68,14 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
@@ -138,11 +251,25 @@ index e9c2ea8..7bf0354 100644
              cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
              inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
          }
-@@ -133,13 +140,14 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+@@ -133,13 +140,28 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
          inpL = cur;
      }
      cur = inpL;
 +    ggml_tensor * hydra_boundary = cur;   // [HYDRA M-1] raw residual entering layer l1
++
++    // [HYDRA P2·10b] A SHARD-LOADED boundary stage never loaded output_norm / output — they live
++    // only in the last stage's shard. The M-1 compute window could always build the final norm and
++    // lm_head and merely *choose* not to expose them (wasted compute on a fully-loaded model);
++    // under a LOAD window those weights are nullptr and building them segfaults. So build the tail
++    // only when its weights are actually present. `t_logits` stays null in that case, which
++    // llama_context already guards for (`if (logits.data && t_logits ...)`).
++    // This does not change what a boundary stage COMPUTES — `hydra_boundary` is the same raw
++    // pre-norm residual either way, which is why the bit-exactness gate still holds.
++    if (model.output_norm == nullptr) {
++        res->t_embd = hydra_boundary;
++        ggml_build_forward_expand(gf, hydra_boundary);
++        return;
++    }
  
      cur = build_norm(cur,
              model.output_norm, NULL,
@@ -154,7 +281,7 @@ index e9c2ea8..7bf0354 100644
  
      // lm_head
      cur = build_lora_mm(model.output, cur, model.output_s);
-@@ -150,5 +158,10 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+@@ -150,5 +172,10 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
      cb(cur, "result_output", -1);
      res->t_logits = cur;
  

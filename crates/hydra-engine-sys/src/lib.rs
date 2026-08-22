@@ -60,6 +60,8 @@ mod ffi {
     extern "C" {
         pub fn hydra_model_load(path: *const c_char, n_gpu_layers: i32) -> *mut HydraModel;
         pub fn hydra_model_load_vocab_only(path: *const c_char) -> *mut HydraModel;
+        pub fn hydra_model_load_shard(path: *const c_char, l0: i32, l1: i32, n_gpu_layers: i32) -> *mut HydraModel;
+        pub fn hydra_model_load_window(m: *const HydraModel, l0: *mut i32, l1: *mut i32);
         pub fn hydra_model_free(m: *mut HydraModel);
         pub fn hydra_model_info(m: *const HydraModel) -> HydraModelInfo;
         pub fn hydra_tokenize_ex(
@@ -137,12 +139,37 @@ mod imp {
             Self::wrap(raw)
         }
 
+        /// Load a per-stage **shard** GGUF (`hydra-modelsvc split` output), allocating only layers
+        /// `[l0, l1)`. `n_layer()` still reports the FULL model's layer count — the shard carries
+        /// the architecture's own `block_count` verbatim, so positions and layer indices keep their
+        /// global meaning and nothing downstream has to re-base them.
+        ///
+        /// This is the memory payoff of P2·10: `load` maps every worker's copy of the whole model,
+        /// `load_shard` maps one stage's share. Requesting a [`Model::context`] outside `[l0, l1)`
+        /// is refused by the engine rather than null-dereferencing.
+        pub fn load_shard(path: &str, l0: i32, l1: i32, n_gpu_layers: i32) -> Result<Model, EngineError> {
+            let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path has NUL" })?;
+            let raw = unsafe { ffi::hydra_model_load_shard(c.as_ptr(), l0, l1, n_gpu_layers) };
+            Self::wrap(raw)
+        }
+
         fn wrap(raw: *mut ffi::HydraModel) -> Result<Model, EngineError> {
             if raw.is_null() {
                 return Err(EngineError { code: 2, what: "model load failed" });
             }
             let info = unsafe { ffi::hydra_model_info(raw) };
             Ok(Model { raw, n_layer: info.n_layer, n_embd: info.n_embd, n_vocab: info.n_vocab })
+        }
+
+        /// The shard layer window this model was loaded with, or `None` for a full load.
+        pub fn load_window(&self) -> Option<(i32, i32)> {
+            let (mut l0, mut l1) = (0i32, -1i32);
+            unsafe { ffi::hydra_model_load_window(self.raw, &mut l0, &mut l1) };
+            if l1 >= 0 {
+                Some((l0, l1))
+            } else {
+                None
+            }
         }
 
         pub fn n_layer(&self) -> i32 {
@@ -326,6 +353,12 @@ mod imp {
         }
         pub fn load_vocab_only(_path: &str) -> Result<Model, EngineError> {
             Err(EngineError::unavailable())
+        }
+        pub fn load_shard(_path: &str, _l0: i32, _l1: i32, _n_gpu_layers: i32) -> Result<Model, EngineError> {
+            Err(EngineError::unavailable())
+        }
+        pub fn load_window(&self) -> Option<(i32, i32)> {
+            None
         }
         pub fn n_layer(&self) -> i32 {
             0

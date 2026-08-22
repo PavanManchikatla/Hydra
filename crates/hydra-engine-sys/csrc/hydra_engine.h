@@ -37,6 +37,7 @@ typedef struct {
 #define HYDRA_E_SHAPE     6
 #define HYDRA_E_KV        7
 #define HYDRA_E_ARG       8
+#define HYDRA_E_WINDOW    9   /* compute window escapes the loaded shard's layer range */
 
 /* Load the full GGUF. n_gpu_layers: 0 = CPU (the deterministic DoD backend), 99 = all on GPU. */
 HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers);
@@ -44,6 +45,18 @@ HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers);
  * tokenization (the engine that computes is the engine that tokenizes). Contexts cannot be made
  * from a vocab-only model. */
 HydraModel* hydra_model_load_vocab_only(const char* path);
+/* Load a per-stage SHARD GGUF (produced by `hydra-modelsvc split`), creating and allocating ONLY
+ * the weights for layers [l0, l1). The shard keeps the architecture's own block_count in its
+ * metadata, so n_layer still reports the FULL model's layer count — the model is the same shape,
+ * it just holds one stage's weights. This is what retires the "full weights per worker" ceiling:
+ * `hydra_model_load` maps the entire model on every worker, this maps one stage's share.
+ *
+ * The load window is remembered, and `hydra_context_new` REFUSES (returns NULL) a compute window
+ * that is not contained in it — asking a shard to run layers it never loaded is a caller bug that
+ * must fail loudly at the boundary, not null-deref inside a graph. */
+HydraModel* hydra_model_load_shard(const char* path, int32_t l0, int32_t l1, int32_t n_gpu_layers);
+/* The loaded shard's layer window, or (0, -1) for a full (non-shard) load. */
+void        hydra_model_load_window(const HydraModel* m, int32_t* l0, int32_t* l1);
 void        hydra_model_free(HydraModel* m);
 HydraModelInfo hydra_model_info(const HydraModel* m);
 

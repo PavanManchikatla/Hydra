@@ -15,6 +15,8 @@ struct HydraModel {
     llama_model*       model = nullptr;
     const llama_vocab* vocab = nullptr;
     int32_t n_layer = 0, n_embd = 0, n_vocab = 0;
+    // [P2·10b] the shard load window this model was loaded with; (0, -1) == full load.
+    int32_t load_l0 = 0, load_l1 = -1;
 };
 
 struct HydraContext {
@@ -41,6 +43,33 @@ HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers) {
     h->n_embd  = llama_model_n_embd(model);
     h->n_vocab = llama_vocab_n_tokens(h->vocab);
     return h;
+}
+
+HydraModel* hydra_model_load_shard(const char* path, int32_t l0, int32_t l1, int32_t n_gpu_layers) {
+    if (!path) return nullptr;
+    if (l1 <= l0 || l0 < 0) return nullptr;   // an empty/inverted window is never a shard
+    if (!g_backends_loaded) { ggml_backend_load_all(); g_backends_loaded = true; }
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers  = n_gpu_layers;
+    mp.il_load_start = l0;
+    mp.il_load_end   = l1;   // >= 0 activates the shard load window (see llama-model.cpp)
+    llama_model* model = llama_model_load_from_file(path, mp);
+    if (!model) return nullptr;
+    auto* h = new HydraModel();
+    h->model   = model;
+    h->vocab   = llama_model_get_vocab(model);
+    h->n_layer = llama_model_n_layer(model);   // the FULL model's layer count (shard metadata is verbatim)
+    h->n_embd  = llama_model_n_embd(model);
+    h->n_vocab = llama_vocab_n_tokens(h->vocab);
+    h->load_l0 = l0;
+    h->load_l1 = l1;
+    return h;
+}
+
+void hydra_model_load_window(const HydraModel* m, int32_t* l0, int32_t* l1) {
+    if (!m) return;
+    if (l0) *l0 = m->load_l0;
+    if (l1) *l1 = m->load_l1;
 }
 
 HydraModel* hydra_model_load_vocab_only(const char* path) {
@@ -107,6 +136,14 @@ int32_t hydra_token_to_piece(const HydraModel* m, int32_t token, int32_t special
 HydraContext* hydra_context_new(HydraModel* m, int32_t l0, int32_t l1,
                                 int32_t embeddings, int32_t n_ctx, int32_t n_batch) {
     if (!m) return nullptr;
+    // [P2·10b] A shard-loaded model holds ONLY layers [load_l0, load_l1). A compute window that
+    // escapes it would reference tensors that were never created — so refuse at the boundary
+    // instead of null-dereferencing inside the graph. Structural, not advisory: the same
+    // refuse-don't-warn posture the manifest verification takes on the Rust side.
+    if (m->load_l1 >= 0) {
+        const int32_t want_l1 = (l1 < 0) ? m->n_layer : l1;
+        if (l0 < m->load_l0 || want_l1 > m->load_l1) return nullptr;
+    }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t) n_ctx;
     cp.n_batch = (uint32_t) n_batch;
