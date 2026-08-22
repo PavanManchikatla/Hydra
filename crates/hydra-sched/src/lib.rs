@@ -13,3 +13,4 @@
 
 pub mod capability;
 pub mod link;
+pub mod solver;
