@@ -1,0 +1,20 @@
+[package]
+name = "hydra-modelsvc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "GGUF splitter + signed manifest (BLUEPRINT §1.7, gate-cond-(ii)). Splits a GGUF into per-stage shard files so a worker loads only its assigned layers' weights, with a per-tensor-BLAKE3 + admission-hash + layer-range manifest, Ed25519-signed. Pure Rust — no engine dependency; the shard-load path in hydra-engine-sys (P2·10b) consumes these."
+
+[[bin]]
+name = "hydra-modelsvc"
+path = "src/bin/hydra-modelsvc.rs"
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+# Ed25519 signing/verification via ring — the same vetted crypto the transport already depends on
+# (through rustls), rather than adding a second signature crate.
+ring = "0.17"
+
+[dev-dependencies]

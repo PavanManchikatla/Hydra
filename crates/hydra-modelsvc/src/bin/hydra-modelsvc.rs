@@ -1,0 +1,121 @@
+//! `hydra-modelsvc` — the GGUF splitter/verifier CLI (P2·10a).
+//!
+//! ```text
+//! hydra-modelsvc info   <model.gguf>
+//! hydra-modelsvc split  <model.gguf> <out_dir> --stages 0-14,14-21,21-24 [--key <pkcs8-file>]
+//! hydra-modelsvc verify <manifest-file> <shard_dir>
+//! ```
+//! `split` writes one GGUF per stage + a `<arch>.manifest` (Ed25519-signed). Without `--key` it
+//! generates a fresh keypair and writes the PKCS#8 next to the manifest (dev convenience; in the
+//! field the signing key is the cluster identity — M4 pairing).
+
+use std::path::Path;
+use std::process::exit;
+
+use hydra_modelsvc::gguf::{layers_present, Gguf};
+use hydra_modelsvc::manifest::{generate_keypair, keypair_from_pkcs8, Manifest};
+use hydra_modelsvc::split::split;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let r = match args.get(1).map(String::as_str) {
+        Some("info") => cmd_info(&args),
+        Some("split") => cmd_split(&args),
+        Some("verify") => cmd_verify(&args),
+        _ => {
+            eprintln!("usage: hydra-modelsvc <info|split|verify> ...");
+            exit(2);
+        }
+    };
+    if let Err(e) = r {
+        eprintln!("error: {e}");
+        exit(1);
+    }
+}
+
+fn read(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
+}
+
+fn cmd_info(args: &[String]) -> Result<(), String> {
+    let path = args.get(2).ok_or("usage: info <model.gguf>")?;
+    let g = Gguf::parse(&read(path)?).map_err(|e| e.to_string())?;
+    println!("architecture: {}", g.architecture().unwrap_or("?"));
+    println!("gguf version: {}", g.version);
+    println!("metadata KVs: {}", g.metadata.len());
+    println!("tensors:      {}", g.tensors.len());
+    let layers = layers_present(&g);
+    println!("layers:       {} (blk.0 .. blk.{})", layers.len(), layers.keys().max().copied().unwrap_or(0));
+    Ok(())
+}
+
+/// Parse `0-14,14-21,21-24` → `[(0,14),(14,21),(21,24)]`.
+fn parse_ranges(s: &str) -> Result<Vec<(u32, u32)>, String> {
+    s.split(',')
+        .map(|part| {
+            let (a, b) = part.split_once('-').ok_or_else(|| format!("bad range {part:?} (want first-last)"))?;
+            Ok((a.trim().parse().map_err(|_| format!("bad {a:?}"))?, b.trim().parse().map_err(|_| format!("bad {b:?}"))?))
+        })
+        .collect()
+}
+
+fn cmd_split(args: &[String]) -> Result<(), String> {
+    let model = args.get(2).ok_or("usage: split <model.gguf> <out_dir> --stages R --key K")?;
+    let out_dir = args.get(3).ok_or("usage: split <model.gguf> <out_dir> --stages R")?;
+    let stages = flag(args, "--stages").ok_or("--stages 0-14,14-21,21-24 required")?;
+    let ranges = parse_ranges(&stages)?;
+
+    let g = Gguf::parse(&read(model)?).map_err(|e| e.to_string())?;
+    let (kp, pk8) = match flag(args, "--key") {
+        Some(kf) => (keypair_from_pkcs8(&read(&kf)?).map_err(|e| e.to_string())?, None),
+        None => {
+            let (pk8, kp) = generate_keypair().map_err(|e| e.to_string())?;
+            (kp, Some(pk8))
+        }
+    };
+
+    let out = split(&g, &ranges, &kp).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {out_dir}: {e}"))?;
+    for shard in &out.shards {
+        let p = Path::new(out_dir).join(&shard.file_name);
+        std::fs::write(&p, &shard.bytes).map_err(|e| format!("write {}: {e}", p.display()))?;
+        println!("wrote {} ({} bytes)", p.display(), shard.bytes.len());
+    }
+    let arch = out.manifest.architecture.clone();
+    let mp = Path::new(out_dir).join(format!("{arch}.manifest"));
+    std::fs::write(&mp, out.manifest.to_bytes().map_err(|e| e.to_string())?).map_err(|e| format!("write manifest: {e}"))?;
+    println!("wrote {} (signed)", mp.display());
+    if let Some(pk8) = pk8 {
+        let kp_path = Path::new(out_dir).join(format!("{arch}.signing.pkcs8"));
+        std::fs::write(&kp_path, pk8).map_err(|e| format!("write key: {e}"))?;
+        println!("wrote {} (dev signing key — keep private)", kp_path.display());
+    }
+    Ok(())
+}
+
+fn cmd_verify(args: &[String]) -> Result<(), String> {
+    let mpath = args.get(2).ok_or("usage: verify <manifest> <shard_dir>")?;
+    let dir = args.get(3).ok_or("usage: verify <manifest> <shard_dir>")?;
+    let m = Manifest::from_bytes(&read(mpath)?).map_err(|e| e.to_string())?;
+    // 1. Signature.
+    m.verify().map_err(|e| format!("MANIFEST REFUSED: {e}"))?;
+    println!("signature: OK (signer {})", hex8(&m.signer_pubkey));
+    // 2. Each shard's bytes hash to the manifest's recorded BLAKE3.
+    for s in &m.shards {
+        let bytes = read(&Path::new(dir).join(&s.file_name).to_string_lossy())?;
+        let got = *blake3::hash(&bytes).as_bytes();
+        if got != s.shard_blake3 {
+            return Err(format!("SHARD REFUSED: {} BLAKE3 mismatch", s.file_name));
+        }
+        println!("shard {} L[{},{}): OK ({} tensors)", s.file_name, s.layer_first, s.layer_last, s.tensors.len());
+    }
+    println!("ALL {} shards verify against the signed manifest", m.shards.len());
+    Ok(())
+}
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+fn hex8(b: &[u8]) -> String {
+    b.iter().take(4).map(|x| format!("{x:02x}")).collect()
+}
