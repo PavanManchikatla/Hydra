@@ -23,6 +23,9 @@ use hydra_transport::ClusterCa;
 use hydra_worker::wire::{self, Msg, SessionKeys};
 
 const PEER: &str = "echo-peer";
+/// A stand-in sampler snapshot, sized like the real one (`SamplerCheckpointRec`: Philox key +
+/// counter + sampled position + the repetition window). Its size is what the frame costs.
+const SNAPSHOT: [u8; 128] = [0x5A; 128];
 const CLIENT: &str = "coordinator";
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -53,7 +56,18 @@ fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: 
                         }
                     }
                     Ok((view, Msg::Fwd { first_input_pos, .. })) => {
-                        let reply = wire::encode_applied_ack(&keys, view.epoch, first_input_pos, &[0u8; 32]);
+                        // Decode-path ack: no logits witness (see `Worker::retain_and_ack`), so the
+                        // bench frames what production frames, not what the anchor harness frames.
+                        let reply = wire::encode_applied_ack(&keys, view.epoch, first_input_pos, &[]);
+                        if conn.send(0, &reply).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok((view, Msg::SampleNext { output_pos, .. })) => {
+                        // The third crossing of a production decode step. `SAMPLED` carries the
+                        // sampler snapshot; the peer runs no sampler, so what this costs is frame
+                        // work alone.
+                        let reply = wire::encode_sampled(&keys, view.epoch, output_pos, 7, &SNAPSHOT, &[0u8; 32]);
                         if conn.send(0, &reply).await.is_err() {
                             break;
                         }
@@ -110,17 +124,35 @@ async fn one_coordinator_stage_exchange_costs() {
         }
     }
 
+    // Exchange C: SAMPLE_NEXT out, SAMPLED back — the third crossing of a PRODUCTION decode step.
+    // The harness path has only A and B; a deployed session also asks S_P for the token.
+    let mut c_samples = Vec::new();
+    for i in 0..(WARMUP + CYCLES) {
+        let t = Instant::now();
+        conn.send(0, &wire::encode_sample_next(&keys, 0, i as i64, &[0u8; 32], 1)).await.expect("send");
+        let f = conn.recv().await.expect("recv");
+        let _ = wire::decode(&f.payload, &keys).expect("decode");
+        if i >= WARMUP {
+            c_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
     let a = median(a_samples);
     let b = median(b_samples);
+    let c = median(c_samples);
     let per_exchange = (a + b) / 2.0;
+    let production_step = a + b + c;
 
     eprintln!(
         "PROTOCOL MICROBENCH (loopback mTLS, n_embd={N_EMBD}, {CYCLES} cycles after {WARMUP} warm-up, NO inference)\n\
          \x20 exchange A (APPLY_TOKEN out / FWD back)   {a:.3} ms\n\
          \x20 exchange B (FWD out / APPLIED_ACK back)   {b:.3} ms\n\
-         \x20 PROTOCOL_MS_PER_CROSSING                  {per_exchange:.3} ms\n\
-         \x20 (a 2-stage pipeline pays this twice per token)"
+         \x20 exchange C (SAMPLE_NEXT out / SAMPLED back) {c:.3} ms\n\
+         \x20 PROTOCOL_MS_PER_CROSSING (mean of A,B)    {per_exchange:.3} ms\n\
+         \x20 PRODUCTION DECODE STEP (A + B + C)        {production_step:.3} ms\n\
+         \x20 (the harness path pays A + B; a deployed session also pays C)"
     );
+    assert!(c > 0.0 && c < 1000.0, "implausible SAMPLE_NEXT exchange cost {c}");
 
     // Sanity, not a tuning knob: the term must be a positive, finite, sub-second quantity. If it
     // were ~0 the amendment would have nothing to explain; if it were huge the bench is broken.

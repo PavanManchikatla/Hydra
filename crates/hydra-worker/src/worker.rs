@@ -236,14 +236,14 @@ impl Worker {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_token(token_id as i32, input_pos as i32)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, input_pos, no_sample, &boundary)]),
-                    None => self.retain_and_ack(view.epoch, input_pos),
+                    None => self.retain_and_ack(view.epoch, input_pos, no_sample),
                 }
             }
             Msg::Fwd { first_input_pos, no_sample, activations } => {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_boundary(&activations, first_input_pos as i32)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, first_input_pos, no_sample, &boundary)]),
-                    None => self.retain_and_ack(view.epoch, first_input_pos),
+                    None => self.retain_and_ack(view.epoch, first_input_pos, no_sample),
                 }
             }
             Msg::SampleNext { output_pos, sampling_config_hash, expected_sampler_checkpoint_id } => {
@@ -313,13 +313,30 @@ impl Worker {
     }
 
     /// Final-stage apply tail: retain the position's logits (for a later `SAMPLE_NEXT`, I14) and
-    /// ack with their digest (the teacher-forced bit-exact anchor's witness).
-    fn retain_and_ack(&mut self, epoch: Epoch, pos: i64) -> Result<Vec<Vec<u8>>, WorkerError> {
+    /// ack the position.
+    ///
+    /// **The `output_checksum` is a teacher-forced WITNESS, and it is emitted only for a
+    /// teacher-forced (`NO_SAMPLE`) apply.** It exists so an equivalence harness — the rule-14
+    /// bit-exact anchor, the shard anchor, the chunked-prefill anchor — can compare a final-stage
+    /// logits vector without sampling it. On an **autoregressive decode** apply (`no_sample =
+    /// false`) the coordinator's token comes from `SAMPLED`, never from this ack, and nothing in
+    /// the protocol reads the field; digesting the whole `n_vocab` vector there is pure cost.
+    ///
+    /// It is not a small cost: on the dev model that vector is 151 936 floats, and converting it
+    /// to little-endian bytes and BLAKE3-hashing it measures **9.607 ms/token**
+    /// (`tests/digest_cost.rs`) — which is what PROJECT_STATE §7.25 identified when a calibration
+    /// residual that was constant across split points turned out to be the harness's own witness.
+    /// Gating it on `no_sample` is what makes a **production-shaped** TPOT measurable at all, and
+    /// it removes real per-token work from the deployed decode loop.
+    ///
+    /// Retention itself is unconditional: I14 requires `SAMPLE_NEXT` to sample only from the
+    /// retained logits of that position.
+    fn retain_and_ack(&mut self, epoch: Epoch, pos: i64, no_sample: bool) -> Result<Vec<Vec<u8>>, WorkerError> {
         let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
         let logits = eng.last_logits()?;
-        let digest = logits_digest(&logits);
+        let witness = if no_sample { logits_digest(&logits).to_vec() } else { Vec::new() };
         self.latest_logits = Some(logits);
-        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, epoch, pos, &digest)])
+        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, epoch, pos, &witness)])
     }
 
     /// `SAMPLE_NEXT` (spec §3, I14): fence the checkpoint id + config hash (drift is fatal), serve a

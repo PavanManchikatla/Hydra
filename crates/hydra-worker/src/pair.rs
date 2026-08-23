@@ -361,6 +361,68 @@ pub async fn time_teacher_forced_pipeline(
     Ok(per_token)
 }
 
+/// **Per-token timing for the PRODUCTION-SHAPED decode loop** — real sampling, no witness.
+///
+/// This is the path the M3 calibration gate measures (PROJECT_STATE §7.25). It differs from
+/// [`time_teacher_forced_pipeline`] in exactly the two ways that separate the correctness harness
+/// from a deployed session:
+///
+/// 1. **The token comes from `SAMPLED`.** Each step issues a real `SAMPLE_NEXT` to S_P and feeds
+///    the returned token back autoregressively — the coordinator holds no sampler state (spec
+///    §1.4). The harness path instead teacher-forces a fixed token sequence.
+/// 2. **No logits digest is computed.** The feedback apply carries `no_sample = false`, so the
+///    final stage's `APPLIED_ACK` omits the `output_checksum` witness (see
+///    `Worker::retain_and_ack`). That witness costs 9.607 ms/token on the dev model and the
+///    deployed path never pays it.
+///
+/// Hygiene, per P2·1: **both connections and the whole prompt prefill happen before the first
+/// timer starts**, so neither the mTLS handshake nor prefill can leak into a per-token number, and
+/// one duration is returned **per generated token**. A timed step is one complete decode cycle —
+/// `SAMPLE_NEXT` → `SAMPLED`, then the sampled token applied through both stages — so the caller
+/// gets TPOT and nothing else. Warm-up policy is the caller's; nothing is baked in here.
+pub async fn time_generation_pipeline(
+    connector: &TcpMtls,
+    ep: &Endpoints,
+    keys: &SessionKeys,
+    config: &SamplingConfig,
+    prompt_tokens: &[u32],
+    n_steps: usize,
+) -> Result<Vec<std::time::Duration>, String> {
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    let cfg_hash = config.hash();
+
+    // Setup and prefill are excluded by construction — the timer below starts after both.
+    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+
+    let mut per_token = Vec::with_capacity(n_steps);
+    let mut input_pos = prompt_tokens.len() as i64;
+    for step in 0..n_steps {
+        let t0 = std::time::Instant::now();
+
+        c2.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+            .await
+            .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
+        let s = c2.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?;
+        let token = match wire::decode(&s.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+            Msg::Sampled { token_id, .. } => token_id,
+            Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
+            other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
+        };
+
+        // Feed it back — every step is a COMPLETE token cycle, including the last, so no sample is
+        // a partial one. `no_sample = false`: this is decode, and the ack carries no witness.
+        c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+        let boundary = expect_fwd(&mut c1, keys, input_pos).await?;
+        c2.send(0, &wire::encode_fwd(keys, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
+        expect_applied_ack(&mut c2, keys).await?;
+        input_pos += 1;
+
+        per_token.push(t0.elapsed());
+    }
+    Ok(per_token)
+}
+
 /// The unsplit greedy next token: apply `tokens` one-at-a-time to the full model and take the
 /// argmax of the final logits — the exact-tier reference for greedy sampling across the pipeline
 /// (test (a): sampling at the end of a teacher-forced run stays bit-exact vs unsplit).
