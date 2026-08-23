@@ -9,8 +9,16 @@
 //! token *t* has traversed every stage. So the per-token latency — TPOT — is a **sum**, not a max:
 //!
 //! ```text
-//! TPOT = Σ (layers_i × ms_per_layer_tok_i)  +  Σ boundary_cost_ms(stage_i → stage_i+1)
+//! TPOT = Σᵢ (fixedᵢ + layersᵢ × ms_per_layer_tokᵢ)
+//!      + Σ crossings (protocol + rtt + bytes/throughput)
 //! ```
+//!
+//! **The two constants are the §7.24 amendment (ratified 2026-08-23), not a tuning.** Both were
+//! *measured before being proposed*, and both are sourced independently of the measurement the M3
+//! gate asks them to predict — see [`CostConstants`] for the provenance rule. Pricing compute as
+//! purely proportional to layer count was **false**: a decode carries a fixed per-context cost that
+//! a 2-stage pipeline pays twice, and a crossing carries protocol processing that
+//! `rtt + bytes/throughput` does not capture.
 //!
 //! This matters, and it is worth being blunt about: **under a sum objective, "balance the stage
 //! times" is not the optimum.** With no other constraint the best placement puts *every* layer on
@@ -63,6 +71,42 @@ pub enum Objective {
     /// model a pipeline that never overlaps, which is the latency case above.
     /// This is the model P1·2's proportional split assumes.
     PipelinedThroughput,
+}
+
+/// §7.24 — the amended cost model's per-device and per-crossing constants.
+///
+/// **Both terms are physically real and were measured before being proposed** (M3 gate row 8):
+///
+/// * **`fixed_ms`** — a decode carries a cost **independent of how many layers the context runs**:
+///   graph dispatch, scheduler setup, output marshalling. Measured on the dev Mac by the
+///   **windowed-context decomposition**, which is now the standard method: time the full range and
+///   both halves, then solve `t(L) = fixed + L·per_layer`. Observed `full [0,24) = 16.88`,
+///   `lower [0,12) = 10.68`, `upper [12,24) = 11.23` ms/tok ⇒ **`fixed ≈ 5.03 ms`**,
+///   `per_layer ≈ 0.494 ms`. A 2-stage pipeline pays `fixed` **twice**; the unsplit reference pays
+///   it once. That is why splitting is not free even before a byte crosses a wire.
+/// * **`protocol_ms`** — per coordinator↔stage exchange: encode + BLAKE3 framing + mTLS + decode on
+///   both ends. **Measured independently, with zero inference in the loop**
+///   (`hydra-worker/tests/protocol_microbench.rs`): **0.438 ms** per exchange on loopback.
+///
+/// **Provenance rule (binding, §7.24):** every coefficient must be sourced **independently of the
+/// measurement it is asked to predict**. `protocol_ms` in particular may **not** be a residual
+/// fitted to the configuration the gate measures — *fitted-here-passes-here is worthless;
+/// fitted-here-predicts-there is a cost model.*
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostConstants {
+    /// Per-stage fixed decode cost (ms/token), independent of layer count.
+    pub fixed_ms: f64,
+    /// Per coordinator↔stage exchange protocol cost (ms/token).
+    pub protocol_ms: f64,
+}
+
+impl Default for CostConstants {
+    /// Zeroes — the **pre-amendment** model. Kept as the default so every existing caller and
+    /// fixture keeps its old meaning until it opts in, and so a caller that forgets to supply
+    /// measured constants gets the old (optimistic) answer rather than an invented one.
+    fn default() -> Self {
+        CostConstants { fixed_ms: 0.0, protocol_ms: 0.0 }
+    }
 }
 
 /// One device's placement-relevant limits.
@@ -125,6 +169,8 @@ pub struct SolveInput<'a> {
     pub boundary_bytes: u64,
     pub max_stages: usize,
     pub objective: Objective,
+    /// §7.24 amended-model constants. Defaults to zeroes = the pre-amendment model.
+    pub costs: CostConstants,
 }
 
 /// Enumerate every ordered device subset of size 1..=max_stages and every contiguous split, and
@@ -156,7 +202,7 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                 }
                 // Compute term.
                 let stage_ms: Vec<f64> =
-                    perm.iter().zip(&split).map(|((_, ms), n)| *n as f64 * *ms).collect();
+                    perm.iter().zip(&split).map(|((_, ms), n)| input.costs.fixed_ms + *n as f64 * *ms).collect();
                 let compute_ms = match input.objective {
                     Objective::SingleStreamLatency => stage_ms.iter().sum::<f64>(),
                     Objective::PipelinedThroughput => stage_ms.iter().cloned().fold(0.0, f64::max),
@@ -176,7 +222,7 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                             break;
                         }
                     };
-                    match input.links.cost_ms(&id, input.boundary_bytes) {
+                    match input.links.cost_ms(&id, input.boundary_bytes).map(|c| c + input.costs.protocol_ms) {
                         Some(c) => {
                             match input.objective {
                                 // Latency: every crossing is paid, one after another.
@@ -356,7 +402,7 @@ mod tests {
         let lim = limits_all(24);
         let e = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap_err();
         assert_eq!(e, SolveError::NoMeasuredDevices);
@@ -369,7 +415,7 @@ mod tests {
         let lim = limits_all(4); // 3 devices x 4 = 12 < 24
         let e = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap_err();
         assert_eq!(e, SolveError::DoesNotFit { n_layer: 24, capacity: 12 });
@@ -386,7 +432,7 @@ mod tests {
         let lim = limits_all(12); // forces 2 stages for 24 layers
         let e = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap_err();
         assert_eq!(e, SolveError::UnpricedLinks);
@@ -401,7 +447,7 @@ mod tests {
         let lim = limits_all(24);
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         assert_eq!(p.stages.len(), 1);
@@ -419,7 +465,7 @@ mod tests {
         let lim = limits_all(12);
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         assert!(p.stages.len() >= 2, "memory pressure must force a pipeline");
@@ -435,7 +481,7 @@ mod tests {
         let lim = limits_all(10); // forces 3 stages
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         let mut cursor = 0;
@@ -456,7 +502,7 @@ mod tests {
         let lim = |d: &str| DeviceLimits { max_layers: if d == "mac" { 0 } else { 20 } };
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         let devs: Vec<&str> = p.stages.iter().map(|s| s.device.as_str()).collect();
@@ -479,7 +525,7 @@ mod tests {
         let lim = limits_all(24);
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         assert_eq!(p.stages.len(), 1, "a 500 ms crossing must not be paid for nothing");
@@ -514,7 +560,7 @@ mod tests {
         let lim = limits_all(24);
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::PipelinedThroughput,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::PipelinedThroughput, costs: CostConstants::default(),
         })
         .unwrap();
         assert_eq!(p.stages.len(), 3, "balancing wants every device: {:?}", p.stages);
@@ -540,7 +586,7 @@ mod tests {
         for obj in [Objective::SingleStreamLatency, Objective::PipelinedThroughput] {
             let p = solve(&SolveInput {
                 caps: &caps, links: &links, limits: &lim, n_layer: 24,
-                boundary_bytes: 3584, max_stages: 3, objective: obj,
+                boundary_bytes: 3584, max_stages: 3, objective: obj, costs: CostConstants::default(),
             })
             .unwrap();
             assert_eq!(p.stages.len(), 1, "{obj:?}: a 25 ms WAN crossing is not worth paying here");
@@ -557,7 +603,7 @@ mod tests {
         let lim = limits_all(12);
         let input = SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         };
         let best = solve(&input).unwrap();
         // Independent re-enumeration.
@@ -587,6 +633,69 @@ mod tests {
         assert!((best.tpot_ms - brute).abs() < 1e-9, "solver {} vs brute force {brute}", best.tpot_ms);
     }
 
+    /// The measured §7.24 constants for the dev Mac. Sources, both independent of the M3 gate
+    /// measurement: `fixed_ms` from the windowed-context decomposition
+    /// (`hydra-engine-sys/tests/fixed_decode_cost.rs`), `protocol_ms` from the zero-inference
+    /// microbench (`hydra-worker/tests/protocol_microbench.rs`).
+    fn measured_costs() -> CostConstants {
+        CostConstants { fixed_ms: 5.03, protocol_ms: 0.438 }
+    }
+
+    /// **§7.24 fixture check (required by the ruling).** The per-stage fixed cost also enters
+    /// objective (b), so the P1·2 (b)-fixture must be re-run under the amendment and any change to
+    /// its chosen split reported as a finding — never silently re-fixtured.
+    ///
+    /// **Result: the chosen split is UNCHANGED at 14/7/3**, and there is a reason rather than a
+    /// coincidence. Under (b) the cost is `max` over stages, and `fixed` is added *uniformly* to
+    /// every stage: `max(c+a, c+b, c+d) = c + max(a,b,d)`, so a uniform additive constant cannot
+    /// move the argmin. What *does* change is the predicted **cost** — the balance point is the
+    /// same, the number attached to it is larger.
+    #[test]
+    fn amendment_does_not_move_the_p1_2_b_fixture_split_and_here_is_why() {
+        let caps = p1_2_caps();
+        let links = cheap_links();
+        let lim = limits_all(24);
+        let before = solve(&SolveInput {
+            caps: &caps, links: &links, limits: &lim, n_layer: 24,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::PipelinedThroughput,
+            costs: CostConstants::default(),
+        })
+        .unwrap();
+        let after = solve(&SolveInput {
+            caps: &caps, links: &links, limits: &lim, n_layer: 24,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::PipelinedThroughput,
+            costs: measured_costs(),
+        })
+        .unwrap();
+
+        let split = |p: &Placement| -> std::collections::BTreeMap<String, u32> {
+            p.stages.iter().map(|s| (s.device.clone(), s.n_layers())).collect()
+        };
+        assert_eq!(split(&before), split(&after), "the amendment must not silently re-fixture P1·2");
+        let s = split(&after);
+        assert_eq!((s["mac"], s["myvm-2"], s["myvm-1"]), (14, 7, 3), "still the deployed split");
+        // The cost moves even though the split does not — the amendment is not a no-op.
+        assert!(after.tpot_ms > before.tpot_ms, "the amendment must raise the predicted cost");
+        assert!((after.tpot_ms - (before.tpot_ms + 5.03)).abs() < 1e-9, "by exactly one fixed term");
+    }
+
+    #[test]
+    fn the_amendment_makes_splitting_dearer_so_the_no_split_conclusion_holds_a_fortiori() {
+        // §7.23's corollary is strengthened, not weakened: paying `fixed` once beats paying it
+        // twice, so a model that fits on one device is now even more clearly best left unsplit.
+        let caps = p1_2_caps();
+        let links = cheap_links();
+        let lim = limits_all(24);
+        let p = solve(&SolveInput {
+            caps: &caps, links: &links, limits: &lim, n_layer: 24,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            costs: measured_costs(),
+        })
+        .unwrap();
+        assert_eq!(p.stages.len(), 1, "one stage pays `fixed` once; any split pays it per stage");
+        assert!((p.tpot_ms - (24.0 + 5.03)).abs() < 1e-9, "24 layers x 1.00 + one fixed term");
+    }
+
     #[test]
     fn the_other_objective_is_reported_alongside_every_placement() {
         // §7.23: v1 gates on (a), but the throughput consequence of a latency-optimal placement
@@ -597,7 +706,7 @@ mod tests {
         let lim = limits_all(10); // 24 layers over 3 devices
         let p = solve(&SolveInput {
             caps: &caps, links: &links, limits: &lim, n_layer: 24,
-            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency, costs: CostConstants::default(),
         })
         .unwrap();
         assert_eq!(p.stages.len(), 3);
