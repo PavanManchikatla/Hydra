@@ -19,8 +19,19 @@
 //! several tokens are in flight, which is true for batched serving and for chunked prefill, and
 //! **not** true for one interactive session decoding one token at a time.
 //!
-//! Both readings are therefore kept, selectable by [`Objective`], and the discrepancy is recorded
-//! as a finding rather than silently resolved — see PROJECT_STATE §7.23.
+//! **RULED (§7.23, 2026-08-22): (a) `SingleStreamLatency` is the M3 gate objective.** v1's
+//! normative workload decides it — one session per model instance, no speculative decoding, so
+//! token *t+1* strictly waits for token *t* and there is never more than one token in flight
+//! within a session. The solver optimises (a) subject to memory.
+//!
+//! **Its corollary is a feature, not an embarrassment:** when the model fits on one device, the
+//! correct placement is *no split*. Hydra's value has always been correctness and running-at-all,
+//! not parallel speedup — and the solver now proves that honestly instead of asserting it.
+//!
+//! (b) `PipelinedThroughput` stays implemented for the two places multiple positions genuinely
+//! *are* in flight: **chunked prefill (P2·7 plans against it)** and, reserved, v2's
+//! multi-session/speculative modes. It is reported as an **informational** metric alongside every
+//! (a)-placement ([`Placement::other_objective_ms`]); a placement need not satisfy both.
 //!
 //! # What makes the problem non-trivial
 //!
@@ -86,6 +97,12 @@ pub struct Placement {
     pub compute_ms: f64,
     /// Link term only.
     pub link_ms: f64,
+    /// **Informational (§7.23 ruling):** this same placement's cost under the *other* objective —
+    /// [`Objective::PipelinedThroughput`] when the search optimised latency, and vice versa.
+    /// v1 gates on (a) alone; a placement need not satisfy both. This is reported so the
+    /// throughput consequence of a latency-optimal placement is visible rather than invisible,
+    /// and because chunked prefill (P2·7) plans against (b) on the same cluster.
+    pub other_objective_ms: f64,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -148,6 +165,8 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                 // Link term: one boundary crossing per adjacent pair. An unpriced link
                 // disqualifies the placement — it is never treated as free.
                 let mut link_ms = 0.0;
+                // Accumulated under the OTHER objective, so it can be reported informationally.
+                let mut other_link_ms: f64 = 0.0;
                 let mut priced = true;
                 for w in perm.windows(2) {
                     let id = match LinkId::new(w[0].0, w[1].0) {
@@ -159,13 +178,19 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                     };
                     match input.links.cost_ms(&id, input.boundary_bytes) {
                         Some(c) => {
-                            link_ms = match input.objective {
+                            match input.objective {
                                 // Latency: every crossing is paid, one after another.
-                                Objective::SingleStreamLatency => link_ms + c,
+                                Objective::SingleStreamLatency => {
+                                    link_ms += c;
+                                    other_link_ms = other_link_ms.max(c);
+                                }
                                 // Throughput: a link is itself a pipeline stage, so the SLOWEST
                                 // link — not their sum — is what can bottleneck the rate.
-                                Objective::PipelinedThroughput => link_ms.max(c),
-                            };
+                                Objective::PipelinedThroughput => {
+                                    link_ms = link_ms.max(c);
+                                    other_link_ms += c;
+                                }
+                            }
                         }
                         None => {
                             priced = false;
@@ -184,6 +209,14 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                     // overlaps, which is the latency case above.
                     Objective::PipelinedThroughput => compute_ms.max(link_ms),
                 };
+                let other_objective_ms = match input.objective {
+                    // We optimised latency; report what this placement costs as a pipeline.
+                    Objective::SingleStreamLatency => {
+                        stage_ms.iter().cloned().fold(0.0, f64::max).max(other_link_ms)
+                    }
+                    // We optimised throughput; report its single-stream latency.
+                    Objective::PipelinedThroughput => stage_ms.iter().sum::<f64>() + other_link_ms,
+                };
                 let cand = Placement {
                     stages: perm
                         .iter()
@@ -197,6 +230,7 @@ pub fn solve(input: &SolveInput) -> Result<Placement, SolveError> {
                     tpot_ms,
                     compute_ms,
                     link_ms,
+                    other_objective_ms,
                 };
                 // Strict improvement only, so ties keep the first (deterministic) candidate.
                 if best.as_ref().map_or(true, |b| cand.tpot_ms < b.tpot_ms - 1e-12) {
@@ -464,8 +498,12 @@ mod tests {
         m
     }
 
+    /// **This is a (b)-OBJECTIVE fixture** (§7.23 ruling): P1·2's deployed split was chosen by the
+    /// pipeline-parallel heuristic, so it validates `PipelinedThroughput`, which v1 retains for
+    /// chunked prefill (P2·7) and reserves for v2. It is **not** a validation of the M3 gate
+    /// objective (a) — labelled so it is never read as one.
     #[test]
-    fn pipelined_objective_reproduces_the_p1_2_deployed_split_exactly() {
+    fn pipelined_objective_b_reproduces_the_p1_2_deployed_split_exactly() {
         // THE P2·3 fixture validation. P1·2's deployed 14/7/3 is the PIPELINE-PARALLEL optimum:
         // minimise the slowest pipeline element. With links cheap enough not to bottleneck, the
         // exhaustive solver must land on exactly the split that was deployed on real hardware.
@@ -547,6 +585,26 @@ mod tests {
             }
         }
         assert!((best.tpot_ms - brute).abs() < 1e-9, "solver {} vs brute force {brute}", best.tpot_ms);
+    }
+
+    #[test]
+    fn the_other_objective_is_reported_alongside_every_placement() {
+        // §7.23: v1 gates on (a), but the throughput consequence of a latency-optimal placement
+        // must be visible rather than invisible — chunked prefill plans against (b) on the same
+        // cluster. Forced into a 3-stage pipeline over cheap links so both numbers are non-trivial.
+        let caps = p1_2_caps();
+        let links = cheap_links();
+        let lim = limits_all(10); // 24 layers over 3 devices
+        let p = solve(&SolveInput {
+            caps: &caps, links: &links, limits: &lim, n_layer: 24,
+            boundary_bytes: 3584, max_stages: 3, objective: Objective::SingleStreamLatency,
+        })
+        .unwrap();
+        assert_eq!(p.stages.len(), 3);
+        // (a) is a sum over stages plus every crossing; (b) is the slowest single element.
+        assert!(p.other_objective_ms < p.tpot_ms, "pipelined cost must be below summed latency: {} vs {}", p.other_objective_ms, p.tpot_ms);
+        let slowest_stage = p.stages.iter().map(|s| s.n_layers()).max().unwrap();
+        assert!(p.other_objective_ms >= slowest_stage as f64 * 1.0 - 1e-9, "(b) must be at least the slowest stage");
     }
 
     #[test]
