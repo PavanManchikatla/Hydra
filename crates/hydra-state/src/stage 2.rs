@@ -138,35 +138,10 @@ impl Stage {
         self.final_evidence
     }
 
-    /// **F2 fence (amended 2026-08-23 — audit H1): the accepted attempt window is
-    /// `{highest_accepted, highest_accepted + 1}`, bounded on BOTH sides.**
-    ///
-    /// It used to be `attempt >= self.highest_attempt` — a one-sided floor, which is
-    /// **unforgeable-past but forgeable-future**. A single activation control message carrying a
-    /// far-future id (say `u32::MAX`) satisfied it, was accepted, and — because acceptance *adopts*
-    /// the value as the new floor (`highest_attempt.max(tuple.attempt)`) — **permanently fenced
-    /// every subsequent legitimate attempt.** The session could then never activate, never recover,
-    /// and §6.4's bound-exhaustion path terminates it. **A silent, permanent denial of activation in
-    /// which the stage behaves exactly as previously specified**, which is why no test caught it:
-    /// there was nothing to catch, the spec said this.
-    ///
-    /// Under the honest-worker assumption (BLUEPRINT §1.9) this is not an attack — and that is
-    /// *why it still had to be fixed*: it is squarely an **accident** case, reachable by a corrupted
-    /// field that survives the BLAKE3 frame tag, a buggy peer, or a replay from a future epoch. The
-    /// assumption excuses malice, never accidents.
-    ///
-    /// **Why a window of exactly two is sufficient:** spec §6.4 gives the coordinator exactly one
-    /// way to advance an attempt — `+1`. A stage that has accepted attempt *n* can therefore only
-    /// ever legitimately be offered *n* (an idempotent replay, which §6.6 step 2 *requires* it to
-    /// re-ack) or *n+1* (the next retry). No legitimate message carries *n+2*.
-    ///
-    /// The Mut3 mutation still disables the fence wholesale, so the mutation's designed
-    /// counterexample is unchanged — narrowing the window must not silence it, and the CI legs
-    /// assert that it still fires.
+    /// F2 fence: accept an activation-control attempt iff it is not below the highest accepted
+    /// (unless the Mut3 mutation disables fencing).
     fn attempt_passes_fence(&self, attempt: AttemptId) -> bool {
-        cfg!(feature = "mutation_no_attempt_fence")
-            || attempt == self.highest_attempt
-            || attempt == self.highest_attempt.saturating_add(1)
+        cfg!(feature = "mutation_no_attempt_fence") || attempt >= self.highest_attempt
     }
 
     pub fn step(&mut self, ev: StageEvent) -> Vec<StageEffect> {

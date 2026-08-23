@@ -365,7 +365,7 @@ StageRecvCommitAt(s, a0) ==
     \E m \in msgs :
         /\ m.t = "COMMIT" /\ m.a = a0 /\ m.tgt = stEpoch[s] /\ m.r = stRId[s]
         /\ m.gens[s] = stGen[s] /\ m.ap = stApplied[s]
-        /\ (AttemptFencing => m.a \in {stAttempt[s], stAttempt[s] + 1}) \* MUTATION 3 (H1: bounded window)
+        /\ (AttemptFencing => m.a >= stAttempt[s])                    \* MUTATION 3
         /\ \/ /\ stState[s] = "FROZEN_READY"
               /\ stState'   = [stState   EXCEPT ![s] = "PREACTIVE"]
               /\ stAttempt' = [stAttempt EXCEPT ![s] = m.a]
@@ -639,32 +639,6 @@ AbortFinality      ==                                                     \* I25
     ~\E ab \in wal, co \in wal :
         /\ ab.t = "ABORT" /\ co.t = "COMPLETE"
         /\ ab.tgt = co.tgt /\ ab.r = co.r /\ ab.a = co.a
-
-(***************************************************************************************)
-(* [AUDIT M13, 2026-08-23] ResetPreservesAttemptSpace                                   *)
-(*                                                                                     *)
-(* The activation-attempt space is per (session, epoch). A RESET advances `recovery_id` *)
-(* but NOT the epoch, so it must not restart attempts.                                 *)
-(*                                                                                     *)
-(* Why this property exists at all is the finding. Spec §6.4 was SILENT on the reset's  *)
-(* effect on the attempt space, and this model made the choice implicitly — every reset *)
-(* action carries `UNCHANGED << attempt, stAttempt >>`. That choice is self-consistent, *)
-(* so TLC had NOTHING TO SAY: the model was not wrong, it was silently opinionated, and *)
-(* its opinion was invisible to anyone reading the spec. A second implementation could  *)
-(* read "fresh reconstruction ⇒ attempts restart at 0" — coherent, and fatal, because   *)
-(* F2's stage floor is epoch-scoped and survives the reset, so every post-reset         *)
-(* activation would be fenced by the stage's own floor. Two conforming implementations, *)
-(* one permanent deadlock.                                                             *)
-(*                                                                                     *)
-(* Making it a CHECKED property is the repair: it must hold on the model UNCHANGED (if  *)
-(* it fails on first run, the model was making the other choice and the finding is      *)
-(* larger than a silence), and a future edit adopting the other reading now fails here  *)
-(* instead of passing quietly.                                                         *)
-(***************************************************************************************)
-ResetPreservesAttemptSpace ==
-    [][ (rId' > rId /\ recTarget' = recTarget)
-        => (/\ attempt' = attempt
-            /\ \A s \in Stages : stAttempt'[s] >= stAttempt[s]) ]_vars
 
 Inv == /\ ServiceSafety /\ TupleSafety /\ CaseBPure /\ NoPreactiveServe
        /\ AbortSafety   /\ CandidateIsolation /\ DecisionMonotone /\ AbortFinality

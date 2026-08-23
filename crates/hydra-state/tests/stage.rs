@@ -88,6 +88,72 @@ fn stale_attempt_is_fenced() {
     assert_eq!(s.attempt(), 2, "stage must not regress to the stale attempt");
 }
 
+/// **Audit H1 — an attempt ABOVE the window is fenced, and (the real property) the floor DOES NOT
+/// MOVE.**
+///
+/// The fence used to be one-sided: `attempt >= highest_attempt`. That is **unforgeable-past but
+/// forgeable-future**. A single `COMMIT_ACTIVATION` carrying a far-future id satisfied it, was
+/// accepted, and — because acceptance *adopts* the value as the new floor — **permanently fenced
+/// every legitimate attempt that followed**. The session could then never activate, never recover,
+/// and §6.4's bound-exhaustion path terminates it: a **silent, permanent denial of activation in
+/// which the stage behaved exactly as specified.**
+///
+/// **The second assertion is the one that matters.** A rejection that still advanced the floor would
+/// reproduce the whole defect while *looking* like a fix — the frame is refused, the log says
+/// `Fenced`, and the session is dead anyway. Asserting only the rejection would be an
+/// over-promising test in exactly the §7.31 sense.
+#[test]
+fn an_attempt_above_the_window_is_fenced_and_does_not_move_the_floor() {
+    let mut s = Stage::frozen_ready(0, 0, 0);
+    step_ok(&mut s, RecvCommit { tuple: tuple(1) }); // accept attempt 1; floor := 1
+    assert_eq!(s.highest_attempt(), 1);
+
+    // A far-future attempt: the exact shape that used to be accepted.
+    for hostile in [3u32, 99, u32::MAX] {
+        let e = step_ok(&mut s, RecvCommit { tuple: tuple(hostile) });
+        assert!(
+            matches!(e[0], StageEffect::Fenced { .. }),
+            "attempt {hostile} is above the window {{1, 2}} and must be FENCED, got {e:?}"
+        );
+        assert_eq!(
+            s.highest_attempt(),
+            1,
+            "a fenced attempt must NOT advance the floor — otherwise the refusal still consumes the \
+             attempt space and the denial-of-activation survives the fix (audit H1)"
+        );
+    }
+
+    // Control: the next legitimate attempt is still accepted, so the window did not close the door
+    // on the protocol's own retry path.
+    step_ok(&mut s, RecvAbort { attempt: 1 });
+    let e = step_ok(&mut s, RecvCommit { tuple: tuple(2) });
+    assert!(!matches!(e.first(), Some(StageEffect::Fenced { .. })), "attempt 2 = floor+1 must be accepted");
+    assert_eq!(s.attempt(), 2);
+    assert_eq!(s.highest_attempt(), 2);
+}
+
+/// The window's lower edge is unchanged, so H1 narrows without weakening: an idempotent replay at
+/// exactly the floor is still accepted (spec §6.6 step 2 *requires* the stage to re-ack it), and
+/// anything below is still stale.
+#[test]
+fn the_window_still_accepts_an_idempotent_replay_and_still_rejects_a_stale_attempt() {
+    let mut s = Stage::frozen_ready(0, 0, 0); // floor starts at 0
+    // Reach attempt 1 the way the protocol reaches it — one increment. (Writing `tuple(2)` here
+    // fails, and correctly so: the window refuses a jump from floor 0 to attempt 2. That is the
+    // amendment biting on the test's own premise, which is worth knowing.)
+    step_ok(&mut s, RecvCommit { tuple: tuple(1) }); // floor := 1
+    assert_eq!(s.highest_attempt(), 1);
+
+    // replay at the floor — must be re-acked, not fenced (I18 convergence, §6.6 step 2)
+    let e = step_ok(&mut s, RecvCommit { tuple: tuple(1) });
+    assert!(!matches!(e.first(), Some(StageEffect::Fenced { .. })), "a replay at the floor must re-ack");
+
+    // below the floor — still stale, exactly as before the amendment
+    let e = step_ok(&mut s, RecvCommit { tuple: tuple(0) });
+    assert!(matches!(e[0], StageEffect::Fenced { attempt: 0, highest: 1, .. }), "got {e:?}");
+    assert_eq!(s.highest_attempt(), 1);
+}
+
 // ---- Mut3 parity: no attempt fencing -> stale commit accepted -> checker catches it ----
 #[cfg(feature = "mutation_no_attempt_fence")]
 #[test]
