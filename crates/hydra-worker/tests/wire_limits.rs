@@ -211,31 +211,82 @@ fn the_frame_cap_is_enforced_at_the_header_before_any_payload_is_read() {
     assert!(matches!(err, FrameError::LimitExceeded { .. }), "got {err:?}");
 }
 
-/// **The regression for the defect the cap itself exposed (§7.27).**
+/// **THE STANDING FIXTURE-BLINDNESS REGRESSION (design-authority directive, 2026-08-23).**
 ///
-/// `encode_fwd` put `activations.len()` — the number of **f32s** — into `n_positions`, a field the
-/// schema declares as `<= MAX_POSITIONS_PER_FRAME`. It was harmless only while nothing read the
-/// field. The moment the cap became real, the wrong value became a live defect: the dev model's
-/// `n_embd` is 896 and slipped under the 1024 cap, but **every larger model would have had its
-/// boundaries refused** — a 7 B has `n_embd = 4096`.
+/// Every wire cap is exercised against dimensions **the dev fixture never reaches**, so no future
+/// cap bug can hide under it.
 ///
-/// That is worth stating plainly, because it is the audit's own near-miss: enforcing a documented
-/// cap against a field nobody had ever validated is exactly how a latent encoder bug becomes an
-/// outage, and it would have shipped looking like a security fix.
+/// # Why this test exists, in its own words
+///
+/// The M4·1 audit enforced `n_positions <= MAX_POSITIONS_PER_FRAME` — a documented, normative,
+/// never-checked constraint. It also found that `encode_fwd` had been putting `activations.len()`,
+/// the number of **f32s**, into that field (the line carried a `// placeholder` comment). Harmless
+/// while nothing read the field; live the instant the cap became real.
+///
+/// And it would have shipped, because **the fixture cannot see it**: the dev model's `n_embd` is
+/// **896**, which slips under the 1024 cap. Every test in the workspace would have stayed green
+/// while every model above 0.5 B had its boundaries refused — a 7 B has `n_embd = 4096`, a 70 B has
+/// `8192`. A correct-looking security fix would have broken the product on the first real model.
+///
+/// **The durable lesson (PROJECT_STATE §7.29): a limit must be tested against values the fixtures
+/// do not reach.** A cap whose only test data sits comfortably below it is not tested — it is
+/// merely not triggered, and the two are indistinguishable from a green suite.
+///
+/// So the widths below are chosen to *straddle and exceed* the cap on purpose: the fixture's own
+/// 896, then the cap itself, then real model widths well beyond it. A cap defect that only bites
+/// above 1024 fails here on the very first run.
 #[test]
-fn a_real_boundary_wider_than_the_position_cap_still_decodes() {
+fn wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches() {
     let keys = SessionKeys::dev(0x55);
-    // 4096 floats — a 7B-class `n_embd`, four times the position cap.
-    let wide = vec![0.25f32; 4096];
-    let payload = wire::encode_fwd(&keys, 0, 0, true, &wide);
 
-    let (_, msg) = wire::decode(&payload, &keys).expect("a wide boundary must decode");
-    match msg {
-        hydra_worker::wire::Msg::Fwd { activations, .. } => assert_eq!(activations.len(), 4096),
-        other => panic!("expected Fwd, got {other:?}"),
+    // 896 = the dev model (Qwen2.5-0.5B) — the width every other engine test uses, and the one
+    // that hid the defect. 1024 = exactly MAX_POSITIONS_PER_FRAME, the value an off-by-one lands
+    // on. 1536/2048/4096/8192 = real n_embd for 1.5 B / 3 B / 7 B / 70 B-class models, i.e. every
+    // width this project intends to serve and none of which any fixture here exercises.
+    for n_embd in [896usize, 1024, 1536, 2048, 4096, 8192] {
+        let boundary = vec![0.25f32; n_embd];
+
+        let payload = wire::encode_fwd(&keys, 0, 0, true, &boundary);
+        let (_, msg) = wire::decode(&payload, &keys)
+            .unwrap_or_else(|e| panic!("a {n_embd}-wide FWD boundary must decode, got {e:?}"));
+        match msg {
+            hydra_worker::wire::Msg::Fwd { activations, .. } => {
+                assert_eq!(activations.len(), n_embd, "the boundary must survive the round trip intact")
+            }
+            other => panic!("expected Fwd for n_embd={n_embd}, got {other:?}"),
+        }
+
+        // The field really carries a POSITION count, not a float count — the defect itself.
+        let frame = flatbuffers::root::<proto::Frame>(&payload).unwrap();
+        assert_eq!(
+            frame.body_as_fwd().unwrap().n_positions(),
+            1,
+            "n_embd={n_embd}: one FWD carries one position in v1; putting the float count here is \
+             the §7.27 defect, and it is invisible at the dev model's 896"
+        );
+
+        // The same for the durability path, which carries the same boundary over a different body.
+        let bc = wire::encode_boundary_copy(&keys, 0, 0, 0, 0, &boundary);
+        assert!(
+            wire::decode(&bc, &keys).is_ok(),
+            "a {n_embd}-wide BOUNDARY_COPY must decode — D1 recovery replays exactly these"
+        );
     }
+}
 
-    // And the field really does carry a POSITION count, not the float count.
-    let frame = flatbuffers::root::<proto::Frame>(&payload).unwrap();
-    assert_eq!(frame.body_as_fwd().unwrap().n_positions(), 1, "one FWD carries one position in v1");
+/// The fixture-blindness the test above exists to defeat, asserted directly so the gap is a
+/// **recorded fact** rather than a comment: the dev model's boundary width really is below the
+/// position cap, so the cap is genuinely untested by every other engine test in the workspace.
+///
+/// If someone later raises `MAX_POSITIONS_PER_FRAME` or shrinks the fixture until this stops being
+/// true, this test fails and tells them the sweep above has lost its reason to exist — rather than
+/// letting it decay into a test that proves nothing.
+#[test]
+fn the_dev_fixture_is_below_the_position_cap_which_is_why_the_sweep_exists() {
+    const DEV_N_EMBD: usize = 896; // Qwen2.5-0.5B
+    assert!(
+        DEV_N_EMBD < MAX_POSITIONS_PER_FRAME as usize,
+        "the dev fixture ({DEV_N_EMBD}) is no longer below the position cap ({MAX_POSITIONS_PER_FRAME}); \
+         re-read PROJECT_STATE §7.29 and re-pick the sweep widths above"
+    );
 }

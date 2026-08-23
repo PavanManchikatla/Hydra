@@ -1,9 +1,18 @@
 # M4·1 completion report — reserved-hook audit, security checklist, parser fuzzing
 
 **Date:** 2026-08-23 · **Milestone:** M4 (product hardening), slice 1 of 4
-**Status: COMPLETE. The project is now PAUSED for the owner's external full-repo security and
-penetration audit.** M4·2 (pairing UX), M4·3 (packaging/docs) and M4·4 (dashboard) are **not
-started**, by instruction.
+**Status: COMPLETE and RATIFIED (design authority, 2026-08-23), on both gating conditions —
+the fuzz arm is observed with its verdict lines banked, and the ten-defect ledger carries a severity
+and a named regression per defect. The project is now PAUSED for the owner's external full-repo
+security and penetration audit.** M4·2 (pairing UX), M4·3 (packaging/docs) and M4·4 (dashboard) are
+**not started**, by instruction.
+
+> **Closing evidence.** Fuzz leg 1 — run
+> [32618764167](https://github.com/PavanManchikatla/Hydra/actions/runs/32618764167): **24 / 24 legs
+> GREEN, 0 crashes, 1 967 017 984 cases, 0.400 CPU-hours**, receipt
+> `verification/ci-results/fuzz-32618764167.md`. The 24-CPU-hour DoD stands at **0.400 / 24** and is
+> tracked as accumulating in PROJECT_STATE §8 — this report does not claim it is met.
+> Defect ledger with severities and named regressions: PROJECT_STATE §7.28.
 
 ---
 
@@ -187,7 +196,7 @@ exit to green.
 | API auth enforced | ✅ **MET**, with `Host`/`Origin` validation |
 | All frame/tensor/record limits enforced pre-allocation | ✅ **MET** (`wire_limits.rs`) |
 | mTLS on every link, refuse-on-fail everywhere | ✅ **MET** (`security_checklist.rs` + the existing durability/sampler/admission refusals, mapped in `docs/SECURITY-CHECKLIST.md`) |
-| GGUF parser fuzzed **24 CPU-hours** without crashes | 🔄 **ACCUMULATING** — the arm exists, runs, and has already paid for itself. The hours are banked as receipts and the claim is made **only when they add up** |
+| GGUF parser fuzzed **24 CPU-hours** without crashes | 🔄 **ACCUMULATING — 0.400 / 24 CPU-hours.** Leg 1 banked (`fuzz-32618764167.md`): 24/24 GREEN, 0 crashes, 1.97 B cases. Weekly legs are ~2.0 CPU-h; ~12 reach the bar. **The arm is *observed* (rule 12); the hours are not yet earned** |
 | *Non-author 3-machine setup in under 30 min* | ⛔ **M4·2/M4·3** — not started, by instruction |
 
 ---
