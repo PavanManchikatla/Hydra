@@ -16,3 +16,4 @@ pub mod capability;
 pub mod link;
 pub mod solver;
 pub mod stability;
+pub mod telemetry;
