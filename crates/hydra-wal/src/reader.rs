@@ -6,7 +6,9 @@
 use std::path::Path;
 
 use crate::file::{FileHeader, FILE_HEADER_LEN};
-use crate::record::{read_record, rec_type, ReadStep};
+use crate::record::{
+    read_record, rec_type, record_size, ReadStep, MAX_PAYLOAD_LEN, RECORD_HEADER_LEN, RECORD_MAGIC,
+};
 use crate::WalError;
 
 /// A record recovered by the scan (payload copied out).
@@ -52,17 +54,64 @@ fn is_known_type(t: u16) -> bool {
     )
 }
 
-/// Does a checksum-valid record exist at or after `pos`? Advances over intact-but-corrupt
-/// records (framing readable, tag bad) by their length; stops at a torn/garbage boundary.
-fn any_valid_record_after(bytes: &[u8], mut pos: usize) -> bool {
-    while pos < bytes.len() {
-        match read_record(&bytes[pos..]) {
-            ReadStep::Record { .. } => return true,
-            ReadStep::BadChecksum { total_len } => pos += total_len,
-            ReadStep::Incomplete | ReadStep::BadFraming => return false,
-        }
+/// How many resync probes to attempt before giving up and refusing (audit H8).
+///
+/// A probe is only attempted at an offset whose two magic bytes match, and each probe costs at most
+/// one BLAKE3 over a declared record. Corrupt data can declare a large length at many offsets, so
+/// the work is capped; **exceeding the cap refuses the log** rather than concluding "no valid record
+/// follows". Fail-closed is the only safe default here: the alternative is to silently discard
+/// however much durable data lay beyond the point we stopped looking.
+const MAX_RESYNC_PROBES: usize = 256;
+
+/// **Audit H8 — resync after damage: is there a checksum-valid record anywhere after `from`?**
+///
+/// # What this replaces, and why it is not the same function
+///
+/// The previous version stepped forward only over records whose *framing* still parsed
+/// (`BadChecksum{total_len}`) and **returned `false` the moment it met `BadFraming` or
+/// `Incomplete`** — i.e. as soon as it could not compute how far to jump. That is exactly the case
+/// a corrupt frame **header** produces. So a single flipped magic byte in the middle of a log made
+/// the scanner answer "nothing valid follows", the scan reported a torn tail, and
+/// `WalWriter::open_append` then **truncated the file to that offset** — permanently destroying
+/// every record after it, all of which were on the platter and checksum-valid.
+///
+/// The fix does not need the framing to be intact: **every record starts at an 8-byte-aligned
+/// offset** (`FILE_HEADER_LEN` is 72 and `record_size` is always a multiple of 8), so the scan can
+/// walk aligned offsets looking for the record magic and try to parse there. A record that parses
+/// AND passes its BLAKE3 tag is real durable data by any standard we have.
+fn find_valid_record_after(bytes: &[u8], from: usize) -> Option<usize> {
+    // Round up to the next 8-aligned offset relative to the file header.
+    let mut probe = from.max(FILE_HEADER_LEN);
+    let rel = probe - FILE_HEADER_LEN;
+    if rel % 8 != 0 {
+        probe += 8 - (rel % 8);
     }
-    false
+    let mut probes = 0usize;
+    while probe + RECORD_HEADER_LEN <= bytes.len() {
+        if u16::from_le_bytes([bytes[probe], bytes[probe + 1]]) == RECORD_MAGIC {
+            probes += 1;
+            if probes > MAX_RESYNC_PROBES {
+                // Unclassifiable: refuse rather than assume the rest is garbage.
+                return Some(probe);
+            }
+            if let ReadStep::Record { .. } = read_record(&bytes[probe..]) {
+                return Some(probe);
+            }
+        }
+        probe += 8;
+    }
+    None
+}
+
+/// **Audit H8 — could the region from `pos` to EOF be a genuine torn tail?**
+///
+/// A torn tail is **at most one partially-written record**: the writer appends one record at a time
+/// and `fdatasync`s between them, so at most one record can be mid-flight when the machine dies.
+/// A trailing region longer than the largest record that could ever have been in flight is
+/// therefore not a tail, whatever it looks like — and discarding it would silently drop however
+/// much durable data it spans.
+fn tail_is_bounded(bytes: &[u8], pos: usize) -> bool {
+    bytes.len().saturating_sub(pos) <= record_size(MAX_PAYLOAD_LEN as usize)
 }
 
 impl WalScan {
@@ -106,17 +155,19 @@ impl WalScan {
                     });
                     pos += total_len;
                 }
-                ReadStep::Incomplete | ReadStep::BadFraming => {
-                    // Torn/garbage tail: the durable log ends at `pos`.
-                    truncated_tail = true;
-                    break;
-                }
-                ReadStep::BadChecksum { total_len } => {
-                    if any_valid_record_after(bytes, pos + total_len) {
-                        // §3.4: not the tail — mid-stream corruption. Refuse to open.
+                // Damage. Whether it is a discardable TAIL or fatal MID-STREAM corruption is
+                // decided identically for all three kinds (audit H8): a torn tail is at most one
+                // partially-written record and has nothing valid after it. Anything else is
+                // corruption and the log is refused — never silently truncated.
+                ReadStep::Incomplete | ReadStep::BadFraming | ReadStep::BadChecksum { .. } => {
+                    // Start the search past this offset: a `BadChecksum` record's own bytes must
+                    // not be re-found as "a valid record after the damage".
+                    if find_valid_record_after(bytes, pos + 1).is_some() {
                         return Err(WalError::CorruptMidStream { offset: pos as u64 });
                     }
-                    // Bad tag with nothing valid after => treat as torn tail, discard.
+                    if !tail_is_bounded(bytes, pos) {
+                        return Err(WalError::CorruptMidStream { offset: pos as u64 });
+                    }
                     truncated_tail = true;
                     break;
                 }

@@ -24,6 +24,44 @@ use std::sync::Arc;
 
 use hydra_coordinator::commit_stream::{CommitStream, Durability, WalFenceCtx};
 
+/// A minimal valid `SamplerCheckpointRec` (I19: generated_through == sampled == pos).
+fn snapshot(checkpoint_id: u64, generated_through: i64, sampled: i64) -> Vec<u8> {
+    use flatbuffers::FlatBufferBuilder;
+    use hydra_proto::wal;
+    let mut fbb = FlatBufferBuilder::new();
+    let rng_key = Some(fbb.create_vector(&[0u8; 8]));
+    let grammar = Some(fbb.create_vector::<u8>(&[]));
+    let penalty = Some(fbb.create_vector::<u8>(&[]));
+    let cfg = Some(fbb.create_vector(&[7u8; 32]));
+    let sum = Some(fbb.create_vector(&[9u8; 32]));
+    let rec = wal::SamplerCheckpointRec::create(
+        &mut fbb,
+        &wal::SamplerCheckpointRecArgs {
+            checkpoint_id,
+            rng_key,
+            rng_counter: 42,
+            generated_through_output_pos: generated_through,
+            serialized_grammar_state: grammar,
+            serialized_penalty_state: penalty,
+            sampled_output_pos: sampled,
+            sampling_config_hash: cfg,
+            state_checksum: sum,
+        },
+    );
+    fbb.finish(rec, None);
+    fbb.finished_data().to_vec()
+}
+
+fn admission() -> hydra_tokenizer::Admission {
+    hydra_tokenizer::Admission {
+        tokenizer_hash: [0xA1; 32],
+        chat_template_hash: [0xB2; 32],
+        rendered_prompt_bytes_hash: [0xC3; 32],
+        rendered_prompt: "hi".to_string(),
+        prompt_tokens: vec![10, 20, 30],
+    }
+}
+
 fn wal_fence() -> WalFenceCtx {
     WalFenceCtx {
         cluster_id: [7u8; 16],
@@ -191,4 +229,132 @@ fn recovery_after_a_disk_fault_resumes_from_the_last_position_that_actually_land
     dedup.dedup();
     assert_eq!(dedup.len(), covered.len(), "no position applied twice across the fault");
     assert_eq!(dedup.len(), 128, "every position applied exactly once");
+}
+
+// ---------------------------------------------------------------------------------------------
+// H9 — the sink now PERSISTS BYTES ON FAILURE, which is what a real disk does.
+//
+// **Standing rule 19: what this file could not see.** `FailAfter` and `StallAfter` above return
+// `Err` and keep the payload to themselves — as if a failing write left the platter untouched.
+// Real failures are not so tidy: `write_all` can return an error after a short write, and
+// `fdatasync` can fail after some of the data has already been written back. Under the old sink
+// the *post-failure state of the log* was inexpressible, so every assertion here was about
+// watermarks and none could be about what a later reader would find.
+//
+// With bytes persisted, the question H9 asks becomes askable: after a failed append, is the log
+// still a log? The answer, before the fix, was no — the writer accepted the NEXT append, which
+// placed a checksum-valid record immediately after a partial one, i.e. manufactured exactly the
+// mid-stream corruption H8 refuses to open.
+// ---------------------------------------------------------------------------------------------
+
+/// A sink that writes the bytes it was given and *then* reports failure — a short write, or an
+/// `fdatasync` that failed after partial write-back. `persisted` is the byte log a later reader
+/// would see.
+struct PersistsThenFails {
+    ok_appends: usize,
+    seen: usize,
+    persisted: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Fraction of the record that lands before the error (1.0 = all of it).
+    landed: f64,
+    len: u64,
+}
+
+impl Durability for PersistsThenFails {
+    fn append(&mut self, _rt: u16, _flags: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError> {
+        self.seen += 1;
+        if self.seen > self.ok_appends {
+            let n = ((payload.len() as f64) * self.landed) as usize;
+            self.persisted.lock().unwrap().extend_from_slice(&payload[..n]);
+            return Err(hydra_wal::WalError::Io(std::io::Error::other("injected failure after partial write-back")));
+        }
+        self.persisted.lock().unwrap().extend_from_slice(payload);
+        self.len += payload.len() as u64;
+        Ok(self.len)
+    }
+    fn durable_len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// **H9 — a failed append leaves bytes behind, so the writer must never accept another one.**
+///
+/// The commit stream is the coordinator's durable truth. If an append fails after some bytes
+/// landed and the next append is accepted, the log gains a valid record sitting behind a partial
+/// one — which is mid-stream corruption by construction, and (since H8) a log that refuses to
+/// open at all. One transient `ENOSPC` would therefore cost the whole session's ledger rather
+/// than the one write that failed.
+#[test]
+fn a_failed_append_poisons_the_stream_so_no_later_write_can_land_behind_it() {
+    let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut cs = CommitStream::with_durability(Box::new(PersistsThenFails {
+        ok_appends: 1,
+        seen: 0,
+        persisted: persisted.clone(),
+        landed: 0.5,
+        len: 0,
+    }));
+
+    cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).expect("chunk 0 lands");
+    assert_eq!(cs.prefill_stable_pos(), 31);
+    let after_good = persisted.lock().unwrap().len();
+
+    // The failing append: bytes land, the error is returned.
+    let err = cs.append_input_chunk_commit(&wal_fence(), 0, 1, 32, 63, &[63]);
+    assert!(err.is_err(), "the failure must be reported, never swallowed");
+    assert_eq!(cs.prefill_stable_pos(), 31, "and the watermark must not move");
+    assert!(persisted.lock().unwrap().len() > after_good, "the sink really did leave bytes behind");
+
+    // THE H9 ASSERTION: every subsequent append is refused, and refused *without touching the
+    // sink* — so nothing valid can ever land behind the partial record.
+    let before = persisted.lock().unwrap().len();
+    for attempt in 0..3 {
+        let again = cs.append_input_chunk_commit(&wal_fence(), 0, 2, 64, 95, &[95]);
+        assert!(again.is_err(), "attempt {attempt}: a poisoned stream must refuse every later append");
+        assert!(
+            matches!(again, Err(hydra_coordinator::CommitError::Poisoned { .. })),
+            "attempt {attempt}: the refusal must name the poisoning, not masquerade as a fresh I/O error: {again:?}"
+        );
+    }
+    assert_eq!(
+        persisted.lock().unwrap().len(),
+        before,
+        "a poisoned stream must not write ANY bytes — not even the ones that would 'probably' be fine"
+    );
+    assert_eq!(cs.prefill_stable_pos(), 31, "no watermark moved");
+}
+
+/// The same for the generation path, and the control that keeps the rule honest: a stream that has
+/// never failed accepts appends normally. (A "poison everything" implementation would pass the
+/// test above and destroy the product.)
+#[test]
+fn poisoning_is_caused_by_the_failure_and_not_by_the_check() {
+    let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ok = CommitStream::with_durability(Box::new(PersistsThenFails {
+        ok_appends: 100,
+        seen: 0,
+        persisted: persisted.clone(),
+        landed: 1.0,
+        len: 0,
+    }));
+    ok.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial commit lands");
+    for pos in 0..4i64 {
+        ok.append_generation_commit(&wal_fence(), pos, pos, &[(pos, 7u32)], &snapshot(1, pos, pos))
+            .unwrap_or_else(|e| panic!("healthy stream must keep accepting appends: {e}"));
+    }
+    assert_eq!(ok.generation_durable_pos(), 3);
+
+    // …and a stream whose generation append fails is poisoned for the generation path too.
+    let mut bad = CommitStream::with_durability(Box::new(PersistsThenFails {
+        ok_appends: 2, // INITIAL + one GENERATION land, the next fails
+        seen: 0,
+        persisted: Arc::new(std::sync::Mutex::new(Vec::new())),
+        landed: 0.25,
+        len: 0,
+    }));
+    bad.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+    bad.append_generation_commit(&wal_fence(), 0, 0, &[(0, 7u32)], &snapshot(1, 0, 0)).expect("first generation commit");
+    assert!(bad.append_generation_commit(&wal_fence(), 1, 1, &[(1, 8u32)], &snapshot(1, 1, 1)).is_err(), "the injected failure");
+    let poisoned = bad.append_generation_commit(&wal_fence(), 2, 2, &[(2, 9u32)], &snapshot(1, 2, 2));
+    assert!(matches!(poisoned, Err(hydra_coordinator::CommitError::Poisoned { .. })), "got {poisoned:?}");
+    assert_eq!(bad.generation_durable_pos(), 0, "the watermark stands where the last DURABLE record left it");
 }

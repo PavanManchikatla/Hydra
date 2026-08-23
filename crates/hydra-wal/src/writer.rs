@@ -24,6 +24,20 @@ pub struct WalWriter {
     dir: PathBuf,
     path: PathBuf,
     size: u64,
+    /// **Audit H9 — the writer is poisoned by any I/O error and never writes again.**
+    ///
+    /// A failed append is not a failed *operation*, it is an **unknown log state**: `write_all` can
+    /// return an error after a short write, and `sync_data` can fail after part of the record has
+    /// been written back. Either way some prefix of a record may be on the platter, and the writer
+    /// cannot find out how much without reading its own file back.
+    ///
+    /// Accepting the next append is then actively destructive: it places a checksum-valid record
+    /// immediately behind a partial one, which is **mid-stream corruption by construction** — and
+    /// since H8 that is a log which refuses to open at all. So one transient `ENOSPC` would cost
+    /// the whole session's ledger rather than the single write that failed. The writer therefore
+    /// stops at the first error and says so, and recovery goes through `WalScan` +
+    /// [`WalWriter::open_append`], which is the only path that establishes what is actually durable.
+    poisoned: Option<String>,
 }
 
 impl WalWriter {
@@ -38,7 +52,7 @@ impl WalWriter {
         file.write_all(&hdr)?;
         file.sync_data()?;
         sync_dir(&dir)?;
-        Ok(Self { file, dir, path, size: hdr.len() as u64 })
+        Ok(Self { file, dir, path, size: hdr.len() as u64, poisoned: None })
     }
 
     /// Reopen an existing segment for appending, positioned at `durable_len` (typically the
@@ -52,18 +66,41 @@ impl WalWriter {
         use std::io::{Seek, SeekFrom};
         let mut file = file;
         file.seek(SeekFrom::Start(durable_len))?;
-        Ok(Self { file, dir, path, size: durable_len })
+        Ok(Self { file, dir, path, size: durable_len, poisoned: None })
     }
 
     /// Append one record and `fdatasync`. Returns the record's start offset. The record is
     /// durable when this returns (WAL-FORMAT §3.1).
     pub fn append(&mut self, record_type: u16, flags: u16, payload: &[u8]) -> Result<u64, WalError> {
+        if let Some(why) = &self.poisoned {
+            return Err(WalError::WriterPoisoned { why: why.clone() });
+        }
         let rec = encode_record(record_type, flags, payload)?;
         let offset = self.size;
-        self.file.write_all(&rec)?;
-        self.file.sync_data()?; // fdatasync — record is durable after this returns
+        // From here to the end of `sync_data`, a failure leaves the on-disk state UNKNOWN — an
+        // unknown number of bytes may have landed. Every such error poisons the writer (H9).
+        if let Err(e) = self.file.write_all(&rec) {
+            return Err(self.poison(format!("write failed at offset {offset}: {e}")));
+        }
+        if let Err(e) = self.file.sync_data() {
+            return Err(self.poison(format!("fdatasync failed for the record at offset {offset}: {e}")));
+        }
         self.size += rec.len() as u64;
         Ok(offset)
+    }
+
+    /// Poison the writer and return the error to report. Idempotent: the FIRST cause is kept,
+    /// because that is the one that explains the state of the file.
+    fn poison(&mut self, why: String) -> WalError {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(why.clone());
+        }
+        WalError::WriterPoisoned { why: self.poisoned.clone().unwrap_or(why) }
+    }
+
+    /// Whether this writer has been poisoned by an I/O error (audit H9).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
     }
 
     /// Current on-disk size (offset of the next append).

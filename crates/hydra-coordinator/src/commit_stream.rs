@@ -24,6 +24,13 @@ pub enum CommitError {
     I19(String),
     #[error("malformed sampler checkpoint snapshot: {0}")]
     BadCheckpoint(String),
+    /// **Audit H9.** An earlier append failed after bytes may have reached the disk, so the stream
+    /// is poisoned: every later append is refused **without touching the sink**. Distinct from a
+    /// fresh `Wal(Io)` error, and deliberately so — "this write failed" and "this stream can no
+    /// longer be written to" are different facts, and a caller that cannot tell them apart will
+    /// retry the first forever and mistake the second for bad luck.
+    #[error("commit stream poisoned by an earlier failed append; nothing further may be written ({why})")]
+    Poisoned { why: String },
     /// **Audit M5.** A sampled `token_id` outside `[0, n_vocab)` was refused before it could be
     /// buffered for a durable `GENERATION_COMMIT`. Nothing was written.
     #[error("token_id {token_id} at output_pos {output_pos} is outside the vocabulary (n_vocab {n_vocab}); refused before durability (audit M5)")]
@@ -124,6 +131,8 @@ fn build_token_entries<'a>(fbb: &mut FlatBufferBuilder<'a>, tokens: &[(i64, u32)
 /// The coordinator's durable commit stream.
 pub struct CommitStream {
     writer: Box<dyn Durability>,
+    /// Audit H9: set by the first failed append; refuses every later one. See [`CommitError::Poisoned`].
+    poisoned: Option<String>,
     generation_durable_pos: i64,
     committed_sampler_checkpoint_id: u64,
     next_commit_id: u64,
@@ -146,6 +155,7 @@ impl CommitStream {
     pub fn with_durability(writer: Box<dyn Durability>) -> CommitStream {
         CommitStream {
             writer,
+            poisoned: None,
             generation_durable_pos: -1,
             committed_sampler_checkpoint_id: 0,
             next_commit_id: 1,
@@ -172,6 +182,29 @@ impl CommitStream {
     }
     pub fn durable_len(&self) -> u64 {
         self.writer.durable_len()
+    }
+
+    /// Audit H9: has an append failed, leaving the on-disk tail unknown?
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// The single append path. **Every** durable write in this type goes through here, so the H9
+    /// poisoning cannot be forgotten at one call site: a new record type gets the check by
+    /// construction rather than by review.
+    fn durable_append(&mut self, record_type: u16, payload: &[u8]) -> Result<u64, CommitError> {
+        if let Some(why) = &self.poisoned {
+            return Err(CommitError::Poisoned { why: why.clone() });
+        }
+        match self.writer.append(record_type, 0, payload) {
+            Ok(off) => Ok(off),
+            Err(e) => {
+                // The bytes may or may not have landed; the stream is no longer writable either
+                // way. Record the FIRST cause — it is the one that explains the file.
+                self.poisoned = Some(e.to_string());
+                Err(CommitError::Wal(e))
+            }
+        }
     }
 
     /// `INITIAL_COMMIT` — admission metadata (the three hashes) + the config-defined initial
@@ -205,7 +238,7 @@ impl CommitStream {
             },
         );
         fbb.finish(ic, None);
-        self.writer.append(rec_type::INITIAL_COMMIT, 0, fbb.finished_data())?;
+        self.durable_append(rec_type::INITIAL_COMMIT, fbb.finished_data())?;
         let rec = flatbuffers::root::<wal::InitialCommit>(fbb.finished_data()).expect("just built");
         self.committed_sampler_checkpoint_id = rec.initial_checkpoint().checkpoint_id();
         Ok(())
@@ -254,7 +287,7 @@ impl CommitStream {
         // I19 on write: one record or nothing (spec §2.6a). Validated BEFORE the durable append.
         validate_generation_commit_i19(payload).map_err(CommitError::I19)?;
 
-        self.writer.append(rec_type::GENERATION_COMMIT, 0, payload)?;
+        self.durable_append(rec_type::GENERATION_COMMIT, payload)?;
         // Durable now (append fdatasync'd) — only now advance the watermarks.
         self.generation_durable_pos = last_output_pos;
         self.committed_sampler_checkpoint_id =
@@ -316,7 +349,7 @@ impl CommitStream {
             },
         );
         fbb.finish(icc, None);
-        self.writer.append(rec_type::INPUT_CHUNK_COMMIT, 0, fbb.finished_data())?;
+        self.durable_append(rec_type::INPUT_CHUNK_COMMIT, fbb.finished_data())?;
         // Durable now — and only now does the input watermark move.
         self.prefill_stable_pos = last_input_pos;
         self.last_commit_id = commit_id;

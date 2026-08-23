@@ -49,6 +49,13 @@ pub enum WalError {
     #[error("unknown CRITICAL record type {record_type} at offset {offset}; refusing to open")]
     UnknownCriticalRecord { record_type: u16, offset: u64 },
 
+    /// **Audit H9.** An earlier append failed mid-write or mid-`fdatasync`, so an unknown prefix
+    /// of a record may be on disk. Every later append is refused: writing a valid record behind a
+    /// partial one manufactures the mid-stream corruption the reader (H8) refuses to open.
+    /// Recovery is `WalScan` + `WalWriter::open_append`, which re-establishes what is durable.
+    #[error("writer poisoned by an earlier I/O error; the on-disk tail is unknown ({why})")]
+    WriterPoisoned { why: String },
+
     /// A GENERATION_COMMIT whose embedded sampler checkpoint violates I19's equalities
     /// (`generated_through == sampled_pos == last_output_pos`), checked on read (WAL-FORMAT §2).
     #[error("I19 violation at offset {offset}: {detail}")]

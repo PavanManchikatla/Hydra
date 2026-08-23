@@ -231,3 +231,119 @@ fn group_commit_crash_window_i19() {
     }
     assert!(matches!(WalScan::open(&bad_path), Err(WalError::I19Violation { .. })));
 }
+
+// ---------------------------------------------------------------------------------------------
+// (e) HEADER-BYTE corruption — the case this contract could not previously generate.
+//
+// **Standing rule 19: what this file could not see.** Every case above corrupts a record's
+// PAYLOAD or its TAG. Both keep the frame header intact, so `read_record` still parses the length
+// and returns `BadChecksum{total_len}` — which the scanner can step over to ask "is there a valid
+// record after this?". Corrupt the HEADER instead (the magic, or the declared length) and the
+// answer is `BadFraming`: the scanner had no way to step over an unknown number of bytes, so it
+// stopped and called everything from there on a torn tail. Silently. A log with one flipped magic
+// byte in the middle therefore recovered as "everything after that never happened", and
+// `open_append` would then TRUNCATE the file to that point — destroying durable records that were
+// on the platter and checksum-valid.
+//
+// A torn tail is at most ONE partially-written record, because records are appended one at a time
+// with an fdatasync between them. So the classification is decidable: if a checksum-valid record
+// exists anywhere after the damage, this is mid-stream corruption; and if the trailing region is
+// longer than one maximum record could be, it is not a tail either.
+// ---------------------------------------------------------------------------------------------
+
+/// The **magic** bytes of a middle record are corrupted. Valid records follow, on the platter,
+/// checksum-intact. This must be refused, not silently discarded.
+#[test]
+fn header_magic_corruption_mid_log_is_refused_not_treated_as_a_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> =
+        vec![b"one".to_vec(), b"two-two".to_vec(), b"three".to_vec(), b"four".to_vec(), b"five".to_vec()];
+    let (_path, full, boundaries) = build_log(dir.path(), &payloads);
+
+    let mut b = full.clone();
+    b[boundaries[2] as usize] ^= 0xFF; // first byte of record 3's magic
+    match WalScan::from_bytes(&b) {
+        Err(WalError::CorruptMidStream { offset }) => assert_eq!(offset, boundaries[2]),
+        Ok(scan) => panic!(
+            "a corrupt frame header mid-log was accepted as a torn tail: {} of {} records survived, \
+             durable_len {} (records 4-5 were on the platter and checksum-valid)",
+            scan.records.len(),
+            payloads.len(),
+            scan.durable_len
+        ),
+        Err(e) => panic!("expected CorruptMidStream, got {e}"),
+    }
+}
+
+/// The declared **payload length** of a middle record is corrupted to an absurd value. Same class:
+/// the frame no longer parses, so the old scanner stopped there.
+#[test]
+fn header_length_corruption_mid_log_is_refused_not_treated_as_a_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> =
+        vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec(), b"four".to_vec()];
+    let (_path, full, boundaries) = build_log(dir.path(), &payloads);
+
+    // Set record 2's payload_len beyond MAX_PAYLOAD_LEN => BadFraming at that offset.
+    let mut b = full.clone();
+    let len_off = boundaries[1] as usize + 8; // header: magic2 type2 flags2 reserved2 | len4
+    b[len_off..len_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(
+        matches!(WalScan::from_bytes(&b), Err(WalError::CorruptMidStream { .. })),
+        "a corrupt declared length mid-log must be refused, not read as a tail"
+    );
+
+    // …and a length corrupted to a SMALLER value, which makes the reader look for the tag inside
+    // the payload: framing parses, tag fails, and the bytes after are still valid records.
+    let mut b2 = full.clone();
+    b2[len_off..len_off + 4].copy_from_slice(&1u32.to_le_bytes());
+    assert!(
+        matches!(WalScan::from_bytes(&b2), Err(WalError::CorruptMidStream { .. })),
+        "a shrunken declared length mid-log must be refused"
+    );
+}
+
+/// **The control that keeps the two apart.** The same corruption in the LAST record is a genuine
+/// torn tail and must still be discarded — otherwise the fix above would turn every ordinary
+/// crash-during-append into an unopenable log, which is a worse failure than the one it fixes.
+#[test]
+fn header_corruption_in_the_last_record_is_still_a_discardable_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+    let (_path, full, boundaries) = build_log(dir.path(), &payloads);
+    let last_start = boundaries[boundaries.len() - 2] as usize;
+
+    let mut b = full.clone();
+    b[last_start] ^= 0xFF; // magic of the FINAL record
+    let scan = WalScan::from_bytes(&b).expect("a torn final record is a tail, not corruption");
+    assert_eq!(scan.records.len(), payloads.len() - 1);
+    assert_eq!(scan.durable_len, last_start as u64);
+    assert!(scan.truncated_tail);
+
+    // Garbage appended after a clean log (a partially-written record) is also a tail.
+    let mut b2 = full.clone();
+    b2.extend_from_slice(&[0xAB; 37]);
+    let scan2 = WalScan::from_bytes(&b2).expect("trailing garbage shorter than one record is a tail");
+    assert_eq!(scan2.records.len(), payloads.len());
+    assert!(scan2.truncated_tail);
+}
+
+/// **The tail is bounded to one maximum record.** A torn tail can only ever be one partially
+/// written record, so a trailing garbage region larger than that is not a tail — it is damage, and
+/// discarding it would silently drop however much durable data it covers.
+#[test]
+fn a_trailing_garbage_region_larger_than_one_max_record_is_refused() {
+    use hydra_wal::record::{record_size, MAX_PAYLOAD_LEN};
+    let dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = vec![b"one".to_vec(), b"two".to_vec()];
+    let (_path, full, _boundaries) = build_log(dir.path(), &payloads);
+
+    // One byte past the largest record that could ever have been mid-write.
+    let over = record_size(MAX_PAYLOAD_LEN as usize) + 1;
+    let mut b = full.clone();
+    b.resize(b.len() + over, 0xCD);
+    assert!(
+        matches!(WalScan::from_bytes(&b), Err(WalError::CorruptMidStream { .. })),
+        "trailing garbage longer than one max record cannot be a torn tail"
+    );
+}
