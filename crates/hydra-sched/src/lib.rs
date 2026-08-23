@@ -15,3 +15,4 @@ pub mod admission;
 pub mod capability;
 pub mod link;
 pub mod solver;
+pub mod stability;
