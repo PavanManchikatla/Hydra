@@ -93,16 +93,34 @@ pub enum Target {
     /// raw `from_bytes`, so the parser is still fuzzed directly rather than being hidden behind a
     /// signature check that will discard almost every case.
     Manifest,
+    /// `hydra_worker::bootstrap::Bootstrap::decode` — the worker's provisioning blob, which now
+    /// carries the manifest **trust anchor** (audit C1). Added by the rule-17 class sweep, where it
+    /// was found to be the **fourth** `Vec::with_capacity(declared)` instance (audit L2).
+    Bootstrap,
+    /// `hydra_wal::record::read_record` — the on-disk WAL record framing. Added by the rule-17
+    /// sweep: it was already allocation-free by construction (it borrows and length-checks before
+    /// slicing), but "clean by construction" is a claim, and rule 17 asks for a fuzz target rather
+    /// than a claim.
+    WalRecord,
 }
 
 impl Target {
-    pub const ALL: [Target; 4] = [Target::Gguf, Target::FrameHeader, Target::WireBody, Target::Manifest];
+    pub const ALL: [Target; 6] = [
+        Target::Gguf,
+        Target::FrameHeader,
+        Target::WireBody,
+        Target::Manifest,
+        Target::Bootstrap,
+        Target::WalRecord,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Target::Gguf => "gguf",
             Target::FrameHeader => "frame-header",
             Target::WireBody => "wire-body",
             Target::Manifest => "manifest",
+            Target::Bootstrap => "bootstrap",
+            Target::WalRecord => "wal-record",
         }
     }
     pub fn parse(name: &str) -> Option<Target> {
@@ -131,6 +149,8 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
         Target::FrameHeader => gen::frame_header_case(&mut rng),
         Target::WireBody => gen::wire_body_case(&mut rng),
         Target::Manifest => gen::manifest_case(&mut rng),
+        Target::Bootstrap => gen::bootstrap_case(&mut rng),
+        Target::WalRecord => gen::wal_record_case(&mut rng),
     };
     let input_len = input.len();
 
@@ -174,6 +194,28 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
                 for sh in &m.shards {
                     let _ = sh.tensors.len();
                 }
+            }
+        }
+        Target::Bootstrap => {
+            // A provisioning blob is untrusted input: it arrives on the worker's filesystem from
+            // whatever provisioned it, and since audit C1 it carries the manifest trust anchor —
+            // so a parser defect here is upstream of the trust decision, not beside it.
+            if let Ok(b) = hydra_worker::bootstrap::Bootstrap::decode_for_fuzz(&input) {
+                let _ = b.listen_addr.len();
+                let _ = b.cert_chain_der.len();
+            }
+        }
+        Target::WalRecord => {
+            // The on-disk record framing. `read_record` borrows rather than allocating, so the
+            // oracle here is the arithmetic — `record_size`, `pad_len`, and the tag slice bounds.
+            match hydra_wal::record::read_record(&input) {
+                hydra_wal::record::ReadStep::Record { header, payload, total_len } => {
+                    // A returned record must be self-consistent with the buffer it came from: if
+                    // it is not, the parser has handed out a slice it did not prove.
+                    assert!(total_len <= input.len(), "read_record returned total_len past the buffer");
+                    assert_eq!(payload.len(), header.payload_len as usize, "payload/header disagree");
+                }
+                _ => {}
             }
         }
     }));

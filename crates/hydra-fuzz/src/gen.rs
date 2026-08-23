@@ -337,3 +337,106 @@ pub fn manifest_case(rng: &mut Rng) -> Vec<u8> {
     }
     v
 }
+
+// ------------------------------------------------------------------------------------------
+// Bootstrap blob + WAL record (rule-17 class sweep)
+// ------------------------------------------------------------------------------------------
+
+/// A `Bootstrap` provisioning blob: a run of u32-length-prefixed strings and byte arrays, then a
+/// counted cert chain, then fixed-width fence-tuple fields, then optional trailing blocks.
+///
+/// The counted cert chain is where audit **L2** lived — the fourth `Vec::with_capacity(declared)`
+/// in the tree — so the generator aims declared counts and length prefixes at exactly that shape.
+pub fn bootstrap_case(rng: &mut Rng) -> Vec<u8> {
+    if rng.below(8) == 0 {
+        return noise(rng, 1024);
+    }
+    let mut v = Vec::with_capacity(512);
+    fn put_lp(v: &mut Vec<u8>, rng: &mut Rng, body: &[u8]) {
+        // Most of the time a truthful length; sometimes an enormous declared one with nothing
+        // behind it — the class this sweep exists for.
+        if rng.below(5) == 0 {
+            put_u32(v, nasty_len(rng) as u32);
+            v.extend_from_slice(&body[..body.len().min(2)]);
+        } else {
+            put_u32(v, body.len() as u32);
+            v.extend_from_slice(body);
+        }
+    }
+    put_lp(&mut v, rng, b"127.0.0.1:9000"); // listen_addr
+    put_lp(&mut v, rng, b"worker-s1"); // device_name
+    put_lp(&mut v, rng, &[0x30, 0x82, 0x01, 0x0a]); // ca_cert_der
+
+    // The cert chain: a declared count, then that many length-prefixed entries — the L2 lever.
+    let real = rng.below(3);
+    let declared = if rng.below(3) == 0 { nasty_len(rng) as u32 } else { real as u32 };
+    put_u32(&mut v, declared);
+    for _ in 0..real {
+        put_lp(&mut v, rng, &[0x30, 0x82, 0x02, 0x0b]);
+    }
+    put_lp(&mut v, rng, &[0x30, 0x53, 0x02, 0x01]); // key_pkcs8_der
+
+    // Fence-tuple fixed arrays (each itself length-prefixed by `arr` → `bytes`).
+    for n in [16usize, 32, 16, 16] {
+        let body: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+        put_lp(&mut v, rng, &body);
+    }
+    // A tail of assorted scalars + optional blocks; truncation is the interesting part.
+    for _ in 0..rng.below(12) {
+        put_u32(&mut v, rng.next_u64() as u32);
+    }
+    if rng.below(3) == 0 && !v.is_empty() {
+        let cut = rng.below(v.len() as u64) as usize;
+        v.truncate(cut);
+    }
+    v
+}
+
+/// A WAL record: `magic2 | type2 | flags2 | reserved2 | payload_len4 | payload | pad | blake3`.
+///
+/// `read_record` is allocation-free by construction — it borrows and length-checks before slicing —
+/// so the oracle here is the **arithmetic**: `record_size`, `pad_len`, and the tag slice bounds. A
+/// declared `payload_len` that disagrees with the buffer is the whole point.
+pub fn wal_record_case(rng: &mut Rng) -> Vec<u8> {
+    if rng.below(8) == 0 {
+        return noise(rng, 512);
+    }
+    let mut v = Vec::with_capacity(256);
+    // magic: mostly correct so the parser gets past the first gate.
+    let magic: u16 = if rng.below(16) == 0 { rng.next_u64() as u16 } else { 0x4857 };
+    v.extend_from_slice(&magic.to_le_bytes());
+    v.extend_from_slice(&(rng.below(8) as u16).to_le_bytes()); // record_type
+    v.extend_from_slice(&(rng.next_u64() as u16).to_le_bytes()); // flags
+    v.extend_from_slice(&(rng.next_u64() as u16).to_le_bytes()); // reserved
+
+    // payload_len: at, just over, and far beyond the cap; and truthful, so valid records occur too.
+    let real: usize = rng.below(64) as usize;
+    let declared: u32 = match rng.below(6) {
+        0 => u32::MAX,
+        1 => 64 * 1024 * 1024,     // exactly MAX_PAYLOAD_LEN
+        2 => 64 * 1024 * 1024 + 1, // just over
+        3 => rng.next_u64() as u32,
+        _ => real as u32,
+    };
+    v.extend_from_slice(&declared.to_le_bytes());
+    for _ in 0..real {
+        v.push(rng.byte());
+    }
+    // Padding to the 8-byte alignment the format uses, then a tag — sometimes correct in shape,
+    // never correct in value unless the record happens to be self-consistent.
+    let unpadded = 12 + real;
+    let pad = (8 - (unpadded % 8)) % 8;
+    for _ in 0..pad {
+        v.push(0);
+    }
+    if rng.below(8) != 0 {
+        for _ in 0..32 {
+            v.push(rng.byte());
+        }
+    }
+    if rng.below(4) == 0 && !v.is_empty() {
+        let cut = rng.below(v.len() as u64) as usize;
+        v.truncate(cut);
+    }
+    v
+}

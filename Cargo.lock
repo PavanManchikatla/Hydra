@@ -327,6 +327,7 @@ version = "0.10.2"
 dependencies = [
  "hydra-modelsvc",
  "hydra-proto",
+ "hydra-wal",
  "hydra-worker",
 ]
 

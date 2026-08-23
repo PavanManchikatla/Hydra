@@ -99,6 +99,34 @@ fn the_manifest_parser_survives_a_seeded_hostile_corpus() {
     }
 }
 
+/// The **bootstrap provisioning blob** (rule-17 sweep). Untrusted input that, since audit C1,
+/// carries the manifest trust anchor — so a parser defect here is upstream of the trust decision.
+/// This is where audit **L2**, the fourth `Vec::with_capacity(declared)`, was found.
+#[test]
+fn the_bootstrap_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::Bootstrap));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// The **on-disk WAL record framing** (rule-17 sweep). It was already allocation-free by
+/// construction — but "clean by construction" is a claim, and rule 17 asks for a target rather than
+/// a claim. The oracle is the arithmetic and the self-consistency of any record it hands back.
+#[test]
+fn the_wal_record_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::WalRecord));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
 /// The generator itself must produce **varied, non-trivial** inputs. Without this, every test above
 /// could pass because the fuzzer emits nothing but empty buffers — a green that means nothing. The
 /// same reason the D0 zero-traffic test is paired with a D1 control.
@@ -114,6 +142,8 @@ fn the_generator_produces_varied_nonempty_inputs() {
                 Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
                 Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
                 Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
+                Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
+                Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
             };
             total += input.len();
             lens.insert(input.len());
@@ -137,6 +167,8 @@ fn a_case_is_reproducible_from_seed_and_iteration_alone() {
                     Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
                     Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
                     Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
+                    Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
+                    Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
                 }
             };
             assert_eq!(build(iteration), build(iteration), "{} case {iteration} is not reproducible", target.name());

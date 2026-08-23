@@ -135,13 +135,23 @@ impl Bootstrap {
         w.0
     }
 
+    /// Fuzz entry point for the rule-17 class sweep. The blob is untrusted input — it arrives on
+    /// the worker's filesystem from whatever provisioned it, and since audit C1 it carries the
+    /// **manifest trust anchor**, so a parser defect here sits *upstream* of the trust decision.
+    pub fn decode_for_fuzz(buf: &[u8]) -> Result<Bootstrap, String> {
+        Self::decode(buf)
+    }
+
     fn decode(buf: &[u8]) -> Result<Bootstrap, String> {
         let mut r = Reader { b: buf, i: 0 };
         let listen_addr = r.str()?;
         let device_name = r.str()?;
         let ca_cert_der = r.bytes()?;
-        let n = r.u32()? as usize;
-        let mut cert_chain_der = Vec::with_capacity(n);
+        let n = r.u32()?;
+        // **Audit L2 — the FOURTH instance of the §7.28-D2 class** (GGUF, manifest, and now here).
+        // A declared count may never reserve more memory than the remaining input could justify;
+        // a DER cert entry costs at least its own 4-byte length prefix.
+        let mut cert_chain_der = Vec::with_capacity(r.reserve_for(n as u64, 4));
         for _ in 0..n {
             cert_chain_der.push(r.bytes()?);
         }
@@ -265,6 +275,16 @@ impl Reader<'_> {
     fn remaining(&self) -> bool {
         self.i < self.b.len()
     }
+    fn remaining_bytes(&self) -> usize {
+        self.b.len().saturating_sub(self.i)
+    }
+    /// Clamp an attacker-declared count to what the remaining input could justify (audit L2 /
+    /// standing rule 17 — the same invariant as `gguf::Cursor::reserve_for` and
+    /// `manifest::Reader::reserve_for`, deliberately spelled the same way in all three so the
+    /// class is recognisable at a glance).
+    fn reserve_for(&self, declared: u64, min_bytes_each: usize) -> usize {
+        (declared as usize).min(self.remaining_bytes() / min_bytes_each.max(1))
+    }
     fn u32(&mut self) -> Result<u32, String> {
         let end = self.i + 4;
         let s = self.b.get(self.i..end).ok_or("truncated u32")?;
@@ -285,7 +305,9 @@ impl Reader<'_> {
     }
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let n = self.u32()? as usize;
-        let end = self.i + n;
+        // Bounds-check BEFORE `to_vec()` allocates, and use a checked add so the offset arithmetic
+        // cannot wrap a hostile length back into range (audit L2 / rule 17).
+        let end = self.i.checked_add(n).ok_or("bytes length overflows")?;
         let s = self.b.get(self.i..end).ok_or("truncated bytes")?;
         self.i = end;
         Ok(s.to_vec())
