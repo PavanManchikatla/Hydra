@@ -122,7 +122,16 @@ impl Bootstrap {
         }
         // P2·10b shard-manifest path (append-only, after the forwarding block): empty ⇒ this
         // worker loads a full model, exactly as before. An older bootstrap simply ends here.
-        w.str(self.cfg.shard_manifest.as_deref().unwrap_or(""));
+        // **Audit C1:** the manifest path travels WITH its trusted signing key. A bootstrap that
+        // carried only the path would let a provisioner hand a worker a manifest without saying
+        // whose signature counts — which is how the self-attesting `verify()` stayed unnoticed.
+        match &self.cfg.shard_manifest {
+            Some(sm) => {
+                w.str(&sm.path);
+                w.0.extend_from_slice(&sm.trusted_signer);
+            }
+            None => w.str(""),
+        }
         w.0
     }
 
@@ -180,8 +189,19 @@ impl Bootstrap {
         };
         // P2·10b shard-manifest path (append-only): older bootstraps end here → `None`.
         let shard_manifest = if r.remaining() {
-            let s = r.str()?;
-            (!s.is_empty()).then_some(s)
+            let path = r.str()?;
+            if path.is_empty() {
+                None
+            } else {
+                // A shard path with no trusted key is REFUSED, not defaulted. There is no key this
+                // code could substitute that would be safe (C1).
+                let key: [u8; 32] = r.raw32().map_err(|_| {
+                    "bootstrap names a shard manifest but carries no trusted signing key (audit C1): \
+                     a shard path without a trust anchor is refused, never defaulted"
+                        .to_string()
+                })?;
+                Some(crate::worker::ShardManifestConfig { path, trusted_signer: key })
+            }
         } else {
             None
         };
@@ -269,6 +289,13 @@ impl Reader<'_> {
         let s = self.b.get(self.i..end).ok_or("truncated bytes")?;
         self.i = end;
         Ok(s.to_vec())
+    }
+    /// A fixed 32 raw bytes with no length prefix (the trusted signing key trailer).
+    fn raw32(&mut self) -> Result<[u8; 32], String> {
+        let end = self.i + 32;
+        let s = self.b.get(self.i..end).ok_or("truncated 32-byte key")?;
+        self.i = end;
+        Ok(s.try_into().unwrap())
     }
     fn arr<const N: usize>(&mut self) -> Result<[u8; N], String> {
         self.bytes()?.try_into().map_err(|_| format!("expected {N}-byte array"))

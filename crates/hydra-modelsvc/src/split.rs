@@ -192,8 +192,11 @@ mod tests {
         assert!(!n1.contains(&"token_embd.weight"));
         assert!(n1.iter().any(|n| n.starts_with("blk.3.")));
 
-        // Manifest: signed, verifies, covers both shards, records the right layer ranges.
-        out.manifest.verify().expect("manifest verifies");
+        // Manifest: signed, verifies **against the key this test generated** (C1 — there is no
+        // argument-less `verify()`; the trust anchor is always the caller's), covers both shards,
+        // records the right layer ranges.
+        let trusted = crate::manifest::public_key_of(&kp);
+        out.manifest.verify_against(&trusted).expect("manifest verifies against the trusted signer");
         assert_eq!(out.manifest.n_layer_total, 4);
         assert_eq!(out.manifest.shards[0].layer_first, 0);
         assert_eq!(out.manifest.shards[1].layer_last, 4);

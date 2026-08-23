@@ -48,7 +48,29 @@ struct SampledEntry {
     state_digest: [u8; 32],
 }
 
+/// Everything a worker needs to load a **verified** shard — the manifest path **and the cluster's
+/// trusted signing key**, together.
+///
+/// **Audit C1, structurally.** The trust anchor is not a second optional field beside the path; it
+/// is in the same struct, so `shard_manifest: Some(..)` cannot be written without answering *whose
+/// signature counts*. The previous shape — `Option<String>` naming only a path — made the anchor
+/// something a caller could simply not think about, and the code then fell back to the key embedded
+/// in the manifest itself.
+///
+/// The **H14** half of the binding needs no field here: the expected `manifest_hash` is already in
+/// `WorkerConfig::keys` (spec §1.1's fence tuple), which is exactly the value the cluster agreed on
+/// for this session. Taking it from anywhere else would be inventing a second source of truth.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShardManifestConfig {
+    /// Path to the signed manifest emitted by `hydra-modelsvc split`.
+    pub path: String,
+    /// The cluster's Ed25519 manifest-signing public key, provisioned at pairing.
+    pub trusted_signer: [u8; 32],
+}
+
 /// Static description of one worker's role in the pipeline.
+
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub keys: SessionKeys,
@@ -83,7 +105,8 @@ pub struct WorkerConfig {
     /// range vs this worker's configured range). Any failure **refuses the shard** — it never
     /// degrades to a full load or a control-plane-only worker, because a silent downgrade is
     /// exactly the attack the signature exists to stop. `None` ⇒ the pre-P2·10b full-model load.
-    pub shard_manifest: Option<String>,
+    /// Shard-loading configuration. **`Some` implies a trust anchor**: see [`ShardManifestConfig`].
+    pub shard_manifest: Option<ShardManifestConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,10 +147,18 @@ impl Engine {
         // weights are read, and a failure REFUSES — it never falls back to a full load or to a
         // control-plane-only worker. The missing-model case above is a dev-environment artifact;
         // this case is a trust failure, and the two must not share an outcome.
-        let model = match cfg.shard_manifest.as_deref() {
-            Some(manifest_path) => {
-                let verified =
-                    crate::shard::verify_shard(manifest_path, path, cfg.layer_first, cfg.layer_last)?;
+        let model = match cfg.shard_manifest.as_ref() {
+            Some(sm) => {
+                // The trust anchor is `sm.trusted_signer` (C1) and the identity binding is the
+                // session's own fence tuple (H14) — not a value invented here.
+                let verified = crate::shard::verify_shard(
+                    &sm.path,
+                    path,
+                    cfg.layer_first,
+                    cfg.layer_last,
+                    &crate::shard::TrustedSigner(sm.trusted_signer),
+                    &cfg.keys.manifest_hash,
+                )?;
                 crate::shard::load_verified_shard(&verified, cfg.n_gpu_layers)?
             }
             None => Model::load(path, cfg.n_gpu_layers)?,

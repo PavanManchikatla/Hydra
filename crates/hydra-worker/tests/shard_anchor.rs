@@ -20,9 +20,9 @@
 //! ```
 
 use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster};
-use hydra_worker::shard::{verify_shard, ShardRefused};
+use hydra_worker::shard::{verify_shard, ShardRefused, TrustedSigner};
 use hydra_worker::wire::SessionKeys;
-use hydra_worker::worker::WorkerConfig;
+use hydra_worker::worker::{ShardManifestConfig, WorkerConfig};
 
 /// `(stage0_shard, stage1_shard, manifest)` for the 2-stage `[0,12)` / `[12,24)` dev split.
 fn shard_set() -> Option<(String, String, String)> {
@@ -32,6 +32,32 @@ fn shard_set() -> Option<(String, String, String)> {
     let s1 = format!("{dir}/qwen2-stage1-L12_24.gguf");
     let mf = format!("{dir}/qwen2.manifest");
     [&s0, &s1, &mf].iter().all(|p| std::path::Path::new(p).exists()).then_some((s0, s1, mf))
+}
+
+/// The fixture's signing key, as the cluster would have it after pairing.
+///
+/// **Audit C1.** Every call below must name a trust anchor; there is no argument-less verification
+/// to fall back on. The fixture ships the dev signing key next to the shards, so the "cluster's
+/// pinned key" here is derived from it — the same value a real provisioner would hand a worker.
+fn trusted_signer() -> TrustedSigner {
+    let dir = std::env::var("HYDRA_TEST_SHARDS")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/shards2").to_string());
+    let pkcs8 = std::fs::read(format!("{dir}/qwen2.signing.pkcs8")).expect("fixture signing key");
+    TrustedSigner(hydra_modelsvc::manifest::pubkey_from_pkcs8(&pkcs8).expect("fixture pubkey"))
+}
+
+/// `blake3` of the manifest file — the value the session fence tuple's `manifest_hash` must carry
+/// for the **H14** identity binding to admit it.
+fn manifest_hash(manifest_path: &str) -> [u8; 32] {
+    *blake3::hash(&std::fs::read(manifest_path).expect("read manifest")).as_bytes()
+}
+
+/// Session keys whose fence tuple actually names this manifest (H14). Building them any other way
+/// is now a refusal, which is the point: a worker's session and its weights must agree on identity.
+fn keys_for(manifest_path: &str, seed: u8) -> SessionKeys {
+    let mut k = SessionKeys::dev(seed);
+    k.manifest_hash = manifest_hash(manifest_path);
+    k
 }
 
 #[tokio::test]
@@ -53,7 +79,10 @@ async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
     };
     let k = (n_layer / 2).max(1);
     assert_eq!(k, 12, "the committed shard fixture is the 24-layer dev model split at 12");
-    let keys = SessionKeys::dev(0xB2);
+    // H14: the fence tuple names this manifest. `SessionKeys::dev(0xB2)` alone would now be
+    // REFUSED — a valid signature says "one of ours", never "the one this session agreed on".
+    let keys = keys_for(&manifest, 0xB2);
+    let signer = trusted_signer();
     let n_ctx = tokens.len() as i32 + 8;
 
     let cluster = Cluster::new().unwrap();
@@ -66,13 +95,15 @@ async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
         keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(s0.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
-        recovery_start: false, shard_manifest: Some(manifest.clone()),
+        recovery_start: false,
+        shard_manifest: Some(ShardManifestConfig { path: manifest.clone(), trusted_signer: signer.0 }),
     };
     let s2_cfg = WorkerConfig {
         keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(s1.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
-        recovery_start: false, shard_manifest: Some(manifest.clone()),
+        recovery_start: false,
+        shard_manifest: Some(ShardManifestConfig { path: manifest.clone(), trusted_signer: signer.0 }),
     };
     let s1_addr = hydra_worker::pair::spawn_endpoint(s1_cfg, cluster.ca.server_config(&s1_id).unwrap());
     let s2_addr = hydra_worker::pair::spawn_endpoint(s2_cfg, cluster.ca.server_config(&s2_id).unwrap());
@@ -107,7 +138,7 @@ fn a_shard_whose_bytes_do_not_match_the_manifest_is_refused() {
     bytes[mid] ^= 0xFF;
     std::fs::write(&tampered, &bytes).unwrap();
 
-    let err = verify_shard(&manifest, tampered.to_str().unwrap(), 0, 12).unwrap_err();
+    let err = verify_shard(&manifest, tampered.to_str().unwrap(), 0, 12, &trusted_signer(), &manifest_hash(&manifest)).unwrap_err();
     assert!(
         matches!(err, ShardRefused::Blake3Mismatch { .. }),
         "a tampered shard must be REFUSED on its BLAKE3, got: {err}"
@@ -131,7 +162,7 @@ fn a_tampered_manifest_is_refused_on_its_signature() {
     raw[mid] ^= 0x01;
     std::fs::write(&bad, &raw).unwrap();
 
-    let err = verify_shard(bad.to_str().unwrap(), &s0, 0, 12).unwrap_err();
+    let err = verify_shard(bad.to_str().unwrap(), &s0, 0, 12, &trusted_signer(), &manifest_hash(bad.to_str().unwrap())).unwrap_err();
     assert!(
         matches!(err, ShardRefused::Signature { .. } | ShardRefused::ManifestMalformed { .. }),
         "a tampered manifest must be REFUSED (signature or structure), got: {err}"
@@ -147,7 +178,7 @@ fn a_shard_for_the_wrong_stage_is_refused() {
     };
     // The stage-0 shard is genuine and its manifest verifies — but this worker was configured to be
     // stage 1. Placement and configuration disagree; never silently follow one of them.
-    let err = verify_shard(&manifest, &s0, 12, 24).unwrap_err();
+    let err = verify_shard(&manifest, &s0, 12, 24, &trusted_signer(), &manifest_hash(&manifest)).unwrap_err();
     assert!(
         matches!(err, ShardRefused::RangeMismatch { have_first: 0, have_last: 12, want_first: 12, want_last: 24, .. }),
         "a genuine shard for the WRONG stage must be REFUSED, got: {err}"
@@ -167,7 +198,7 @@ fn an_unlisted_shard_file_is_refused() {
     let renamed = dir.join("qwen2-stage9-L0_12.gguf");
     std::fs::copy(&s0, &renamed).unwrap();
 
-    let err = verify_shard(&manifest, renamed.to_str().unwrap(), 0, 12).unwrap_err();
+    let err = verify_shard(&manifest, renamed.to_str().unwrap(), 0, 12, &trusted_signer(), &manifest_hash(&manifest)).unwrap_err();
     assert!(
         matches!(err, ShardRefused::NotInManifest { .. }),
         "a shard file the manifest does not list must be REFUSED, got: {err}"
@@ -182,9 +213,134 @@ fn a_verified_shard_reports_the_manifests_layer_range() {
         return;
     };
     // The manifest's layer-range map — not the worker's config — is what drives the load window.
-    let v0 = verify_shard(&manifest, &s0, 0, 12).expect("stage-0 shard verifies");
+    let v0 = verify_shard(&manifest, &s0, 0, 12, &trusted_signer(), &manifest_hash(&manifest)).expect("stage-0 shard verifies");
     assert_eq!((v0.layer_first, v0.layer_last, v0.n_layer_total), (0, 12, 24));
     // `-1` in the config means "to the model's last layer" and must resolve against the manifest.
-    let v1 = verify_shard(&manifest, &s1, 12, -1).expect("stage-1 shard verifies with layer_last=-1");
+    let v1 = verify_shard(&manifest, &s1, 12, -1, &trusted_signer(), &manifest_hash(&manifest)).expect("stage-1 shard verifies with layer_last=-1");
     assert_eq!((v1.layer_first, v1.layer_last, v1.n_layer_total), (12, 24, 24));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit Wave 1 — C1 / H13 / H14 regressions.
+// ---------------------------------------------------------------------------------------------
+
+/// **C1 — a manifest signed by a key the cluster does not trust is REFUSED.**
+///
+/// This is the finding, stated as a test. The previous `verify()` checked the signature against
+/// `manifest.signer_pubkey` — the key *carried inside the manifest*. An attacker generates a
+/// keypair, re-signs a manifest describing whatever shard bytes they like, and it verifies: the
+/// artifact carries its own answer key. Every later check — per-tensor BLAKE3, the layer-range map,
+/// the admission hashes — then validates against the attacker's numbers and passes cleanly.
+///
+/// Here the manifest is **genuinely, correctly signed** — just by the wrong key. Nothing about it
+/// is malformed. Only the trust anchor distinguishes it from the real one, which is exactly why an
+/// anchor that comes from the artifact is not an anchor.
+#[test]
+fn a_manifest_signed_by_an_untrusted_key_is_refused() {
+    let Some((s0, _s1, manifest)) = shard_set() else {
+        eprintln!("SKIP: no shards (dev artifact)");
+        return;
+    };
+    // Re-sign the real manifest's contents with an ATTACKER key. Structurally perfect, self-
+    // consistent, and verifiable against its own embedded pubkey — the old check's happy path.
+    let raw = std::fs::read(&manifest).unwrap();
+    let mut m = hydra_modelsvc::manifest::Manifest::from_bytes(&raw).expect("parse fixture manifest");
+    let (attacker_pkcs8, _) = hydra_modelsvc::manifest::generate_keypair().unwrap();
+    let attacker = hydra_modelsvc::manifest::keypair_from_pkcs8(&attacker_pkcs8).unwrap();
+    m.sign(&attacker);
+
+    let attacker_pub = hydra_modelsvc::manifest::public_key_of(&attacker);
+    // The self-attestation the old code performed still succeeds — proving the forgery is a good
+    // one and that this test's setup is real, not a broken manifest that would fail anything.
+    m.verify_against(&TrustedSigner(attacker_pub).0).expect("the forgery is internally consistent");
+
+    let dir = std::env::temp_dir().join("hydra-audit-c1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let forged = dir.join("qwen2.forged.manifest");
+    let forged_bytes = m.to_bytes().unwrap();
+    std::fs::write(&forged, &forged_bytes).unwrap();
+    let forged_hash = *blake3::hash(&forged_bytes).as_bytes();
+
+    // …and against the CLUSTER's key it is refused. Note the fence tuple is given the forgery's own
+    // hash, so H14 cannot be what rejects it — this isolates C1.
+    let err = verify_shard(forged.to_str().unwrap(), &s0, 0, 12, &trusted_signer(), &forged_hash)
+        .expect_err("a manifest signed by an untrusted key must be REFUSED");
+    assert!(matches!(err, ShardRefused::Signature { .. }), "expected a signature refusal, got: {err}");
+
+    // Control: the genuine manifest, same call shape, is accepted — so the refusal above is caused
+    // by the signer and not by a check that refuses everything.
+    verify_shard(&manifest, &s0, 0, 12, &trusted_signer(), &manifest_hash(&manifest))
+        .expect("control: the genuine, cluster-signed manifest verifies");
+
+    let _ = std::fs::remove_file(&forged);
+}
+
+/// **H14 — a genuine, cluster-signed manifest for a DIFFERENT model is refused.**
+///
+/// The cluster's key legitimately signs every model it publishes, so a valid signature means "this
+/// is one of ours" and never "this is the one this session agreed on". Without the identity
+/// binding, an attacker who can influence which manifest file a worker reads substitutes one
+/// genuine artifact for another — no forgery required.
+///
+/// Simulated here by presenting the real manifest against a fence tuple that names something else,
+/// which is precisely the observable the worker has.
+#[test]
+fn a_genuine_manifest_that_the_fence_tuple_does_not_name_is_refused() {
+    let Some((s0, _s1, manifest)) = shard_set() else {
+        eprintln!("SKIP: no shards (dev artifact)");
+        return;
+    };
+    let other_model = [0xAB; 32]; // some other model the cluster also signed
+
+    let err = verify_shard(&manifest, &s0, 0, 12, &trusted_signer(), &other_model)
+        .expect_err("a manifest the session's fence tuple does not name must be REFUSED");
+    assert!(
+        matches!(err, ShardRefused::Signature { .. }),
+        "expected an identity refusal (reported through the signature/verification gate), got: {err}"
+    );
+
+    // Control: the same manifest, same key, bound to the hash the fence tuple should carry.
+    verify_shard(&manifest, &s0, 0, 12, &trusted_signer(), &manifest_hash(&manifest))
+        .expect("control: bound to its own hash, the genuine manifest verifies");
+}
+
+/// **H13 — the signature is checked before the structure is parsed.**
+///
+/// Asserted by consequence rather than by instrumentation: a manifest whose *structure* is
+/// catastrophically hostile — a declared shard count of `u32::MAX` with nothing behind it — is
+/// refused on the **signature**, not on a parse error, because the parser never runs. If the order
+/// were reversed this would surface as `ManifestMalformed` and the attacker-directed parse would
+/// already have happened.
+#[test]
+fn an_unsigned_but_structurally_hostile_manifest_never_reaches_the_parser() {
+    let Some((s0, _s1, _mf)) = shard_set() else {
+        eprintln!("SKIP: no shards (dev artifact)");
+        return;
+    };
+    // Header magic + a plausible prefix, then an enormous declared count, then a 64-byte trailer so
+    // the shape is "a manifest" rather than "obviously truncated".
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"HYDRAMF1");
+    raw.extend_from_slice(&4u32.to_le_bytes());
+    raw.extend_from_slice(b"qwen");
+    raw.extend_from_slice(&24u32.to_le_bytes());
+    raw.extend_from_slice(&[0u8; 32 * 4]); // three admission hashes + signer pubkey
+    raw.extend_from_slice(&u32::MAX.to_le_bytes()); // n_shards — the amplification lever
+    raw.extend_from_slice(&[0u8; 64]); // signature trailer
+
+    let dir = std::env::temp_dir().join("hydra-audit-h13");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hostile = dir.join("qwen2.hostile.manifest");
+    std::fs::write(&hostile, &raw).unwrap();
+    let hostile_hash = *blake3::hash(&raw).as_bytes();
+
+    let err = verify_shard(hostile.to_str().unwrap(), &s0, 0, 12, &trusted_signer(), &hostile_hash)
+        .expect_err("an unsigned manifest must be refused");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, ShardRefused::Signature { .. }),
+        "H13: the refusal must come from the SIGNATURE gate, proving the parser never ran on \
+         unauthenticated bytes. Got: {msg}"
+    );
+    let _ = std::fs::remove_file(&hostile);
 }

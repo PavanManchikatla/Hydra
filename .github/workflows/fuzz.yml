@@ -66,6 +66,9 @@ jobs:
       - name: Build the fuzz driver (release)
         run: cargo build --release -p hydra-fuzz --bin hydra-fuzz
 
+      # `--target all` now covers four parsers (manifest added by audit Wave 1), so a fixed
+      # --seconds buys proportionally less time per target. The classify step below requires ALL
+      # FOUR to report, so a silently-dropped target is INCONCLUSIVE rather than a pass.
       - name: Fuzz (shard ${{ matrix.shard }}, distinct seed)
         env:
           SECONDS_PER_SHARD: ${{ github.event.inputs.seconds || '900' }}
@@ -92,7 +95,7 @@ jobs:
             exit 1
           fi
           # Every target must have reported, or the run covered less than it claims.
-          for t in gguf frame-header wire-body; do
+          for t in gguf frame-header wire-body manifest; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
           done
           if grep -qE '^CRASH ' "$LOG"; then

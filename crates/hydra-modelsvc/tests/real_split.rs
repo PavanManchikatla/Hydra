@@ -36,12 +36,14 @@ fn real_gguf_split_verifies_and_covers_every_layer_once() {
     let total_blk = g.tensors.iter().filter(|t| tensor_layer(&t.name).is_some()).count();
 
     let (pk8, _) = generate_keypair().unwrap();
+    let kp = keypair_from_pkcs8(&pk8).unwrap();
+    let trusted = hydra_modelsvc::manifest::public_key_of(&kp);
     let ranges = [(0u32, 14u32), (14, 21), (21, 24)]; // the P1·2 capability-weighted split
-    let out = split(&g, &ranges, &keypair_from_pkcs8(&pk8).unwrap()).unwrap();
+    let out = split(&g, &ranges, &kp).unwrap();
     assert_eq!(out.shards.len(), 3);
 
-    // The signed manifest verifies and covers the whole model.
-    out.manifest.verify().expect("manifest signature verifies");
+    // The signed manifest verifies **against the pinned key** (C1) and covers the whole model.
+    out.manifest.verify_against(&trusted).expect("manifest signature verifies against the trusted signer");
     assert_eq!(out.manifest.n_layer_total, 24);
     assert_eq!(out.manifest.shards[0].layer_first, 0);
     assert_eq!(out.manifest.shards[2].layer_last, 24);

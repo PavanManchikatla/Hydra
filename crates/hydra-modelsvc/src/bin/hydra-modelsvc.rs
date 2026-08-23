@@ -93,13 +93,43 @@ fn cmd_split(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a 64-hex-character Ed25519 public key, or read it from a file containing one.
+fn trusted_key(arg: &str) -> Result<[u8; 32], String> {
+    let text = if std::path::Path::new(arg).exists() {
+        std::fs::read_to_string(arg).map_err(|e| format!("read trusted key {arg}: {e}"))?
+    } else {
+        arg.to_string()
+    };
+    let hex: String = text.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    if hex.len() != 64 {
+        return Err(format!("trusted key must be 64 hex chars (32 bytes), got {} chars", hex.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|e| format!("bad hex: {e}"))?;
+    }
+    Ok(out)
+}
+
 fn cmd_verify(args: &[String]) -> Result<(), String> {
-    let mpath = args.get(2).ok_or("usage: verify <manifest> <shard_dir>")?;
-    let dir = args.get(3).ok_or("usage: verify <manifest> <shard_dir>")?;
-    let m = Manifest::from_bytes(&read(mpath)?).map_err(|e| e.to_string())?;
-    // 1. Signature.
-    m.verify().map_err(|e| format!("MANIFEST REFUSED: {e}"))?;
-    println!("signature: OK (signer {})", hex8(&m.signer_pubkey));
+    let usage = "usage: verify <manifest> <shard_dir> <trusted-pubkey-hex|keyfile>";
+    let mpath = args.get(2).ok_or(usage)?;
+    let dir = args.get(3).ok_or(usage)?;
+    // C1: the trusted key is REQUIRED, not optional. There is deliberately no "verify without a
+    // key" mode — it would print "signature: OK" for a manifest an attacker signed themselves,
+    // which is a stronger claim than no output at all and would be believed.
+    let trusted = trusted_key(args.get(4).ok_or(usage)?)?;
+
+    // H13: signature first, structure second. `verify_and_parse` needs the fence tuple's
+    // manifest_hash for the H14 identity binding; the CLI is an operator tool inspecting a file it
+    // already chose by path, so there is no session to bind to — it passes the file's own hash and
+    // SAYS SO, rather than pretending to a binding it cannot make.
+    let raw = read(mpath)?;
+    let self_hash = *blake3::hash(&raw).as_bytes();
+    let m = Manifest::verify_and_parse(&raw, &trusted, &self_hash)
+        .map_err(|e| format!("MANIFEST REFUSED: {e}"))?;
+    println!("signature: OK (signed by the pinned trusted key {})", hex8(&m.signer_pubkey));
+    println!("manifest blake3: {} — bind this into the session fence tuple's manifest_hash (H14)", hex8(&self_hash));
     // 2. Each shard's bytes hash to the manifest's recorded BLAKE3.
     for s in &m.shards {
         let bytes = read(&Path::new(dir).join(&s.file_name).to_string_lossy())?;

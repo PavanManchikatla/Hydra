@@ -244,3 +244,96 @@ fn noise(rng: &mut Rng, max_len: u64) -> Vec<u8> {
     let n = rng.below(max_len) as usize;
     (0..n).map(|_| rng.byte()).collect()
 }
+
+// ------------------------------------------------------------------------------------------
+// Signed shard manifest (audit Wave 1)
+// ------------------------------------------------------------------------------------------
+
+const MANIFEST_MAGIC: &[u8; 8] = b"HYDRAMF1";
+
+/// Build one manifest case.
+///
+/// The manifest is the third length-prefixed, counted-array format in the supply chain, and it was
+/// the one the M4·1 fuzz arm did not cover. Its hostile shapes are the same family as GGUF's:
+/// a declared `n_shards` or `n_tensors` with nothing behind it, and a string length that overruns.
+///
+/// Cases are emitted **unsigned by construction** — the generator never holds a signing key, so the
+/// production entry point (`verify_and_parse`) rejects essentially all of them at the signature.
+/// That is deliberate and is exactly what H13 asks to be true: rejection must be cheap and must
+/// happen before the parser runs. The raw parser is fuzzed alongside it, so the structural code is
+/// still genuinely covered rather than shadowed by a gate that discards every input.
+pub fn manifest_case(rng: &mut Rng) -> Vec<u8> {
+    if rng.below(8) == 0 {
+        return noise(rng, 2048);
+    }
+    let mut v = Vec::with_capacity(512);
+    if rng.below(16) == 0 {
+        let mut m = *MANIFEST_MAGIC;
+        m[(rng.below(8)) as usize] ^= 1 << rng.below(8);
+        v.extend_from_slice(&m);
+    } else {
+        v.extend_from_slice(MANIFEST_MAGIC);
+    }
+
+    // architecture: a u32-prefixed string, sometimes with an enormous declared length.
+    if rng.below(5) == 0 {
+        put_u32(&mut v, rng.next_u64() as u32);
+        v.push(b'q');
+    } else {
+        let name = "qwen2";
+        put_u32(&mut v, name.len() as u32);
+        v.extend_from_slice(name.as_bytes());
+    }
+    put_u32(&mut v, rng.below(200) as u32); // n_layer_total
+    for _ in 0..4 {
+        // three admission hashes + the signer pubkey
+        for _ in 0..32 {
+            v.push(rng.byte());
+        }
+    }
+
+    // n_shards — the amplification lever, mismatched with what follows most of the time.
+    let real = rng.below(3);
+    let declared = if rng.below(3) == 0 { nasty_len(rng) as u32 } else { real as u32 };
+    put_u32(&mut v, declared);
+    for i in 0..real {
+        put_u32(&mut v, i as u32); // stage
+        put_u32(&mut v, rng.below(64) as u32); // layer_first
+        put_u32(&mut v, rng.below(64) as u32); // layer_last
+        if rng.below(4) == 0 {
+            put_u32(&mut v, rng.next_u64() as u32); // hostile file-name length
+            v.push(b'x');
+        } else {
+            let n = format!("s{i}.gguf");
+            put_u32(&mut v, n.len() as u32);
+            v.extend_from_slice(n.as_bytes());
+        }
+        for _ in 0..32 {
+            v.push(rng.byte()); // shard_blake3
+        }
+        let real_t = rng.below(3);
+        let declared_t = if rng.below(3) == 0 { nasty_len(rng) as u32 } else { real_t as u32 };
+        put_u32(&mut v, declared_t);
+        for t in 0..real_t {
+            let n = format!("blk.{t}.weight");
+            put_u32(&mut v, n.len() as u32);
+            v.extend_from_slice(n.as_bytes());
+            for _ in 0..32 {
+                v.push(rng.byte());
+            }
+        }
+    }
+
+    // The 64-byte signature trailer — usually present (so the shape is "a manifest"), sometimes
+    // short so the split-before-parse path sees a truncated file.
+    if rng.below(6) != 0 {
+        for _ in 0..64 {
+            v.push(rng.byte());
+        }
+    }
+    if rng.below(4) == 0 && !v.is_empty() {
+        let cut = rng.below(v.len() as u64) as usize;
+        v.truncate(cut);
+    }
+    v
+}

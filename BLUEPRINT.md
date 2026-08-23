@@ -40,6 +40,13 @@
 7. **Model format:** GGUF, Q4_K_M reference quantization. A `hydra-modelsvc` tool splits a GGUF into per-stage shard files + signed manifest (per-tensor BLAKE3, tokenizer hash, chat-template hash, inference-config hash). Content-addressed tensor cache is M4, not MVP.
 8. **KV cache:** contiguous per-session, `q8_0` default. No paged attention, no TurboQuant in v1 (feature-flag slot reserved).
 9. **Security (v1 boundary = one trusted household):** per-device Ed25519 identity, mTLS with a cluster CA created at pairing (QR/PIN), signed placement manifests, hard frame/tensor size caps validated before allocation, API auth token + Host/Origin validation, never bind 0.0.0.0 by default.
+   > **⚑ THE HONEST-WORKER ASSUMPTION (ruled 2026-08-23 after the external security audit; normative).** **v1 assumes every certificate holder is honest.** mTLS and signed manifests protect against **outsiders and accidents** — an unpaired machine, a tampered model file, a browser on the LAN, a corrupted frame. They do **not** protect against a **compromised stage**: a worker holding a valid cluster certificate can lie about its computation, and v1 has no mechanism that would detect it.
+   >
+   > **This is written down because the identity story was quietly implying it away.** "Per-device Ed25519 identity + mTLS + signed manifests" reads like a defence against a malicious participant, and it is not one; it is a defence against a *non*-participant. An assumption that everyone infers but nobody states is the kind that gets designed against by accident and then relied on by mistake.
+   >
+   > **The assumption is load-bearing, and naming what rests on it is the point:** teacher-forced recovery trusts a survivor's replayed boundaries; the placement solver trusts reported capability; `BOUNDARY_COPY` durability trusts the copier; the sampler at S_P is the single source of sampled tokens. Each is correct *given* honest workers and has no fallback without them.
+   >
+   > **Worker-compromise resistance is v2 scope** (attested boundaries, redundant recomputation, or a quorum over stages — all of which change the protocol, not just the code). **It is not a v1 gap to be fixed quietly; it is a v1 boundary to be stated loudly.** The audit's criticals were fixed regardless, because none of them depend on worker trust: they are reachable by an outsider, a hostile file, or an accident.
 10. **Out of scope for this blueprint (do not build):** phones as workers, WAN/NAT traversal, speculative decoding, MoE, beam search, paged KV, multi-session, coordinator election, public swarms. Reserved hooks exist in the spec; leave them as typed-but-unused fields.
 
 ## 2. Repository layout

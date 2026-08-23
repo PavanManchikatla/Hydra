@@ -4,7 +4,10 @@
 //! manifest carrying per-tensor BLAKE3, the three admission hashes, and the **layer-range map**.
 //! This module is the consuming half: before a worker loads any shard weights it
 //!
-//! 1. verifies the **manifest signature** — an unsigned or tampered manifest is refused;
+//! 1. verifies the **manifest signature against the cluster's PINNED signing key**, before parsing
+//!    a single byte of structure, and checks that `blake3(manifest)` is the one this session's
+//!    fence tuple names — an unsigned, foreign-signed, tampered, or substituted manifest is refused
+//!    (audit C1 / H13 / H14);
 //! 2. finds **this shard's entry** by file name — an unlisted shard file is refused;
 //! 3. verifies the **shard bytes' BLAKE3** against the entry — a modified shard is refused;
 //! 4. cross-checks the entry's **layer range against the worker's configured range** — a shard
@@ -18,6 +21,15 @@
 
 use hydra_engine_sys::Model;
 use hydra_modelsvc::manifest::{Manifest, ShardEntry};
+
+/// The cluster's manifest-signing identity, provisioned at pairing alongside the mTLS identity.
+///
+/// **C1 — this type exists so the trust anchor cannot be omitted.** The previous code called
+/// `manifest.verify()`, which checked the signature against the key *embedded in the manifest*:
+/// a self-attestation that any attacker can produce with `generate_keypair()`. Making the anchor a
+/// required parameter means "verified" cannot be reached without answering *by whom*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedSigner(pub [u8; 32]);
 
 /// Why a shard was refused. Every variant is fatal — there is no "load it anyway" path.
 #[derive(Debug, thiserror::Error)]
@@ -66,14 +78,17 @@ pub fn verify_shard(
     shard_path: &str,
     want_first: i32,
     want_last: i32,
+    trusted: &TrustedSigner,
+    expected_manifest_hash: &[u8; 32],
 ) -> Result<VerifiedShard, ShardRefused> {
-    // 1. Signature — before anything else is trusted, including the file names in the manifest.
+    // 1. Signature against the PINNED key, checked BEFORE the structure is parsed, and identity
+    //    bound to the session's fence tuple. The old comment here said "before anything else is
+    //    trusted" while the code parsed the whole structure first and then checked a signature
+    //    against the manifest's own embedded key — the comment described the intent, the code did
+    //    neither. `verify_and_parse` is now the only way in (audit C1 / H13 / H14).
     let raw = std::fs::read(manifest_path)
         .map_err(|source| ShardRefused::ManifestUnreadable { path: manifest_path.into(), source })?;
-    let manifest = Manifest::from_bytes(&raw)
-        .map_err(|e| ShardRefused::ManifestMalformed { path: manifest_path.into(), msg: e.to_string() })?;
-    manifest
-        .verify()
+    let manifest = Manifest::verify_and_parse(&raw, &trusted.0, expected_manifest_hash)
         .map_err(|e| ShardRefused::Signature { path: manifest_path.into(), msg: e.to_string() })?;
 
     // 2. This shard's entry, by file name.

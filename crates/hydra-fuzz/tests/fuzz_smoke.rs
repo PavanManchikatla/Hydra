@@ -85,6 +85,20 @@ fn the_wire_body_parser_survives_a_seeded_hostile_corpus() {
     }
 }
 
+/// The signed shard manifest — the third length-prefixed counted-array format in the supply chain,
+/// and the one M4·1's arm did not cover (audit Wave 1). Its `verify_and_parse` must reject an
+/// unsigned case *before* the parser runs, and the raw parser must survive the case anyway.
+#[test]
+fn the_manifest_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::Manifest));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
 /// The generator itself must produce **varied, non-trivial** inputs. Without this, every test above
 /// could pass because the fuzzer emits nothing but empty buffers — a green that means nothing. The
 /// same reason the D0 zero-traffic test is paired with a D1 control.
@@ -99,6 +113,7 @@ fn the_generator_produces_varied_nonempty_inputs() {
                 Target::Gguf => hydra_fuzz::gen::gguf_case(&mut rng),
                 Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
                 Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
+                Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
             };
             total += input.len();
             lens.insert(input.len());
@@ -121,6 +136,7 @@ fn a_case_is_reproducible_from_seed_and_iteration_alone() {
                     Target::Gguf => hydra_fuzz::gen::gguf_case(&mut rng),
                     Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
                     Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
+                    Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
                 }
             };
             assert_eq!(build(iteration), build(iteration), "{} case {iteration} is not reproducible", target.name());

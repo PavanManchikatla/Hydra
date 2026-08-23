@@ -84,15 +84,25 @@ pub enum Target {
     FrameHeader,
     /// `hydra_worker::wire::decode` — the FlatBuffers body + F1 fence, post-header.
     WireBody,
+    /// `hydra_modelsvc::manifest` — the **signed shard manifest**, added by audit Wave 1.
+    ///
+    /// This target exists because the M4·1 fuzz arm covered the GGUF parser and the wire, and left
+    /// the manifest parser — reached from the same untrusted supply chain, with the same
+    /// length-prefixed counted-array shape that produced §7.28 D2 — untouched. It exercises both
+    /// entry points deliberately: `verify_and_parse`, which must reject before parsing, and the
+    /// raw `from_bytes`, so the parser is still fuzzed directly rather than being hidden behind a
+    /// signature check that will discard almost every case.
+    Manifest,
 }
 
 impl Target {
-    pub const ALL: [Target; 3] = [Target::Gguf, Target::FrameHeader, Target::WireBody];
+    pub const ALL: [Target; 4] = [Target::Gguf, Target::FrameHeader, Target::WireBody, Target::Manifest];
     pub fn name(self) -> &'static str {
         match self {
             Target::Gguf => "gguf",
             Target::FrameHeader => "frame-header",
             Target::WireBody => "wire-body",
+            Target::Manifest => "manifest",
         }
     }
     pub fn parse(name: &str) -> Option<Target> {
@@ -120,6 +130,7 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
         Target::Gguf => gen::gguf_case(&mut rng),
         Target::FrameHeader => gen::frame_header_case(&mut rng),
         Target::WireBody => gen::wire_body_case(&mut rng),
+        Target::Manifest => gen::manifest_case(&mut rng),
     };
     let input_len = input.len();
 
@@ -146,6 +157,24 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
             let keys = hydra_worker::wire::SessionKeys::dev(0x5E);
             let _ = hydra_worker::wire::decode(&input, &keys);
             let _ = hydra_worker::wire::is_fwd_frame(&input);
+        }
+        Target::Manifest => {
+            // The production entry point: must refuse before parsing (H13). A fixed trust anchor
+            // and fixed expected hash mean essentially every case is rejected — which is the point,
+            // since this arm is asserting that rejection is *cheap and total*, not that it parses.
+            const TRUSTED: [u8; 32] = [0x11; 32];
+            const EXPECTED: [u8; 32] = [0x22; 32];
+            let _ = hydra_modelsvc::manifest::Manifest::verify_and_parse(&input, &TRUSTED, &EXPECTED);
+            // …and the parser directly, so the structural code is genuinely covered rather than
+            // shadowed by the signature gate. Walk the accessors on success: a parser that accepts
+            // a hostile manifest and then hands out an inconsistent structure has moved the crash,
+            // not prevented it.
+            if let Ok(m) = hydra_modelsvc::manifest::Manifest::from_bytes(&input) {
+                let _ = m.canonical_bytes();
+                for sh in &m.shards {
+                    let _ = sh.tensors.len();
+                }
+            }
         }
     }));
 
