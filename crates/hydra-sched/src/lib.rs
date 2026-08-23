@@ -11,6 +11,7 @@
 //! The measurement itself (running real decode steps through the engine) lives in the
 //! `hydra-bench` binary, which owns the engine dependency and feeds its samples here.
 
+pub mod admission;
 pub mod capability;
 pub mod link;
 pub mod solver;
