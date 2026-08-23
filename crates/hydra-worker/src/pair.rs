@@ -448,7 +448,10 @@ pub async fn time_generation_pipeline(
     let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
     let cfg_hash = config.hash();
 
-    // Setup and prefill are excluded by construction — the timer below starts after both.
+    // Setup, activation (audit C4) and prefill are excluded by construction — the timer below
+    // starts after all three, so the measurement is unchanged in kind.
+    activate(&mut c1, fence, 0, 0, 1).await?;
+    activate(&mut c2, fence, 0, 0, 1).await?;
     prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
     let mut per_token = Vec::with_capacity(n_steps);
@@ -512,6 +515,57 @@ where
     Ok(())
 }
 
+/// **Run the activation transaction on one stage connection (audit C4).**
+///
+/// `COMMIT_ACTIVATION{tuple}` → `ACTIVATION_COMMITTED`, then `FINALIZE_ACTIVATION` →
+/// `ACTIVATION_FINALIZED`, i.e. spec §6.6 steps 2 and 4 through the **real** stage SM. The stage
+/// ends in `ACTIVE_FINAL`, which is the only state from which it may serve a sampled decode.
+///
+/// # Why the drivers in this module call it now, and did not before
+///
+/// Before audit C4 the data plane was unfenced, so every driver here dialled a freshly-spawned
+/// worker sitting in `FROZEN_READY` and immediately sent `APPLY_TOKEN`/`FWD` — and was served.
+/// **That is not a shortcut in the harness; it was the defect, expressed as a habit:** the
+/// harness could not distinguish "a stage that has been activated" from "a stage that has not",
+/// because nothing in the worker did either. Every equivalence anchor in this crate was therefore
+/// structurally incapable of noticing an unfenced data plane, which is why a critical finding sat
+/// under a fully green suite. The drivers now activate first, so what they exercise is the state
+/// the product actually serves from.
+pub async fn activate<S>(
+    c: &mut hydra_transport::framed::Conn<S>,
+    fence: &SessionFence,
+    epoch: hydra_state::Epoch,
+    recovery_id: hydra_state::RecoveryId,
+    attempt: hydra_state::AttemptId,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let tuple = hydra_state::ActivationTuple {
+        kind: hydra_state::ActivationKind::Initial,
+        epoch,
+        recovery_id,
+        attempt,
+        sampler_checkpoint_id: INITIAL_CHECKPOINT_ID,
+    };
+    c.send(0, &wire::encode_commit_activation(fence, &tuple, 1)).await.map_err(|e| format!("COMMIT_ACTIVATION send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("COMMIT_ACTIVATION recv: {e}"))?.payload, fence)
+        .map_err(|e| e.to_string())?
+        .1
+    {
+        Msg::ActivationCommitted(_) => {}
+        other => return Err(format!("expected ACTIVATION_COMMITTED, got {other:?}")),
+    }
+    c.send(0, &wire::encode_finalize_activation(fence, &tuple, 1)).await.map_err(|e| format!("FINALIZE_ACTIVATION send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("FINALIZE_ACTIVATION recv: {e}"))?.payload, fence)
+        .map_err(|e| e.to_string())?
+        .1
+    {
+        Msg::ActivationFinalized => Ok(()),
+        other => Err(format!("expected ACTIVATION_FINALIZED, got {other:?}")),
+    }
+}
+
 async fn expect_fwd<S>(c: &mut hydra_transport::framed::Conn<S>, fence: &SessionFence, pos: i64) -> Result<Vec<f32>, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -549,6 +603,11 @@ pub async fn run_generation(
     let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
     let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
     let cfg_hash = config.hash();
+
+    // Audit C4: both stages are activated before anything is served — a sampled decode is legal
+    // only from ACTIVE_FINAL (I20), and this is the transaction that puts them there.
+    activate(&mut c1, fence, 0, 0, 1).await?;
+    activate(&mut c2, fence, 0, 0, 1).await?;
 
     prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
@@ -599,6 +658,11 @@ pub async fn run_direct_fwd_generation(
     let mut cp = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s_p (control): {e}"))?;
     let cfg_hash = config.hash();
 
+    // Audit C4: activate both stages before serving. S1's own control connection is `c1`; S_P's is
+    // the concurrent `cp` — the same two connections the generation then uses.
+    activate(&mut c1, fence, 0, 0, 1).await?;
+    activate(&mut cp, fence, 0, 0, 1).await?;
+
     // Prefill (teacher-forced NO_SAMPLE): C→S1 APPLY_TOKEN; S1 forwards the boundary direct to S_P;
     // S_P's APPLIED_ACK is relayed back up S1→C.
     for (pos, &tok) in prompt_tokens.iter().enumerate() {
@@ -640,6 +704,9 @@ pub async fn sample_next_twice(
 ) -> Result<(Msg, Msg), String> {
     let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
     let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    // Audit C4: SAMPLE_NEXT is serving, so the stages are activated first.
+    activate(&mut c1, fence, 0, 0, 1).await?;
+    activate(&mut c2, fence, 0, 0, 1).await?;
     prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
     let cfg_hash = config.hash();
     let fire = || wire::encode_sample_next(fence, 0, 0, &cfg_hash, INITIAL_CHECKPOINT_ID);

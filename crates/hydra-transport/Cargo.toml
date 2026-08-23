@@ -8,6 +8,10 @@ description = "Hydra transport: Transport trait + TCP+mTLS impl with cluster-CA 
 
 [dependencies]
 hydra-proto = { path = "../hydra-proto" }
+# Audit H4: `BoundPeer::authenticated_rank()` mints `hydra_state::AuthenticatedRank` — the only
+# way the activation quorum can learn a rank, since the wire carries none. One-way dep
+# (hydra-state does not depend on this crate), so no cycle; hydra-state stays pure.
+hydra-state = { path = "../hydra-state" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

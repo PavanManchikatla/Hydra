@@ -24,13 +24,13 @@ fn drive_happy_path(n: u16) -> Coordinator {
     step_ok(&mut c, WalDurable(Intent));
     step_ok(&mut c, ProceedSendCommit);
     for r in 0..n {
-        step_ok(&mut c, StageCommitted { rank: r, attempt: 1 });
+        step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(r), attempt: 1 });
     }
     step_ok(&mut c, ProceedWriteComplete);
     step_ok(&mut c, WalDurable(Complete));
     step_ok(&mut c, ProceedSendFinalize);
     for r in 0..n {
-        step_ok(&mut c, StageFinalized { rank: r, attempt: 1 });
+        step_ok(&mut c, StageFinalized { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(r), attempt: 1 });
     }
     step_ok(&mut c, ProceedBecomeServiceable);
     c
@@ -101,8 +101,8 @@ fn tlc1_crash_after_abort_never_completes_aborted_attempt() {
     step_ok(&mut c, WalDurable(Intent));
     step_ok(&mut c, ProceedSendCommit); // S7
     // pre-abort attempt-1 acks — these linger in the network past the abort
-    step_ok(&mut c, StageCommitted { rank: 0, attempt: 1 });
-    step_ok(&mut c, StageCommitted { rank: 1, attempt: 1 });
+    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
+    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
     step_ok(&mut c, ProceedAbort); // S8: durably ABORT attempt 1
     step_ok(&mut c, WalDurable(Abort));
     step_ok(&mut c, Crash); // S9
@@ -112,8 +112,8 @@ fn tlc1_crash_after_abort_never_completes_aborted_attempt() {
     assert_eq!(c.attempt(), 1, "attempt id unchanged across the aborted-attempt restart");
     assert!(c.attempt_aborted(1), "durable ABORT for attempt 1 persists across restart");
     // the lingering stale attempt-1 acks (TLC S12–S13) complete nothing under the guard
-    step_ok(&mut c, StageCommitted { rank: 0, attempt: 1 });
-    step_ok(&mut c, StageCommitted { rank: 1, attempt: 1 });
+    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
+    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
     assert!(!c.completed(), "no COMPLETE for an aborted attempt (I25)");
     assert!(invariants::check(&c).is_empty());
 }
@@ -129,8 +129,8 @@ fn mut4_completion_after_abort_is_caught_by_checker() {
     c.step(ProceedWriteIntent); // S6: attempt 1
     c.step(WalDurable(Intent));
     c.step(ProceedSendCommit); // S7
-    c.step(StageCommitted { rank: 0, attempt: 1 });
-    c.step(StageCommitted { rank: 1, attempt: 1 });
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
     c.step(ProceedAbort); // S8
     c.step(WalDurable(Abort));
     c.step(Crash); // S9
@@ -138,8 +138,8 @@ fn mut4_completion_after_abort_is_caught_by_checker() {
     assert_eq!(c.state(), CoordState::IntentDurable, "S10 Mut4: aborted attempt resurrected");
     assert_eq!(c.attempt(), 1, "the resurrected attempt is the aborted attempt 1");
     c.step(ProceedSendCommit); // S11: replay COMMIT for attempt 1
-    c.step(StageCommitted { rank: 0, attempt: 1 }); // S12–S13: stale acks now counted
-    c.step(StageCommitted { rank: 1, attempt: 1 });
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 }); // S12–S13: stale acks now counted
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
     c.step(ProceedWriteComplete); // S14: guard off → allowed
     c.step(WalDurable(Complete)); // COMPLETE written for an aborted attempt
     let v = invariants::check(&c);

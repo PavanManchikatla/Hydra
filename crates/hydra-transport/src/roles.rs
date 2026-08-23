@@ -178,5 +178,24 @@ pub struct BoundPeer {
     pub role: PeerRole,
 }
 
+impl BoundPeer {
+    /// **Audit H4 — the only source of a rank the activation quorum will accept.**
+    ///
+    /// `ACTIVATION_COMMITTED` and `ACTIVATION_FINALIZED` carry **no rank on the wire**, so a
+    /// coordinator that keys its ack set on anything the frame says is keying it on nothing: one
+    /// peer could be counted as a quorum. The rank lives here instead — in the role this peer's
+    /// **certificate** was bound to at `accept()` (C2) — and [`hydra_state::AuthenticatedRank`]
+    /// exists so the type system carries that provenance to the coordinator SM.
+    ///
+    /// `None` for a coordinator or durability-target peer: those roles have no stage rank, and a
+    /// quorum ack from them is not a rank to be guessed but an ack that should never be counted.
+    pub fn authenticated_rank(&self) -> Option<hydra_state::AuthenticatedRank> {
+        match self.role {
+            PeerRole::Stage { rank } => Some(hydra_state::AuthenticatedRank::from_authenticated_peer_role(rank)),
+            PeerRole::Coordinator | PeerRole::DurabilityTarget => None,
+        }
+    }
+}
+
 /// A role table plus the mTLS acceptor, so a listener cannot be constructed without one.
 pub type SharedRoleTable = Arc<RoleTable>;

@@ -21,14 +21,14 @@ use std::rc::Rc;
 use std::net::SocketAddr;
 
 use hydra_engine_sys::{Context, EngineError, Model, ENGINE_AVAILABLE};
-use hydra_state::{ActivationKind, ActivationTuple, Epoch, RecoveryId, Stage, StageEffect, StageEvent, StageRank};
+use hydra_state::{ActivationKind, ActivationTuple, Epoch, RecoveryId, Stage, StageEffect, StageEvent, StageRank, StageState};
 use hydra_transport::framed::Conn;
 use hydra_transport::tcp_mtls::{ClientConn, TcpMtls, TcpMtlsListener};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::durable::DurableForwarder;
 use crate::sampler::{Sampler, SamplerError, SamplingConfig};
-use crate::wire::{self, Msg, SessionFence, WireError};
+use crate::wire::{self, Msg, SessionFence, WireError, FenceView};
 use hydra_transport::roles::PeerRole;
 
 /// `ERR_FENCED` on the wire (`proto::ErrCode::ERR_FENCED`).
@@ -37,6 +37,9 @@ const ERR_FENCED: u16 = 1;
 const ERR_RECOVERY_COMPLETED: u16 = 3;
 /// `ERR_CHECKPOINT_MISMATCH` — sampler drift (spec §2.6b: fatal, never silently repaired).
 const ERR_CHECKPOINT_MISMATCH: u16 = 9;
+/// `ERR_GAP` — the data-plane position is neither the next one nor the retransmittable last one
+/// (spec §5 R2; audit M9). Its detail field is the stage's `applied_input_pos`.
+const ERR_GAP: u16 = 4;
 /// The config-defined initial checkpoint id the coordinator seeds S_P with (spec §1.4 boundary).
 pub const INITIAL_CHECKPOINT_ID: u64 = 1;
 
@@ -114,6 +117,12 @@ pub struct WorkerConfig {
 pub enum WorkerError {
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// **Audit C4.** A data-plane frame arrived for a stage that is not eligible to serve it: the
+    /// wrong epoch, the wrong stage generation, or a state that may not answer this frame class.
+    /// Answered on the wire as `ERR_FENCED` (the reply the fence tuple's `FenceState` exists for),
+    /// never by silently applying the frame.
+    #[error("REFUSED (audit C4 data-plane fence): {what} — frame {got}, stage {want}")]
+    DataPlaneFenced { what: &'static str, got: i64, want: i64 },
     /// **Audit C2.** The peer is authentic and bound to a role, but that role may not send this
     /// message family. Distinct from a fence mismatch: F1 asks *"is this frame for this session?"*,
     /// this asks *"may THIS peer send THIS?"* — and before the gate existed, nothing asked it.
@@ -277,6 +286,10 @@ pub struct Worker {
     /// Snapshot ring / `SAMPLED` cache keyed by output position — makes a duplicate `SAMPLE_NEXT`
     /// idempotent (I14) and holds `snapshot(q)` for each sampled q (spec §2.6a).
     sampled_ring: HashMap<i64, SampledEntry>,
+    /// **Audit M9 (I1 exactly-once apply, shard-scoped; R2).** The highest input position this
+    /// shard has applied, and the replies it answered with. See [`Worker::data_plane_idempotency`].
+    applied_frontier: i64,
+    last_apply: Option<(i64, Vec<Vec<u8>>)>,
 }
 
 impl Worker {
@@ -294,7 +307,16 @@ impl Worker {
         } else {
             None
         };
-        Ok(Worker { cfg, stage, engine, sampler, latest_logits: None, sampled_ring: HashMap::new() })
+        Ok(Worker {
+            cfg,
+            stage,
+            engine,
+            sampler,
+            latest_logits: None,
+            sampled_ring: HashMap::new(),
+            applied_frontier: -1,
+            last_apply: None,
+        })
     }
 
     pub fn has_engine(&self) -> bool {
@@ -319,18 +341,34 @@ impl Worker {
                     // A non-ingress stage never receives raw tokens (F1/precondition) — drop.
                     return Ok(vec![]);
                 }
-                let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
-                match eng.apply_token(token_id, input_pos)? {
-                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, input_pos, no_sample, &boundary)]),
-                    None => self.retain_and_ack(view.epoch, input_pos, no_sample),
+                if let Some(err) = self.data_plane_fence(&view, no_sample) {
+                    return Ok(err);
                 }
+                self.check_wire_pos("APPLY_TOKEN input_pos", input_pos)?;
+                if let Some(replies) = self.data_plane_idempotency(input_pos)? {
+                    return Ok(replies);
+                }
+                let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
+                let replies = match eng.apply_token(token_id, input_pos)? {
+                    Some(boundary) => vec![wire::encode_fwd(&self.cfg.fence, view.epoch, input_pos, no_sample, &boundary)],
+                    None => self.retain_and_ack(view.epoch, input_pos, no_sample)?,
+                };
+                Ok(self.note_apply(input_pos, replies))
             }
             Msg::Fwd { first_input_pos, no_sample, n_positions, n_embd, activations } => {
-                let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
-                match eng.apply_boundary(&activations, n_positions, n_embd, first_input_pos)? {
-                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, first_input_pos, no_sample, &boundary)]),
-                    None => self.retain_and_ack(view.epoch, first_input_pos, no_sample),
+                if let Some(err) = self.data_plane_fence(&view, no_sample) {
+                    return Ok(err);
                 }
+                self.check_wire_pos("FWD first_input_pos", first_input_pos)?;
+                if let Some(replies) = self.data_plane_idempotency(first_input_pos)? {
+                    return Ok(replies);
+                }
+                let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
+                let replies = match eng.apply_boundary(&activations, n_positions, n_embd, first_input_pos)? {
+                    Some(boundary) => vec![wire::encode_fwd(&self.cfg.fence, view.epoch, first_input_pos, no_sample, &boundary)],
+                    None => self.retain_and_ack(view.epoch, first_input_pos, no_sample)?,
+                };
+                Ok(self.note_apply(first_input_pos, replies))
             }
             Msg::SampleNext { output_pos, sampling_config_hash, expected_sampler_checkpoint_id } => {
                 self.on_sample_next(view.epoch, output_pos, &sampling_config_hash, expected_sampler_checkpoint_id)
@@ -339,10 +377,22 @@ impl Worker {
                 self.on_install_sampler_checkpoint(view.epoch, checkpoint_id, &snapshot)
             }
             Msg::CommitActivation(t) => Ok(self.step_control(StageEvent::RecvCommit { tuple: t })),
-            Msg::FinalizeActivation { attempt } => Ok(self.step_control(StageEvent::RecvFinalize { attempt })),
+            Msg::FinalizeActivation { attempt } => {
+                // Audit H2: the epoch travels to the SM, which checks it (the TLA+ action always
+                // did). `view.epoch` is the frame's own claim, checked against the stage's.
+                Ok(self.step_control(StageEvent::RecvFinalize { epoch: view.epoch, attempt }))
+            }
             Msg::ActivationCommitAbort { aborted_attempt } => Ok(self.step_control(StageEvent::RecvAbort { attempt: aborted_attempt })),
             Msg::BeginRecovery { base, target, recovery_id, truncate_to } => {
-                let effects = self.stage.step(StageEvent::RecvBegin { base, target, recovery_id, truncate_to });
+                // Audit H3: `n_ctx` is the stage's own fact, supplied so the SM can bound
+                // `truncate_to` — a sender never states the receiver's context window.
+                let effects = self.stage.step(StageEvent::RecvBegin {
+                    base,
+                    target,
+                    recovery_id,
+                    truncate_to,
+                    n_ctx: self.cfg.n_ctx as i64,
+                });
                 // I7a/I7b (§7.19 (b)): if the freeze is ACCEPTED, a **surviving** stage must discard the
                 // provisional tail the rest of the pipeline — rebuilt only to the durable frontier — can
                 // no longer justify. Mirror the SM's `applied`-truncation into the engine KV (`kv_truncate`
@@ -359,11 +409,17 @@ impl Worker {
                         let keep = i32::try_from(keep).map_err(|_| WorkerError::PreFfi { what: "BEGIN_RECOVERY truncate_to", value: truncate_to, bound: i32::MAX as i64 })?;
                         eng.ctx.kv_truncate(keep)?;
                     }
+                    // M9: the data-plane frontier follows the truncation — the positions above
+                    // `truncate_to` are gone from the KV, so the next legitimate apply is
+                    // `truncate_to + 1` and the cached reply for a discarded position must not be
+                    // re-servable.
+                    self.applied_frontier = self.applied_frontier.min(truncate_to);
+                    self.last_apply = None;
                     self.sampled_ring.clear();
                 }
                 Ok(effects.into_iter().filter_map(|eff| self.encode_effect(eff)).collect())
             }
-            Msg::CatchUpContext { goal_input_pos } => Ok(self.catch_up(goal_input_pos)),
+            Msg::CatchUpContext { goal_input_pos } => self.catch_up(goal_input_pos),
             // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them. The
             // durability-plane acks (DURABILITY_ACK / COMMIT_ACK / COMMIT_SYNC) are consumed by the
             // release-rule logic in the serve loop, not by `on_frame`; a stage worker that is not a
@@ -386,11 +442,35 @@ impl Worker {
     /// Drive the **real stage SM** through catch-up: step `RebuildStep{goal}` until it reaches
     /// `FROZEN_READY` (or stalls), then emit `CATCH_UP_READY`. The engine KV is rebuilt separately by
     /// the preceding `REBUILD_APPLY` (`APPLY_TOKEN` NO_SAMPLE) frames — this advances the SM's
-    /// control-plane frontier so activation can commit (spec §6.2). Bounded to `goal+2` steps so a
-    /// stuck SM cannot loop forever.
-    fn catch_up(&mut self, goal: i64) -> Vec<Vec<u8>> {
+    /// control-plane frontier so activation can commit (spec §6.2).
+    ///
+    /// **Audit H19 — the fence, applied first.** This loop advances `applied` by **one per
+    /// iteration** toward `goal`, so its trip count is `goal − applied`. `goal` arrives on the wire
+    /// as an `int64`, and the old bound was `0..goal.max(0) + 2` — so a `CATCH_UP_CONTEXT{goal =
+    /// i64::MAX − 2}` frame turned the **single-threaded** worker into a ~2⁶³-iteration spin: a
+    /// **self-DoS from an honest bug**, no forgery needed (C2 already binds the sender's role;
+    /// this is a corrupted or buggy `goal`, which the honest-worker assumption does not excuse).
+    ///
+    /// Two bounds, both cheap: (1) `goal` must lie in `[0, n_ctx]` — a catch-up target past the
+    /// context window is meaningless, and `n_ctx` is the worker's own fact (available even without
+    /// an engine); an out-of-range goal is **refused before the loop**, never clamped-and-run.
+    /// (2) the loop runs **only while the stage is in a rebuild state** (`Frozen`/`Rebuilding`) and
+    /// is hard-capped at `n_ctx + 1` iterations as a backstop, so a stage that stops advancing for
+    /// any reason exits immediately rather than spinning to `goal`.
+    fn catch_up(&mut self, goal: i64) -> Result<Vec<Vec<u8>>, WorkerError> {
+        let n_ctx = self.cfg.n_ctx as i64;
+        if goal < 0 || goal > n_ctx {
+            return Err(WorkerError::PreFfi { what: "CATCH_UP_CONTEXT goal (must be in [0, n_ctx])", value: goal, bound: n_ctx });
+        }
         let mut ready: Option<Vec<u8>> = None;
-        for _ in 0..goal.max(0) + 2 {
+        // The backstop is `n_ctx + 1`: each iteration advances `applied` by at most one over the
+        // `[0, n_ctx]` range, plus the final iteration that observes `applied == goal` and emits
+        // READY. It can only ever be reached if the stage stays in a rebuild state the whole way,
+        // which the loop condition already forbids past completion.
+        for _ in 0..=n_ctx {
+            if !matches!(self.stage.state(), StageState::Frozen | StageState::Rebuilding) {
+                break;
+            }
             for eff in self.stage.step(StageEvent::RebuildStep { goal }) {
                 if let StageEffect::Ready { recovery_id, applied, .. } = eff {
                     ready = Some(wire::encode_catch_up_ready(&self.cfg.fence, self.stage.epoch(), recovery_id, applied));
@@ -400,7 +480,137 @@ impl Worker {
                 break;
             }
         }
-        ready.into_iter().collect()
+        Ok(ready.into_iter().collect())
+    }
+
+    /// The wire-position bound (audit 1c), applied **before** the M9 sequencing check.
+    ///
+    /// Order matters and is deliberate: a position outside `[0, n_ctx)` — or one that does not fit
+    /// `i32` — is a **malformed** frame, while a position that is merely not the next one is a
+    /// **well-formed but out-of-order** frame. Reporting the first as `ERR_GAP` would tell a peer
+    /// to resume from a frontier when the real problem is that its position cannot exist; and
+    /// `i64::MIN` is not a gap in any meaningful sense. Bounds first, then sequencing.
+    fn check_wire_pos(&self, what: &'static str, pos: i64) -> Result<(), WorkerError> {
+        wire_pos(what, pos, self.cfg.n_ctx).map(|_| ())
+    }
+
+    /// **Audit M9 — per-position idempotency on the data plane (I1 / R2).**
+    ///
+    /// `Ok(Some(replies))` = answer these and do **not** touch the engine; `Ok(None)` = apply
+    /// normally; `Err`/`ERR_GAP` = refuse.
+    ///
+    /// # What the protocol requires, and what the code did
+    ///
+    /// I1 is *exactly-once apply, shard-scoped*, and R2 says **"shard-scoped idempotency; `ERR_GAP`
+    /// on gaps; in-shard recomputation never authorized."** The worker had neither: every
+    /// `APPLY_TOKEN`/`FWD` went to `hydra_apply`, so an **R1 retransmit** — the retry the protocol
+    /// itself prescribes when an ack is slow or lost — applied the same position to the KV a
+    /// second time. That is not a lost update; it is a *corrupted context*: position p appears
+    /// twice, every later position attends over a history that never existed, and the damage is
+    /// silent because both applies "succeed". A dropped ack on a healthy link is enough to trigger
+    /// it. Symmetrically, a **skipped** position was applied as if contiguous, so a lost frame
+    /// produced a KV with a hole rather than an error.
+    ///
+    /// # The rule
+    ///
+    /// * `p == frontier + 1` → apply, advance, remember the replies.
+    /// * `p == frontier` (the retransmit R1 actually produces — v1 is strictly one position in
+    ///   flight) → **re-send the cached replies byte-for-byte**. Not recomputed: R2 forbids
+    ///   recomputation, and a recomputed boundary is not guaranteed identical once the KV has
+    ///   moved on.
+    /// * `p < frontier` → refused as `ERR_GAP`. R1 retries *the identical logical frame*, which is
+    ///   the one still in flight, so an older position is not a legitimate retry; answering it
+    ///   would require either recomputation (forbidden) or an unbounded reply cache (the H20
+    ///   shape). Stated as a limit rather than papered over.
+    /// * `p > frontier + 1` → `ERR_GAP`, carrying the stage's own frontier so the coordinator can
+    ///   resume from `applied_pos + 1` (spec §2.3d's resume rule).
+    fn data_plane_idempotency(&self, pos: i64) -> Result<Option<Vec<Vec<u8>>>, WorkerError> {
+        let fence = &self.cfg.fence;
+        let epoch = self.stage.epoch();
+        if pos == self.applied_frontier + 1 {
+            return Ok(None);
+        }
+        if pos == self.applied_frontier {
+            if let Some((cached_pos, replies)) = &self.last_apply {
+                if *cached_pos == pos {
+                    return Ok(Some(replies.clone()));
+                }
+            }
+        }
+        Ok(Some(vec![wire::encode_error(fence, epoch, self.stage.attempt(), ERR_GAP)]))
+    }
+
+    /// Record a completed data-plane apply for [`Worker::data_plane_idempotency`].
+    fn note_apply(&mut self, pos: i64, replies: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        self.applied_frontier = pos;
+        self.last_apply = Some((pos, replies.clone()));
+        replies
+    }
+
+    /// **Audit C4 — the data plane is fenced.** Returns `Some(reply)` (an `ERR_FENCED` frame) iff
+    /// this stage may not serve the frame; `None` if it may.
+    ///
+    /// # What was missing, and why it was reachable
+    ///
+    /// Epoch, stage generation and serve-eligible state were checked on **control** frames only —
+    /// the stage SM does it in `step`. `APPLY_TOKEN` and `FWD` went **straight to the engine**:
+    /// `wire::decode` proves F1's *session* identity (cluster / manifest / model-instance /
+    /// session), and nothing looked at `session_epoch`, `stage_generation`, or what state the
+    /// stage was in. So a frame from a **superseded epoch** — an in-flight boundary from before a
+    /// recovery, a retransmit from a peer that has not learned of the new epoch — was applied to
+    /// the current KV, corrupting the very context the recovery had just rebuilt. No forgery
+    /// needed; C2 binds the sender's role and this is a *legitimate* sender's *stale* frame, which
+    /// is the accident case the honest-worker assumption explicitly does not excuse.
+    ///
+    /// # The rule, from spec §1.1 F1
+    ///
+    /// > *Accept iff cluster/manifest/placement match, `session_epoch` current, and the frame's
+    /// > shard is locally attached in a **serving-eligible role** — `ACTIVE_FINAL` for normal
+    /// > decode (never `PREACTIVE`); rebuilding/catching-up for those classes — with matching
+    /// > `stage_context_generation`.*
+    ///
+    /// So the eligibility depends on the frame **class**, and the two classes are distinguished on
+    /// the wire by `policy`:
+    ///
+    /// * **`SAMPLE` (normal decode)** — requires `ACTIVE_FINAL`. This is "serving", and I20 says
+    ///   serving happens only from a finalized activation.
+    /// * **`NO_SAMPLE` (teacher-forced / `REBUILD_APPLY`)** — the rebuild class: allowed while
+    ///   `FROZEN` / `REBUILDING` / `FROZEN_READY` (a stage rebuilding its KV *must* accept these,
+    ///   which is the whole point of catch-up) **and** in `ACTIVE_FINAL` (a finalized stage still
+    ///   answers teacher-forced prefill). **`PREACTIVE` and `LOST` are refused for both classes** —
+    ///   `PREACTIVE` because I20 names it explicitly, `LOST` because a lost shard has no KV to
+    ///   speak for.
+    ///
+    /// The **stage generation** is checked too: `stage_generation` in the fence identifies the
+    /// shard incarnation, so a frame addressed to the pre-crash incarnation must not be answered by
+    /// the replacement. `0` is the "unspecified" value every current encoder writes on data-plane
+    /// frames, so it is accepted; a **non-zero** value must match. That asymmetry is stated rather
+    /// than hidden: tightening it to "always match" is a wire-format change for every producer and
+    /// belongs with the coordinator driver that will actually populate the field.
+    fn data_plane_fence(&self, view: &FenceView, no_sample: bool) -> Option<Vec<Vec<u8>>> {
+        let fence = &self.cfg.fence;
+        let epoch = self.stage.epoch();
+        let fenced = |_what: &'static str| Some(vec![wire::encode_error(fence, epoch, self.stage.attempt(), ERR_FENCED)]);
+
+        if view.epoch != epoch {
+            return fenced("session_epoch");
+        }
+        if view.stage_generation != 0 && view.stage_generation != self.stage.generation() {
+            return fenced("stage_generation");
+        }
+        let eligible = match self.stage.state() {
+            StageState::ActiveFinal => true,
+            // The rebuild classes: a stage that is catching up must accept REBUILD_APPLY, and a
+            // stage awaiting activation must accept teacher-forced prefill — but neither may serve
+            // a sampled decode, because nothing has finalized it.
+            StageState::Frozen | StageState::Rebuilding | StageState::FrozenReady => no_sample,
+            // I20 names PREACTIVE: an activation that is committed but not finalized never serves.
+            StageState::Preactive | StageState::Lost => false,
+        };
+        if !eligible {
+            return fenced("serve-eligible state");
+        }
+        None
     }
 
     /// Final-stage apply tail: retain the position's logits (for a later `SAMPLE_NEXT`, I14) and

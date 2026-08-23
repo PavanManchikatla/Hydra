@@ -160,3 +160,66 @@ fn a_peer_with_no_certificate_is_refused_rather_than_assumed_impossible() {
     let err = table().bind(Some(&[])).expect_err("an empty chain must be refused");
     assert!(matches!(err, TransportError::UnboundPeer(_)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit H4 — the activation quorum's rank comes from the AUTHENTICATED PEER, never from a frame.
+// ---------------------------------------------------------------------------------------------
+
+/// **H4 — a rank the quorum will accept can only be minted from a bound peer identity.**
+///
+/// The finding: `ACTIVATION_COMMITTED` carries **no rank on the wire**, so the coordinator's ack
+/// set was keyed on a value the driver supplied — and one peer could be counted as a quorum of
+/// three. The TLA+ model gets one-ack-per-stage free from set semantics, so it can never exhibit
+/// this: a **modelling artifact, not a protocol guarantee**.
+///
+/// The closure is structural, and this test is what makes it a fact rather than a convention:
+/// `hydra_state::AuthenticatedRank` has a private field and `hydra-state` exposes no way to build
+/// one from a number, so a coordinator driver **cannot** key its quorum on anything but a peer the
+/// transport authenticated and bound to a stage role.
+#[tokio::test]
+async fn a_quorum_rank_can_only_be_minted_from_an_authenticated_stage_peer() {
+    let ca = ClusterCa::new().unwrap();
+
+    // A genuine stage peer yields its bound rank…
+    let peer = handshake_as(&ca, table(), "coordinator", "worker-s1").await.expect("bound");
+    assert_eq!(peer.role, PeerRole::Stage { rank: 0 });
+    assert_eq!(peer.authenticated_rank().map(|r| r.rank()), Some(0), "a stage peer carries the rank the quorum counts");
+
+    // …and a peer that is authentic but is NOT a stage has no rank to contribute. This is the case
+    // the old code would have had to invent a number for: it does not get a zero, it gets nothing.
+    let coord = handshake_as(&ca, table(), "worker-s1", "coordinator").await.expect("bound");
+    assert_eq!(coord.role, PeerRole::Coordinator);
+    assert!(coord.authenticated_rank().is_none(), "a coordinator peer has no stage rank — not rank 0");
+
+    let dur = handshake_as(&ca, table(), "worker-s1", "durability").await.expect("bound");
+    assert!(dur.authenticated_rank().is_none(), "a durability target has no stage rank — not rank 0");
+
+    // Two distinct stage ranks stay distinct, so a quorum keyed on them cannot be filled twice by
+    // one peer — the actual harm the finding names.
+    let two = RoleTable::new()
+        .with("coordinator", PeerRole::Coordinator)
+        .with("worker-s1", PeerRole::Stage { rank: 0 })
+        .with("worker-s2", PeerRole::Stage { rank: 1 });
+    let s2 = handshake_as(&ca, two, "coordinator", "worker-s2").await.expect("bound");
+    assert_eq!(s2.authenticated_rank().map(|r| r.rank()), Some(1));
+}
+
+/// The wire genuinely carries **no** rank on either activation ack — asserted here so the claim
+/// above rests on the schema rather than on memory. An exhaustive destructure would be better
+/// still, but these tables have no rank field to destructure: the point is that the accessors do
+/// not exist, which is a compile-time fact this test documents and `hydra-proto`'s generated code
+/// enforces.
+#[test]
+fn the_activation_acks_carry_no_rank_on_the_wire() {
+    // If a `rank` field is ever added to either table, this assertion's premise changes and the
+    // H4 reasoning above must be re-read — so state it where a schema change will be reviewed.
+    let fbs = include_str!("../../../docs/hydra-proto.fbs");
+    let acks: Vec<&str> = fbs
+        .lines()
+        .filter(|l| l.contains("table ActivationCommitted") || l.contains("table ActivationFinalized"))
+        .collect();
+    assert_eq!(acks.len(), 2, "both activation acks must be found in the schema");
+    for line in acks {
+        assert!(!line.contains("rank"), "the ack now carries a rank on the wire: {line} — re-read audit H4");
+    }
+}

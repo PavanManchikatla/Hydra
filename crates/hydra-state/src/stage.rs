@@ -23,15 +23,21 @@ pub enum StageState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StageEvent {
     /// `BEGIN_RECOVERY{base, target, recovery_id, truncate_to}` — the three-case transition (I11).
-    RecvBegin { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
+    ///
+    /// **Audit H3:** `n_ctx` accompanies the message because the stage must bound `truncate_to`
+    /// against *its own* context window before acting on it — see [`Stage::step`]'s `RecvBegin`
+    /// arm. It is the stage's fact, never the sender's, so it is not a wire field.
+    RecvBegin { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64, n_ctx: i64 },
     /// `RESET_RECOVERY_ATTEMPT{target, new_recovery_id, truncate_to}` (I23).
     RecvReset { target: Epoch, new_recovery_id: RecoveryId, truncate_to: i64 },
     /// Catch-up/rebuild toward `goal` (advances `applied`; TLA+ `StageRebuildStep`).
     RebuildStep { goal: i64 },
     /// `COMMIT_ACTIVATION{tuple}` — carries the activation attempt.
     RecvCommit { tuple: ActivationTuple },
-    /// `FINALIZE_ACTIVATION` for `attempt`.
-    RecvFinalize { attempt: AttemptId },
+    /// `FINALIZE_ACTIVATION` for `attempt` **in `epoch`** (audit H2 — the epoch is checked; the
+    /// TLA+ action `StageRecvFinalizeAt` has always required `m.tgt = stEpoch[s]` and the code did
+    /// not, so the implementation was strictly weaker than the model it mirrors).
+    RecvFinalize { epoch: Epoch, attempt: AttemptId },
     /// `ACTIVATION_COMMIT_ABORT` for `attempt`.
     RecvAbort { attempt: AttemptId },
     /// Shard loss: LOST + new stage generation.
@@ -173,7 +179,29 @@ impl Stage {
         use StageEvent::*;
         use StageState::*;
         match ev {
-            RecvBegin { base, target, recovery_id: r, truncate_to } => {
+            RecvBegin { base, target, recovery_id: r, truncate_to, n_ctx } => {
+                // **Audit H3 — bounds, before any state is touched.** `BEGIN_RECOVERY` freezes a
+                // serving stage and truncates its KV, so a malformed one is destructive even when
+                // it is honest: the code checked only `epoch == base` and accepted **any**
+                // `target` and **any** `truncate_to`, including negatives — and `truncate_to = -1`
+                // (or `i64::MIN`) discards the entire context via `applied.min(truncate_to)`.
+                //
+                // The model has never been able to express either defect: `SendBeginRecovery`
+                // emits `base |-> recTarget - 1, tgt |-> recTarget` by construction, so `tgt =
+                // base + 1` holds in every reachable state, and `trunc` ranges over a small
+                // non-negative bound. **The implementation was weaker than the model it mirrors**,
+                // which is why no mutation could catch it: TLC never generates the frame.
+                //
+                // Spec §1.3 gives exactly one epoch relation (`base e → target e+1`) and §2.3's
+                // positions are non-negative and bounded by the context window. Both are checked
+                // here and the message is dropped (→ `ERR_TRANSITION` on the wire, Case C), never
+                // clamped: a clamp would let a wrong frame produce a *plausible* truncation.
+                if target != base.saturating_add(1) {
+                    return Vec::new();
+                }
+                if truncate_to < 0 || truncate_to >= n_ctx {
+                    return Vec::new();
+                }
                 // Case B′: a completed activation is locally decidable — ERR_RECOVERY_COMPLETED.
                 if self.state == ActiveFinal && self.epoch == target && self.final_evidence {
                     return vec![StageEffect::RecoveryCompleted { rank: self.rank, target }];
@@ -271,7 +299,19 @@ impl Stage {
                     attempt: tuple.attempt,
                 }]
             }
-            RecvFinalize { attempt } => {
+            RecvFinalize { epoch, attempt } => {
+                // **Audit H2 — the epoch check the model always had.** `StageRecvFinalizeAt`
+                // requires `m.tgt = stEpoch[s]`; the code checked only `state == Preactive &&
+                // attempt == self.attempt`. Post-C2 a *forged* finalize is closed by the role
+                // gate, but **a legitimate coordinator's stale finalize still lands**: an
+                // in-flight `FINALIZE_ACTIVATION` from epoch e, delivered after the stage has
+                // moved to e+1 under a recovery, would finalize the new epoch's preactive tuple on
+                // the old epoch's evidence — a stage-side I25 violation and a later Case-B′ fatal
+                // audit event. The attempt id does not save it: attempt space is per (session,
+                // epoch), so the same id recurs in the next epoch.
+                if epoch != self.epoch {
+                    return Vec::new();
+                }
                 if self.state == Preactive
                     && (cfg!(feature = "mutation_no_attempt_fence") || attempt == self.attempt)
                 {

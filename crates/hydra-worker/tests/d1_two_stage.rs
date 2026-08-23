@@ -81,12 +81,15 @@ async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &Se
 
 /// C→S1 APPLY_TOKEN → S1 emits the boundary as `FWD` → C captures it (durably copies if `store`) and
 /// relays it C→S_P → `APPLIED_ACK`. The boundary is thus made durable exactly when it is applied.
-async fn apply_relay<A, B>(c1: &mut Conn<A>, cp: &mut Conn<B>, fence: &SessionFence, input_pos: i64, token: u32, no_sample: bool, store: Option<&mut BoundaryStore>) -> Result<(), String>
+/// `epoch` is the stage epoch the frames are addressed to (audit C4: the data plane is fenced on
+/// it — pre-kill both stages are at 0, post-recovery both are at 1).
+#[allow(clippy::too_many_arguments)] // a coordinator relay genuinely carries this many; splitting it into a struct would obscure the call sites
+async fn apply_relay<A, B>(c1: &mut Conn<A>, cp: &mut Conn<B>, fence: &SessionFence, epoch: u32, input_pos: i64, token: u32, no_sample: bool, store: Option<&mut BoundaryStore>) -> Result<(), String>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
+    c1.send(0, &wire::encode_apply_token(fence, epoch, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
     let boundary = match wire::decode(&c1.recv().await.map_err(|e| format!("recv s1 fwd: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::Fwd { activations, .. } => activations,
         o => return Err(format!("S1 @ {input_pos}: expected FWD, got {o:?}")),
@@ -94,7 +97,7 @@ where
     if let Some(store) = store {
         store.append_boundary(0, input_pos, 0, &boundary).map_err(|e| e.to_string())?;
     }
-    cp.send(0, &wire::encode_fwd(fence, 0, input_pos, no_sample, &boundary)).await.map_err(|e| e.to_string())?;
+    cp.send(0, &wire::encode_fwd(fence, epoch, input_pos, no_sample, &boundary)).await.map_err(|e| e.to_string())?;
     match wire::decode(&cp.recv().await.map_err(|e| format!("recv sp ack: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()),
         o => Err(format!("S_P @ {input_pos}: expected APPLIED_ACK, got {o:?}")),
@@ -102,16 +105,16 @@ where
 }
 
 /// FWD a durable boundary directly to a (replacement) S_P — rebuilds its KV from boundaries.
-async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(cp: &mut Conn<S>, fence: &SessionFence, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
-    cp.send(0, &wire::encode_fwd(fence, 0, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
+async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(cp: &mut Conn<S>, fence: &SessionFence, epoch: u32, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
+    cp.send(0, &wire::encode_fwd(fence, epoch, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
     match wire::decode(&cp.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()),
         o => Err(format!("rebuild @ {input_pos}: expected APPLIED_ACK, got {o:?}")),
     }
 }
 
-async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
-    c.send(0, &wire::encode_sample_next(fence, 0, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
+async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, epoch: u32, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
+    c.send(0, &wire::encode_sample_next(fence, epoch, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
     match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::Sampled { token_id, post_sample_snapshot, .. } => Ok((token_id, post_sample_snapshot)),
         Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {output_pos} err {code}")),
@@ -143,16 +146,21 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
         let sp = spawn(&cluster, "sp", sp_cfg(&model, &fence, k, n_ctx, false));
         let mut c1 = connector.connect(s1, "s1").await.unwrap();
         let mut cp = connector.connect(sp, "sp").await.unwrap();
+        // Audit C4: the reference pipeline is activated like the recovered one below — the live
+        // runs in this file already did (lines further down); only the *reference* served from an
+        // unactivated stage, which is exactly the asymmetry C4 made visible.
+        activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
+        activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
         for (i, &t) in prompt.iter().enumerate() {
-            apply_relay(&mut c1, &mut cp, &fence, i as i64, t, true, None).await.unwrap();
+            apply_relay(&mut c1, &mut cp, &fence, 0, i as i64, t, true, None).await.unwrap();
         }
         let mut out = Vec::new();
         let mut input_pos = prompt.len() as i64;
         for q in 0..n as i64 {
-            let (tok, _) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+            let (tok, _) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
             out.push(tok);
             if (q as usize + 1) < n {
-                apply_relay(&mut c1, &mut cp, &fence, input_pos, tok, false, None).await.unwrap();
+                apply_relay(&mut c1, &mut cp, &fence, 0, input_pos, tok, false, None).await.unwrap();
                 input_pos += 1;
             }
         }
@@ -177,20 +185,20 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
     activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
 
     for (i, &t) in prompt.iter().enumerate() {
-        apply_relay(&mut c1, &mut cp, &fence, i as i64, t, true, Some(&mut store)).await.unwrap();
+        apply_relay(&mut c1, &mut cp, &fence, 0, i as i64, t, true, Some(&mut store)).await.unwrap();
     }
     let m = n / 2;
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
         committed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
-        apply_relay(&mut c1, &mut cp, &fence, input_pos, tok, false, Some(&mut store)).await.unwrap();
+        apply_relay(&mut c1, &mut cp, &fence, 0, input_pos, tok, false, Some(&mut store)).await.unwrap();
         input_pos += 1;
     }
     if let Some(b) = group.take() {
@@ -209,6 +217,14 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
         Msg::RecoveryAck { .. } => {}
         o => panic!("survivor S1 must ack RECOVERY_ACK (Case A freeze), got {o:?}"),
     }
+    // **Audit C4 made this step mandatory rather than optional.** A frozen survivor may not serve
+    // a decode, so it must complete the §7.19 choreography — catch up to its durable frontier
+    // (its KV is intact, so this re-applies nothing) and be **re-activated under the recovery
+    // epoch** — before it relays another token. The test previously kept feeding the frozen
+    // survivor and was served, because the data plane never asked what state it was in.
+    c1.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
+    assert!(matches!(wire::decode(&c1.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
+    activate(&mut c1, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
 
     // Replacement S_P: rebuild KV from the DURABLE BOUNDARIES (not tokens — the D1 difference).
     let boundaries = BoundaryStore::read(&bs_path).unwrap();
@@ -218,11 +234,11 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
     rcp.send(0, &wire::encode_begin_recovery(&fence, 0, 1, 1, 0)).await.unwrap();
     assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::RecoveryAck { .. }));
     for b in &boundaries {
-        rebuild_apply(&mut rcp, &fence, b.first_input_pos, &b.activations).await.unwrap();
+        rebuild_apply(&mut rcp, &fence, 1, b.first_input_pos, &b.activations).await.unwrap();
     }
-    rcp.send(0, &wire::encode_catch_up_context(&fence, 0, 1, input_pos)).await.unwrap();
+    rcp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
     assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
-    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
     assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
     activate(&mut rcp, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
     let detect_to_resumed = t_detect.elapsed();
@@ -230,7 +246,7 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
     // Resume greedy generation from output m through the replacement S_P (survivor S1 relays as before).
     let mut resumed = Vec::new();
     for q in (m as i64)..n as i64 {
-        let (tok, snap) = sample(&mut rcp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut rcp, &fence, 1, q, &cfg_hash).await.unwrap();
         resumed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
@@ -238,7 +254,7 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
         if (q as usize + 1) < n {
-            apply_relay(&mut c1, &mut rcp, &fence, input_pos, tok, false, Some(&mut store)).await.unwrap();
+            apply_relay(&mut c1, &mut rcp, &fence, 1, input_pos, tok, false, Some(&mut store)).await.unwrap();
             input_pos += 1;
         }
     }
@@ -264,9 +280,12 @@ async fn d1_two_stage_kill_s_p_rebuilds_from_durable_boundaries_byte_identical()
 
 /// S1-local rebuild from raw tokens: APPLY_TOKEN each, dropping the produced boundary (the survivor
 /// S_P already holds those positions — only S1's own KV needs rebuilding).
-async fn rebuild_s1_from_tokens<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, fence: &SessionFence, tokens: &[u32]) -> Result<(), String> {
+async fn rebuild_s1_from_tokens<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, fence: &SessionFence, epoch: u32, tokens: &[u32]) -> Result<(), String> {
     for (i, &t) in tokens.iter().enumerate() {
-        c1.send(0, &wire::encode_apply_token(fence, 0, i as i64, t, true)).await.map_err(|e| e.to_string())?;
+        // REBUILD_APPLY is the rebuild class (NO_SAMPLE), which audit C4 admits while the stage is
+        // rebuilding — but it must speak the stage's **current** epoch, which BEGIN_RECOVERY has
+        // already advanced to the target.
+        c1.send(0, &wire::encode_apply_token(fence, epoch, i as i64, t, true)).await.map_err(|e| e.to_string())?;
         match wire::decode(&c1.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
             Msg::Fwd { .. } => {} // drop — the survivor S_P is not re-applied
             o => return Err(format!("rebuild S1 @ {i}: expected FWD, got {o:?}")),
@@ -311,16 +330,21 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
         let sp = spawn(&cluster, "sp", sp_cfg(&model, &fence, k, n_ctx, false));
         let mut c1 = connector.connect(s1, "s1").await.unwrap();
         let mut cp = connector.connect(sp, "sp").await.unwrap();
+        // Audit C4: the reference pipeline is activated like the recovered one below — the live
+        // runs in this file already did (lines further down); only the *reference* served from an
+        // unactivated stage, which is exactly the asymmetry C4 made visible.
+        activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
+        activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
         for (i, &t) in prompt.iter().enumerate() {
-            apply_relay(&mut c1, &mut cp, &fence, i as i64, t, true, None).await.unwrap();
+            apply_relay(&mut c1, &mut cp, &fence, 0, i as i64, t, true, None).await.unwrap();
         }
         let mut out = Vec::new();
         let mut input_pos = prompt.len() as i64;
         for q in 0..n as i64 {
-            let (tok, _) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+            let (tok, _) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
             out.push(tok);
             if (q as usize + 1) < n {
-                apply_relay(&mut c1, &mut cp, &fence, input_pos, tok, false, None).await.unwrap();
+                apply_relay(&mut c1, &mut cp, &fence, 0, input_pos, tok, false, None).await.unwrap();
                 input_pos += 1;
             }
         }
@@ -341,20 +365,20 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
     activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
 
     for (i, &t) in prompt.iter().enumerate() {
-        apply_relay(&mut c1, &mut cp, &fence, i as i64, t, true, None).await.unwrap();
+        apply_relay(&mut c1, &mut cp, &fence, 0, i as i64, t, true, None).await.unwrap();
     }
     let m = n / 2;
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
         committed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
-        apply_relay(&mut c1, &mut cp, &fence, input_pos, tok, false, None).await.unwrap();
+        apply_relay(&mut c1, &mut cp, &fence, 0, input_pos, tok, false, None).await.unwrap();
         input_pos += 1;
     }
     if let Some(b) = group.take() {
@@ -372,6 +396,14 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
         Msg::RecoveryAck { .. } => {}
         o => panic!("survivor S_P must ack RECOVERY_ACK (Case A freeze), got {o:?}"),
     }
+    // Audit C4 (see the S_P-kill test): the frozen survivor completes the §7.19 choreography —
+    // catch up, re-install the sampler checkpoint (I17: install before activation), re-activate —
+    // before it samples again.
+    cp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
+    assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
+    cp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
+    activate(&mut cp, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
 
     // Replacement S1: rebuild its KV from the committed TOKENS (the S1-side rebuild — S1 ingests
     // tokens, so token replay is correct here; the boundaries it produces are dropped, since the
@@ -381,7 +413,7 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
     rc1.send(0, &wire::encode_begin_recovery(&fence, 0, 1, 1, 0)).await.unwrap();
     assert!(matches!(wire::decode(&rc1.recv().await.unwrap().payload, &fence).unwrap().1, Msg::RecoveryAck { .. }));
     let replay: Vec<u32> = prompt.iter().copied().chain(committed.iter().copied()).collect();
-    rebuild_s1_from_tokens(&mut rc1, &fence, &replay).await.unwrap();
+    rebuild_s1_from_tokens(&mut rc1, &fence, 1, &replay).await.unwrap();
     rc1.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
     assert!(matches!(wire::decode(&rc1.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
     activate(&mut rc1, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
@@ -390,7 +422,7 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
     // Resume: sample from the SURVIVOR S_P; feed back through the replacement S1 (boundary replay downstream).
     let mut resumed = Vec::new();
     for q in (m as i64)..n as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 1, q, &cfg_hash).await.unwrap();
         resumed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
@@ -398,7 +430,7 @@ async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
         if (q as usize + 1) < n {
-            apply_relay(&mut rc1, &mut cp, &fence, input_pos, tok, false, None).await.unwrap();
+            apply_relay(&mut rc1, &mut cp, &fence, 1, input_pos, tok, false, None).await.unwrap();
             input_pos += 1;
         }
     }

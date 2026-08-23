@@ -37,6 +37,60 @@ pub type RecoveryId = u32;
 pub type AttemptId = u32;
 pub type CompletionId = u64;
 pub type StageRank = u16;
+
+/// **Audit H4 — a stage rank that came from an AUTHENTICATED PEER IDENTITY, not from a frame.**
+///
+/// # The finding
+///
+/// The activation quorum is a set of ranks, and the coordinator learned each rank from *the ack it
+/// was counting*. `ACTIVATION_COMMITTED` carries **no rank on the wire at all** (see
+/// `hydra-proto.fbs`), so whatever a driver passed to [`CoordEvent::StageCommitted`] was, at best,
+/// its own guess and, at worst, whatever the sender implied — one peer could therefore be counted
+/// as a quorum of three. The TLA+ model gets one-ack-per-stage **free from set semantics** (`\E s
+/// \in Stages` quantifies over real stages), so the model can never exhibit the defect: it is a
+/// **modelling artifact, not a protocol guarantee**, and the auditor marked it SUSPICIOUS precisely
+/// because no production coordinator driver exists yet — this is a latent defect the driver would
+/// have inherited.
+///
+/// # Why a newtype rather than a comment
+///
+/// C2 already binds every connection to a role at `accept()`, so the *information* is available;
+/// the risk is that a future driver reaches for the wrong source (a decoded field, a loop index, a
+/// config lookup) because nothing stops it. This type makes the right source the **only** source:
+/// the field is private, this crate exposes no constructor, and the single way to obtain one is
+/// `hydra_transport::roles::BoundPeer::authenticated_rank()`, which reads the rank out of the peer
+/// certificate's bound role. A driver that has not authenticated a peer cannot produce the value
+/// the quorum accounting requires — "do it explicitly, not implicitly", as the audit asked.
+///
+/// `hydra-state` stays pure: it defines the type and never learns how identity works.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct AuthenticatedRank(StageRank);
+
+impl AuthenticatedRank {
+    /// The rank inside. Reading is unrestricted; **minting** is the guarded operation.
+    pub fn rank(self) -> StageRank {
+        self.0
+    }
+
+    /// Mint from a peer identity the transport has already authenticated and bound to a stage role.
+    ///
+    /// **Not public API for drivers.** It is `#[doc(hidden)]` and named for what it requires so
+    /// that a call site outside the transport reads as the mistake it is. `hydra-transport` calls
+    /// it from `BoundPeer::authenticated_rank()`; nothing else should.
+    #[doc(hidden)]
+    pub fn from_authenticated_peer_role(rank: StageRank) -> Self {
+        AuthenticatedRank(rank)
+    }
+
+    /// A rank asserted by a test harness that is standing in for the transport.
+    ///
+    /// Deliberately verbose, deliberately `cfg(any(test, feature = "test-harness"))`-free (the sim
+    /// and the state tests are separate crates), and deliberately *named* so it cannot be mistaken
+    /// for the production path in review. A test may assert an identity; a driver may not.
+    pub fn for_test_harness_asserting_identity(rank: StageRank) -> Self {
+        AuthenticatedRank(rank)
+    }
+}
 pub type CheckpointId = u64;
 
 /// 16-byte session id.

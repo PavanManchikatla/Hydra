@@ -142,16 +142,18 @@ async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &Se
 }
 
 /// C→S1 APPLY_TOKEN → (S1→S2→S_P direct FWD, durable copies) → APPLIED_ACK relayed back up to C.
-async fn chain_apply<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, fence: &SessionFence, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String> {
-    c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
+/// `epoch` is the stage epoch the frame is addressed to (audit C4 fences the data plane on it:
+/// pre-kill the chain is at 0, post-recovery at 1).
+async fn chain_apply<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, fence: &SessionFence, epoch: u32, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String> {
+    c1.send(0, &wire::encode_apply_token(fence, epoch, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
     match wire::decode(&c1.recv().await.map_err(|e| format!("recv chain ack: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()),
         o => Err(format!("chain @ {input_pos}: expected APPLIED_ACK, got {o:?}")),
     }
 }
 
-async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
-    c.send(0, &wire::encode_sample_next(fence, 0, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
+async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, epoch: u32, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
+    c.send(0, &wire::encode_sample_next(fence, epoch, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
     match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::Sampled { token_id, post_sample_snapshot, .. } => Ok((token_id, post_sample_snapshot)),
         Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {output_pos} err {code}")),
@@ -161,12 +163,28 @@ async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &Sess
 
 /// FWD a durable boundary directly to a (replacement) stage — rebuilds its KV from boundaries. For a
 /// final stage the reply is APPLIED_ACK; for a middle stage (down-linked to a sink) it is too (relayed).
-async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
-    c.send(0, &wire::encode_fwd(fence, 0, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
+async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, epoch: u32, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
+    c.send(0, &wire::encode_fwd(fence, epoch, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
     match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()),
         o => Err(format!("rebuild @ {input_pos}: expected APPLIED_ACK, got {o:?}")),
     }
+}
+
+/// **Audit C4 — bring a frozen survivor back to `ACTIVE_FINAL` (the §7.19 choreography).**
+///
+/// A Case-A freeze leaves the stage `FROZEN` at the recovery epoch. Since the data plane is fenced
+/// (C4), such a stage may not serve a decode: it must catch up to its durable frontier (its KV is
+/// intact, so nothing is re-applied) and be **re-activated under the recovery epoch**. Before C4
+/// these tests kept driving frozen survivors and were served, so the omission was invisible — and
+/// where the harness froze only *some* survivors, the rest silently kept serving the old epoch.
+async fn reactivate_survivor<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, goal: i64) -> Result<(), String> {
+    c.send(0, &wire::encode_catch_up_context(fence, 1, 1, goal)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
+        Msg::CatchUpReady { .. } => {}
+        o => return Err(format!("survivor catch-up: expected CATCH_UP_READY, got {o:?}")),
+    }
+    activate(c, fence, ActivationKind::Recovery, 1, 1).await
 }
 
 async fn begin_recovery<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, truncate_to: i64) -> Result<(), String> {
@@ -278,19 +296,19 @@ async fn three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_i
 
     // Prefill + generate m tokens through the chain.
     for (i, &t) in prompt.iter().enumerate() {
-        chain_apply(&mut c1, &fence, i as i64, t, true).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, i as i64, t, true).await.unwrap();
     }
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m_kill as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
         committed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
-        chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, input_pos, tok, false).await.unwrap();
         input_pos += 1;
     }
     if let Some(b) = group.take() {
@@ -309,6 +327,9 @@ async fn three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_i
     // Survivors S1 + S2 take BEGIN_RECOVERY Case A (freeze).
     begin_recovery(&mut c1, &fence, input_pos).await.unwrap();
     begin_recovery(&mut c2, &fence, input_pos).await.unwrap();
+    // Audit C4: a frozen survivor may not serve — both come back through catch-up + re-activation.
+    reactivate_survivor(&mut c1, &fence, input_pos).await.unwrap();
+    reactivate_survivor(&mut c2, &fence, input_pos).await.unwrap();
 
     // Replacement S_P: rebuild from S2's DURABLE boundaries (not tokens — the D1 difference).
     let rsp_id = pl.cluster.issue("sp").unwrap();
@@ -316,11 +337,11 @@ async fn three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_i
     let mut rcp = connector.connect(rsp_addr, "sp").await.unwrap();
     begin_recovery(&mut rcp, &fence, 0).await.unwrap();
     for b in boundaries.iter().take(input_pos as usize) {
-        rebuild_apply(&mut rcp, &fence, b.first_input_pos, &b.activations).await.unwrap();
+        rebuild_apply(&mut rcp, &fence, 1, b.first_input_pos, &b.activations).await.unwrap();
     }
-    rcp.send(0, &wire::encode_catch_up_context(&fence, 0, 1, input_pos)).await.unwrap();
+    rcp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
     assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
-    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
     assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
     activate(&mut rcp, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
 
@@ -331,7 +352,7 @@ async fn three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_i
     // ---- resume: sample from the replacement S_P; feedback through S1→S2→(re-linked)→new S_P ----
     let mut resumed = Vec::new();
     for q in (m_kill as i64)..n as i64 {
-        let (tok, snap) = sample(&mut rcp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut rcp, &fence, 1, q, &cfg_hash).await.unwrap();
         resumed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
@@ -339,7 +360,7 @@ async fn three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_i
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
         if (q as usize + 1) < n {
-            chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+            chain_apply(&mut c1, &fence, 1, input_pos, tok, false).await.unwrap();
             input_pos += 1;
         }
     }
@@ -397,23 +418,31 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     let mut c1 = connector.connect(pl.s1_addr, "s1").await.unwrap();
     let mut cp = connector.connect(pl.sp_addr, "sp").await.unwrap();
 
+    // Audit C4: the MIDDLE stage is a participant in the activation transaction too, and since C4
+    // an unactivated stage may not serve a decode `FWD`. The coordinator's data path never touches
+    // it (S1 forwards directly), so it gets its own control connection — the multi-conn serve loop
+    // is what makes that possible. Before C4 the omission was invisible: S2 served anything.
+    let s2_addr = pl.s1_down.lock().unwrap().0;
+    let mut c2 = connector.connect(s2_addr, "s2").await.unwrap();
+
     activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
+    activate(&mut c2, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
     activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
 
     for (i, &t) in prompt.iter().enumerate() {
-        chain_apply(&mut c1, &fence, i as i64, t, true).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, i as i64, t, true).await.unwrap();
     }
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m_kill as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
         committed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
-        chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, input_pos, tok, false).await.unwrap();
         input_pos += 1;
     }
     if let Some(b) = group.take() {
@@ -428,12 +457,21 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
 
     // ---- kill the MIDDLE stage S2 ----
     let t_detect = Instant::now();
+    drop(c2); // the control connection to the stage that just died
     // Downstream survivor S_P freezes (Case A) — the ratified survivor path (§7.19). The §7.19 hang
     // was an ORCHESTRATION omission: a Case-A freeze leaves the stage FROZEN, and `RecvCommit` needs
     // FROZEN_READY, reached via **catch-up** (RebuildStep). The survivor's KV is intact, so the
     // catch-up re-applies nothing (applied ≥ goal → immediate FROZEN_READY). freeze → catch-up →
     // reinstall → reactivate — the fix proven by `survivor_reactivate.rs` (100×).
     begin_recovery(&mut cp, &fence, input_pos).await.unwrap();
+    // **Audit C4 exposed a partial choreography here.** A recovery advances the **session** epoch
+    // (spec §6.1: `BEGIN_RECOVERY{session, base e, target e+1}`), so *every* surviving participant
+    // is frozen and re-activated under it — this test froze only the downstream survivor and left
+    // the upstream S1 serving epoch 0. With the data plane unfenced that mismatch was undetectable;
+    // now S1's own frames would be refused by the epoch-1 stages below, which is the correct
+    // reading of the protocol rather than a new requirement.
+    begin_recovery(&mut c1, &fence, input_pos).await.unwrap();
+    reactivate_survivor(&mut c1, &fence, input_pos).await.unwrap();
     cp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos - 1)).await.unwrap();
     match wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::CatchUpReady { .. } => {}
@@ -455,9 +493,9 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     let mut rc2 = connector.connect(rs2_addr, "s2").await.unwrap();
     begin_recovery(&mut rc2, &fence, 0).await.unwrap();
     for b in boundaries.iter().take(input_pos as usize) {
-        rebuild_apply(&mut rc2, &fence, b.first_input_pos, &b.activations).await.unwrap();
+        rebuild_apply(&mut rc2, &fence, 1, b.first_input_pos, &b.activations).await.unwrap();
     }
-    rc2.send(0, &wire::encode_catch_up_context(&fence, 0, 1, input_pos)).await.unwrap();
+    rc2.send(0, &wire::encode_catch_up_context(&fence, 1, 1, input_pos)).await.unwrap();
     assert!(matches!(wire::decode(&rc2.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
     activate(&mut rc2, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
 
@@ -465,7 +503,7 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     *rs2_down.lock().unwrap() = (pl.sp_addr, "sp".to_string());
     // Re-activate the frozen survivor S_P (I17: reinstall the sampler checkpoint before activation),
     // then S1 re-links to the replacement S2.
-    cp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    cp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
     assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
     activate(&mut cp, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
     // S1 re-links its direct down-link to the replacement S2 (the seam-2 re-link, middle-stage).
@@ -475,7 +513,7 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
     // ---- resume: sample from the survivor S_P; feedback through S1→(re-linked)→new S2→S_P ----
     let mut resumed = Vec::new();
     for q in (m_kill as i64)..n as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 1, q, &cfg_hash).await.unwrap();
         resumed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
@@ -483,7 +521,7 @@ async fn three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byt
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
         if (q as usize + 1) < n {
-            chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+            chain_apply(&mut c1, &fence, 1, input_pos, tok, false).await.unwrap();
             input_pos += 1;
         }
     }
@@ -544,24 +582,32 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     let mut c1 = connector.connect(pl.s1_addr, "s1").await.unwrap();
     let mut cp = connector.connect(pl.sp_addr, "sp").await.unwrap();
 
+    // Audit C4: the MIDDLE stage is a participant in the activation transaction too, and since C4
+    // an unactivated stage may not serve a decode `FWD`. The coordinator's data path never touches
+    // it (S1 forwards directly), so it gets its own control connection — the multi-conn serve loop
+    // is what makes that possible. Before C4 the omission was invisible: S2 served anything.
+    let s2_addr = pl.s1_down.lock().unwrap().0;
+    let mut c2 = connector.connect(s2_addr, "s2").await.unwrap();
+
     activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
+    activate(&mut c2, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
     activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await.unwrap();
 
     for (i, &t) in prompt.iter().enumerate() {
-        chain_apply(&mut c1, &fence, i as i64, t, true).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, i as i64, t, true).await.unwrap();
     }
     // Commit m outputs (durable).
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 0, q, &cfg_hash).await.unwrap();
         committed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
-        chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+        chain_apply(&mut c1, &fence, 0, input_pos, tok, false).await.unwrap();
         input_pos += 1;
     }
     if let Some(b) = group.take() {
@@ -575,8 +621,8 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     // generation_durable_pos, and none of it is committed. This is the tail the survivors' Case-A
     // freeze must discard (I7a/I7b): the replacement S2 rebuilds only to the durable frontier, so a
     // survivor whose KV outruns it produces WRONG logits unless truncated back.
-    let (prov_tok, _snap) = sample(&mut cp, &fence, m as i64, &cfg_hash).await.unwrap();
-    chain_apply(&mut c1, &fence, input_pos, prov_tok, false).await.unwrap();
+    let (prov_tok, _snap) = sample(&mut cp, &fence, 0, m as i64, &cfg_hash).await.unwrap();
+    chain_apply(&mut c1, &fence, 0, input_pos, prov_tok, false).await.unwrap();
     let provisional_pos = input_pos; // = durable_frontier + 1
 
     // Durable boundaries. Settle the WAN-class copies first. S1's outputs rebuild the replacement S2;
@@ -589,16 +635,19 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
 
     // ---- kill the MIDDLE stage S2 ----
     let t_detect = Instant::now();
+    drop(c2); // the control connection to the stage that just died
     // Freeze survivors. S1 (forwarder) truncates its KV to the durable frontier (drops the provisional
     // position); it re-forwards the re-applied position on resume, so it needs no logits regen.
     begin_recovery(&mut c1, &fence, durable_frontier).await.unwrap();
+    // Audit C4 (see the middle-kill test): the frozen upstream survivor is re-activated too.
+    reactivate_survivor(&mut c1, &fence, durable_frontier).await.unwrap();
     // S_P (sampler) — TRUNCATE-AND-REPLAY (owner-ruled, no new machinery): roll applied to goal-1
     // (durable_frontier-1), then re-apply position `durable_frontier` teacher-forced with S2's durable
     // boundary. The last application regenerates FRESH head logits as a side effect (exactly how
     // Strategy A/B guarantee next_logits_ready) — its previously-retained logits came from the (now
     // truncated) provisional application and are stale.
     begin_recovery(&mut cp, &fence, durable_frontier - 1).await.unwrap();
-    rebuild_apply(&mut cp, &fence, durable_frontier, &frontier_boundary).await.unwrap();
+    rebuild_apply(&mut cp, &fence, 1, durable_frontier, &frontier_boundary).await.unwrap();
     cp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, durable_frontier)).await.unwrap();
     assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
 
@@ -617,14 +666,14 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     let mut rc2 = connector.connect(rs2_addr, "s2").await.unwrap();
     begin_recovery(&mut rc2, &fence, 0).await.unwrap();
     for b in boundaries.iter().filter(|b| b.first_input_pos <= durable_frontier).take((durable_frontier + 1) as usize) {
-        rebuild_apply(&mut rc2, &fence, b.first_input_pos, &b.activations).await.unwrap();
+        rebuild_apply(&mut rc2, &fence, 1, b.first_input_pos, &b.activations).await.unwrap();
     }
-    rc2.send(0, &wire::encode_catch_up_context(&fence, 0, 1, durable_frontier)).await.unwrap();
+    rc2.send(0, &wire::encode_catch_up_context(&fence, 1, 1, durable_frontier)).await.unwrap();
     assert!(matches!(wire::decode(&rc2.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }));
     activate(&mut rc2, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
 
     *rs2_down.lock().unwrap() = (pl.sp_addr, "sp".to_string());
-    cp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
+    cp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await.unwrap();
     assert!(matches!(wire::decode(&cp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::SamplerCheckpointInstalled { .. }));
     activate(&mut cp, &fence, ActivationKind::Recovery, 1, 1).await.unwrap();
     *pl.s1_down.lock().unwrap() = (rs2_addr, "s2".to_string());
@@ -635,7 +684,7 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
     input_pos = provisional_pos;
     let mut resumed = Vec::new();
     for q in (m as i64)..n as i64 {
-        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await.unwrap();
+        let (tok, snap) = sample(&mut cp, &fence, 1, q, &cfg_hash).await.unwrap();
         resumed.push(tok);
         group.push(q, tok, snap);
         if group.count_ready() {
@@ -643,7 +692,7 @@ async fn three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_ident
             cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).unwrap();
         }
         if (q as usize + 1) < n {
-            chain_apply(&mut c1, &fence, input_pos, tok, false).await.unwrap();
+            chain_apply(&mut c1, &fence, 1, input_pos, tok, false).await.unwrap();
             input_pos += 1;
         }
     }

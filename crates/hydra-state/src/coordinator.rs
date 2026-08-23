@@ -60,14 +60,19 @@ pub enum CoordEvent {
     ProceedWriteIntent,
     WalDurable(WalKindTag),
     ProceedSendCommit,
-    StageCommitted { rank: StageRank, attempt: crate::AttemptId },
+    /// Audit H4: the rank must come from an authenticated peer identity — see
+    /// [`crate::AuthenticatedRank`]. The wire carries no rank, so a `StageRank` here would be a
+    /// value the coordinator invented or the sender implied.
+    StageCommitted { rank: crate::AuthenticatedRank, attempt: crate::AttemptId },
     ProceedAbort,
     ProceedWriteComplete,
     ProceedSendFinalize,
-    StageFinalized { rank: StageRank, attempt: crate::AttemptId },
+    /// Audit H4: authenticated rank (see [`crate::AuthenticatedRank`]).
+    StageFinalized { rank: crate::AuthenticatedRank, attempt: crate::AttemptId },
     ProceedBecomeServiceable,
     /// A required participant is permanently lost (new stage_generation / removal).
-    StageLost { rank: StageRank },
+    /// Audit H4: authenticated rank (see [`crate::AuthenticatedRank`]).
+    StageLost { rank: crate::AuthenticatedRank },
     /// §6.7: record ACTIVATION_UNSERVABLE for a decided-but-unservable activation.
     ProceedRecordUnservable,
     /// §6.7 step 3: open the superseding recovery at epoch+1.
@@ -254,7 +259,7 @@ impl Coordinator {
             StageCommitted { rank, attempt } => {
                 // count only acks for the CURRENT attempt (stale pre-abort acks never count — I25)
                 if attempt == self.attempt && self.state == CoordState::Committing {
-                    self.committed.insert(rank);
+                    self.committed.insert(rank.rank());
                 }
                 Vec::new()
             }
@@ -293,7 +298,7 @@ impl Coordinator {
             }
             StageFinalized { rank, attempt } => {
                 if attempt == self.attempt && self.state == CoordState::Finalizing {
-                    self.finalized.insert(rank);
+                    self.finalized.insert(rank.rank());
                 }
                 Vec::new()
             }
@@ -302,8 +307,8 @@ impl Coordinator {
                 Vec::new()
             }
             StageLost { rank } => {
-                self.lost.insert(rank);
-                self.finalized.remove(&rank); // a lost participant's finalize evidence is gone
+                self.lost.insert(rank.rank());
+                self.finalized.remove(&rank.rank()); // a lost participant's finalize evidence is gone
                 Vec::new()
             }
             ProceedRecordUnservable => {

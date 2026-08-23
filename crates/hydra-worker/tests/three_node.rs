@@ -149,6 +149,16 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
     // S1→S2→S_P chaining is transparent to it. `Endpoints{s1, s2=S_P}` reuses the direct-FWD driver.
     let connector = TcpMtls::from_config(ca.client_config(&ca.issue("coordinator").unwrap()).unwrap()).unwrap();
     let ep = Endpoints::new(s1_addr, "s1", sp_addr, "sp");
+
+    // **Audit C4:** the middle stage is a participant in the activation transaction like any other
+    // (spec §6.6 commits the tuple to *every* stage), and since C4 a stage that has not been
+    // activated may not serve a decode `FWD`. The coordinator's data path never touches S2 — S1
+    // forwards to it directly — so it needs its own control connection, which the multi-conn serve
+    // loop exists to provide. Before C4 the omission was invisible: S2 served whatever arrived.
+    {
+        let mut c2 = connector.connect(s2_addr, "s2").await.expect("connect s2 (control)");
+        hydra_worker::pair::activate(&mut c2, &fence, 0, 0, 1).await.expect("activate s2");
+    }
     let tokens = run_direct_fwd_generation(&connector, &ep, &fence, &cfg, &prompt, n).await.expect("3-node generation");
 
     // (1) BYTE-IDENTICAL: the chained 3-node stream == the unsplit greedy run.

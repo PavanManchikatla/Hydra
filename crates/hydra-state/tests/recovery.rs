@@ -18,7 +18,7 @@ fn step_ok(s: &mut Stage, ev: hydra_state::StageEvent) -> Vec<StageEffect> {
 #[test]
 fn case_a_first_application_truncates() {
     let mut s = Stage::frozen(0, 0, 0, 5); // epoch 0, applied 5
-    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 2 });
+    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 2, n_ctx: 64 });
     assert_eq!(s.state(), StageState::Frozen);
     assert_eq!(s.epoch(), 1);
     assert_eq!(s.applied(), 2, "applied truncated to truncate_to (I7a)");
@@ -34,7 +34,7 @@ fn preactive_stage_reverts_on_begin_recovery() {
     step_ok(&mut s, RecvCommit { tuple: tuple(0, 1) }); // -> PREACTIVE at epoch 0, attempt 1
     assert_eq!(s.state(), StageState::Preactive);
     // BEGIN_RECOVERY for the next epoch, base = the stage's epoch: must revert, not be rejected.
-    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0 });
+    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0, n_ctx: 64 });
     assert_eq!(s.state(), StageState::Frozen, "PREACTIVE reverts to FROZEN (spec §1.3)");
     assert_eq!(s.epoch(), 1, "adopts the target epoch");
     assert!(!s.holds_final_evidence());
@@ -45,15 +45,15 @@ fn preactive_stage_reverts_on_begin_recovery() {
 fn case_b_prime_completed_is_locally_decidable() {
     let mut s = Stage::frozen_ready(0, 1, 0);
     step_ok(&mut s, RecvCommit { tuple: tuple(1, 1) });
-    step_ok(&mut s, RecvFinalize { attempt: 1 }); // ACTIVE_FINAL with evidence
-    let e = s.step(RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0 });
+    step_ok(&mut s, RecvFinalize { epoch: 1, attempt: 1 }); // ACTIVE_FINAL with evidence
+    let e = s.step(RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0, n_ctx: 64 });
     assert!(matches!(e[0], StageEffect::RecoveryCompleted { target: 1, .. }));
 }
 
 #[test]
 fn case_b_pure_replay_ok_when_within_truncate() {
     let mut s = Stage::frozen(0, 1, 0, 1); // at target epoch 1, applied 1 ≤ truncate
-    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 2 });
+    let e = step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 2, n_ctx: 64 });
     assert!(matches!(e[0], StageEffect::RecoveryAck { .. }));
     assert!(!s.caseb_violated());
 }
@@ -90,7 +90,7 @@ fn reset_after_catch_up_truncates_then_case_b_ok() {
     step_ok(&mut s, RecvReset { target: 1, new_recovery_id: 1, truncate_to: 1 });
     assert_eq!(s.applied(), 1, "RESET truncates the survivor (I23)");
     // now Case B is a clean pure replay
-    step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 1 });
+    step_ok(&mut s, RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 1, n_ctx: 64 });
     assert!(!s.caseb_violated());
 }
 
@@ -105,7 +105,7 @@ fn mut2_label_only_reset_trips_case_b() {
     assert_eq!(s.applied(), 3);
     s.step(RecvReset { target: 1, new_recovery_id: 1, truncate_to: 1 }); // label-only: applied stays 3
     assert_eq!(s.applied(), 3, "Mut2 reset does not truncate");
-    s.step(RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 1 }); // Case B: 3 > 1
+    s.step(RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 1, n_ctx: 64 }); // Case B: 3 > 1
     let v = check_stage(&s);
     assert!(
         v.iter().any(|x| x.invariant == "CaseBPure"),

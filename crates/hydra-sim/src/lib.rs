@@ -39,6 +39,10 @@ pub mod wal_disk;
 pub use rng::Rng;
 use wal_disk::VirtualWal;
 
+/// The stage context window the sim's abstract positions live in (audit H3 bounds `truncate_to`
+/// against it). The sim's positions are single digits; this is simply a bound they are inside.
+const SIM_N_CTX: i64 = 64;
+
 /// Sim/scheduler version identifier — stamped on every run's output header and on each `Failure`,
 /// so result provenance is mechanically visible if the adversarial scheduler ever changes (a
 /// median or catch-rate is only comparable within one scheduler version). Bump on any change to
@@ -301,10 +305,10 @@ impl World {
             c.push(Action::Coord(WalDurable(tag)));
         }
         for &r in &self.commit_acks {
-            c.push(Action::Coord(StageCommitted { rank: r, attempt: self.ack_attempt }));
+            c.push(Action::Coord(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(r), attempt: self.ack_attempt }));
         }
         for &r in &self.finalize_acks {
-            c.push(Action::Coord(StageFinalized { rank: r, attempt: self.ack_attempt }));
+            c.push(Action::Coord(StageFinalized { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(r), attempt: self.ack_attempt }));
         }
         // Intent-driven adversarial bias (still randomized: `round_intent` is seeded).
         let intent = self.round_intent;
@@ -324,7 +328,7 @@ impl World {
         if intent == 2 && self.coord.state() == CoordState::Finalizing {
             if let Some(&r) = self.finalize_acks.first() {
                 for _ in 0..5 {
-                    c.push(Action::Coord(StageLost { rank: r }));
+                    c.push(Action::Coord(StageLost { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(r) }));
                 }
             }
         }
@@ -336,7 +340,7 @@ impl World {
             c.push(Action::Coord(Restart));
         }
         if !self.lost_candidate().is_empty() && self.rng.chance(1, 40) {
-            c.push(Action::Coord(StageLost { rank: self.lost_candidate()[0] }));
+            c.push(Action::Coord(StageLost { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(self.lost_candidate()[0]) }));
         }
         c
     }
@@ -399,7 +403,9 @@ impl World {
                     StageState::Frozen if s.recovery_id() == 1 => {
                         bias(
                             c,
-                            StageEvent::RecvBegin { base: 0, target, recovery_id: 1, truncate_to: t },
+                            // `n_ctx` (audit H3) is the stage's own context bound; the sim's
+                            // positions live well inside it.
+                            StageEvent::RecvBegin { base: 0, target, recovery_id: 1, truncate_to: t, n_ctx: SIM_N_CTX },
                         );
                     }
                     _ => {}
@@ -484,17 +490,17 @@ impl World {
                 match &ev {
                     CoordEvent::StageCommitted { rank, .. } => {
                         if self.rng.chance(3, 4) {
-                            self.commit_acks.retain(|r| r != rank);
+                            self.commit_acks.retain(|r| *r != rank.rank());
                         }
                     }
                     CoordEvent::StageFinalized { rank, .. } => {
                         if self.rng.chance(3, 4) {
-                            self.finalize_acks.retain(|r| r != rank);
+                            self.finalize_acks.retain(|r| *r != rank.rank());
                         }
                     }
                     CoordEvent::StageLost { rank } => {
-                        self.lost.push(*rank);
-                        self.finalize_acks.retain(|r| r != rank);
+                        self.lost.push(rank.rank());
+                        self.finalize_acks.retain(|r| *r != rank.rank());
                     }
                     CoordEvent::WalDurable(_) => {
                         self.pending_wal = None;

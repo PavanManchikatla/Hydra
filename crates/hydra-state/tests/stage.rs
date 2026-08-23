@@ -31,7 +31,7 @@ fn commit_then_finalize_reaches_active_final() {
     let e = step_ok(&mut s, RecvCommit { tuple: tuple(1) });
     assert_eq!(s.state(), StageState::Preactive);
     assert!(matches!(e[0], StageEffect::Committed { attempt: 1, .. }));
-    let e = step_ok(&mut s, RecvFinalize { attempt: 1 });
+    let e = step_ok(&mut s, RecvFinalize { epoch: 0, attempt: 1 });
     assert_eq!(s.state(), StageState::ActiveFinal);
     assert!(s.holds_final_evidence());
     assert!(matches!(e[0], StageEffect::Finalized { attempt: 1, .. }));

@@ -388,6 +388,7 @@ name = "hydra-transport"
 version = "0.10.2"
 dependencies = [
  "hydra-proto",
+ "hydra-state",
  "rcgen",
  "rustls",
  "rustls-pki-types",

@@ -336,6 +336,19 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
     // Connection B: the control path — concurrent SAMPLE_NEXTs that borrow the SAME shared Worker.
     let mut cb_conn = connector.connect(s1_addr, "s1").await.expect("connect B");
 
+    // **Audit M9:** positions are applied exactly once and in order (I1/R2), so the prompt is
+    // actually prefilled before the loop starts at `prompt.len()`. The loop below always addressed
+    // positions above an empty KV — a gap the worker now refuses with `ERR_GAP`. The lock stress
+    // this test exists for is unchanged; it just no longer skips the context it decodes over.
+    for (pos, &tok) in prompt.iter().enumerate() {
+        ca_conn.send(0, &wire::encode_apply_token(&fence, 0, pos as i64, tok, true)).await.unwrap();
+        let r = ca_conn.recv().await.unwrap();
+        assert!(
+            matches!(wire::decode(&r.payload, &fence).unwrap().1, Msg::AppliedAck { .. }),
+            "prefill @ {pos} must be acked"
+        );
+    }
+
     for i in 0..iters {
         let pos = (prompt.len() + i) as i64;
         let tok = prompt[i % prompt.len()];

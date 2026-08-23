@@ -41,13 +41,13 @@ fn drive_to_post_decision_loss() -> Coordinator {
     c.step(ProceedWriteIntent);
     c.step(WalDurable(hydra_state::coordinator::WalKindTag::Intent));
     c.step(ProceedSendCommit);
-    c.step(StageCommitted { rank: 0, attempt: 1 });
-    c.step(StageCommitted { rank: 1, attempt: 1 });
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
     c.step(ProceedWriteComplete);
     c.step(WalDurable(hydra_state::coordinator::WalKindTag::Complete));
     c.step(ProceedSendFinalize); // -> Finalizing (decision is durable)
-    c.step(StageFinalized { rank: 0, attempt: 1 });
-    c.step(StageLost { rank: 1 }); // required participant lost after the decision
+    c.step(StageFinalized { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
+    c.step(StageLost { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1) }); // required participant lost after the decision
     assert!(c.completed());
     assert_eq!(c.state(), CoordState::Finalizing);
     c

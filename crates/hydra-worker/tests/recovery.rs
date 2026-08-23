@@ -60,15 +60,20 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
     let connector = TcpMtls::from_config(ca.client_config(&c_id).unwrap()).unwrap();
     let mut conn = connector.connect(addr, W).await.expect("connect");
 
-    // 1. BEGIN_RECOVERY Case A (base=target=0, new recovery_id=1, truncate_to=0 for a fresh replica).
-    conn.send(0, &wire::encode_begin_recovery(&fence, 0, 0, 1, 0)).await.unwrap();
+    // 1. BEGIN_RECOVERY Case A — base 0 → **target 1**, new recovery_id=1, truncate_to=0 (fresh
+    //    replica). **Audit H3 (2026-08-23): this used to send `base = target = 0`** — a degenerate
+    //    "transition" the coordinator can never produce (spec §1.3 and the TLA+
+    //    `SendBeginRecovery` both emit `target = base + 1` by construction). The harness was
+    //    exercising a shape the protocol has no way to generate, which is why nothing here could
+    //    have caught the missing `target == base + 1` bound.
+    conn.send(0, &wire::encode_begin_recovery(&fence, 0, 1, 1, 0)).await.unwrap();
     match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::RecoveryAck { .. } => {}
         other => panic!("Case A must ack RECOVERY_ACK, got {other:?}"),
     }
 
     // 2. CATCH_UP_CONTEXT{goal=3} → the stage RebuildStep-s to FROZEN_READY → CATCH_UP_READY.
-    conn.send(0, &wire::encode_catch_up_context(&fence, 0, 1, 3)).await.unwrap();
+    conn.send(0, &wire::encode_catch_up_context(&fence, 1, 1, 3)).await.unwrap();
     match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::CatchUpReady { applied_input_pos } => assert_eq!(applied_input_pos, 3, "caught up to goal"),
         other => panic!("catch-up must ack CATCH_UP_READY, got {other:?}"),
@@ -76,11 +81,11 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
 
     // 3. Activation transaction on the recovered stage: COMMIT → COMMITTED, FINALIZE → FINALIZED.
     let tuple = hydra_state::ActivationTuple {
-        kind: hydra_state::ActivationKind::Recovery, epoch: 0, recovery_id: 1, attempt: 0, sampler_checkpoint_id: 0,
+        kind: hydra_state::ActivationKind::Recovery, epoch: 1, recovery_id: 1, attempt: 0, sampler_checkpoint_id: 0,
     };
     conn.send(0, &wire::encode_commit_activation(&fence, &tuple, 1)).await.unwrap();
     match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
-        Msg::ActivationCommitted(t) => assert_eq!((t.epoch, t.recovery_id, t.attempt), (0, 1, 0)),
+        Msg::ActivationCommitted(t) => assert_eq!((t.epoch, t.recovery_id, t.attempt), (1, 1, 0)),
         other => panic!("expected ActivationCommitted, got {other:?}"),
     }
     conn.send(0, &wire::encode_finalize_activation(&fence, &tuple, 1)).await.unwrap();
@@ -95,10 +100,10 @@ async fn fresh_worker_does_not_accept_case_a() {
     // Guard: a NON-recovery worker (FROZEN_READY) must not satisfy Case A — the recovery-start flag
     // is load-bearing, not cosmetic. Exercised directly on the Stage to keep it engine-free.
     let mut fresh = hydra_state::Stage::frozen_ready(0, 0, 0);
-    let effs = fresh.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 0, recovery_id: 1, truncate_to: 0 });
+    let effs = fresh.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
     assert!(effs.is_empty(), "FROZEN_READY is not a Case-A entry state (no RECOVERY_ACK)");
 
     let mut recovering = hydra_state::Stage::frozen(0, 0, 0, 0);
-    let effs = recovering.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 0, recovery_id: 1, truncate_to: 0 });
+    let effs = recovering.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
     assert!(!effs.is_empty(), "FROZEN accepts Case A");
 }
