@@ -24,3 +24,8 @@ hydra-worker = { path = "../hydra-worker" }
 hydra-wal = { path = "../hydra-wal" }
 hydra-coordinator = { path = "../hydra-coordinator" }
 flatbuffers.workspace = true
+# Audit H6: the VENDORED GGUF parser is the one the worker actually loads through; the Rust reader
+# below it is the offline splitter's. Fuzzing one and reporting "the GGUF parser" covers the other
+# by silence. Degrades to a stub when the engine is unavailable, and the target says so rather than
+# disappearing.
+hydra-engine-sys = { path = "../hydra-engine-sys" }

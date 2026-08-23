@@ -113,6 +113,27 @@ fn the_bootstrap_parser_survives_a_seeded_hostile_corpus() {
     }
 }
 
+/// **Audit H6 — the VENDORED parser, the one the worker actually loads through.**
+///
+/// Skipped (loudly) when the engine is not linked, which is the CI case today: **`build.rs`
+/// degrades to a stub and CI never builds the real engine at all** (audit L1). So this target is
+/// exercised locally and its CI status is *unavailable*, not *green* — recorded here so the
+/// distinction survives into whoever reads the receipts.
+#[test]
+fn the_vendored_gguf_parser_survives_a_seeded_hostile_corpus() {
+    if !hydra_engine_sys::ENGINE_AVAILABLE {
+        eprintln!("SKIP: the vendored engine is not linked — this target is UNAVAILABLE, not passing (audit L1)");
+        return;
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::VendoredGguf));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
 /// The **on-disk WAL record framing** (rule-17 sweep). It was already allocation-free by
 /// construction — but "clean by construction" is a claim, and rule 17 asks for a target rather than
 /// a claim. The oracle is the arithmetic and the self-consistency of any record it hands back.
@@ -156,6 +177,7 @@ fn the_generator_produces_varied_nonempty_inputs() {
                 Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
                 Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
                 Target::BoundaryRecord => hydra_fuzz::gen::boundary_record_case(&mut rng),
+                Target::VendoredGguf => hydra_fuzz::gen::gguf_case(&mut rng),
             };
             total += input.len();
             lens.insert(input.len());
@@ -182,6 +204,7 @@ fn a_case_is_reproducible_from_seed_and_iteration_alone() {
                     Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
                     Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
                     Target::BoundaryRecord => hydra_fuzz::gen::boundary_record_case(&mut rng),
+                    Target::VendoredGguf => hydra_fuzz::gen::gguf_case(&mut rng),
                 }
             };
             assert_eq!(build(iteration), build(iteration), "{} case {iteration} is not reproducible", target.name());

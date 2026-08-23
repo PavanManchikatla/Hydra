@@ -19,6 +19,8 @@ hydra-proto = { path = "../hydra-proto" }
 hydra-state = { path = "../hydra-state" }
 hydra-transport = { path = "../hydra-transport" }
 hydra-engine-sys = { path = "../hydra-engine-sys" }
+# Audit H6: O_NOFOLLOW on the shard open, and (dev, ino) identity across the two opens.
+libc = "0.2"
 # Promoted to a regular dep (P2·10b, 2026-08-22): the worker verifies the Ed25519-signed shard
 # manifest before loading any shard weights (refuse-on-fail), so it needs the manifest type at
 # runtime. One-way edge — hydra-modelsvc deps are gguf/blake3/ring/thiserror only, no cycle.
@@ -44,4 +46,8 @@ hydra-coordinator = { path = "../hydra-coordinator" }
 hydra-tokenizer = { path = "../hydra-tokenizer" }
 
 [dev-dependencies]
+# Audit H6: the TOCTOU and O_NOFOLLOW regressions need real files staged in a temp dir, and the
+# hardened-parser test replays the exact fuzz case that aborts the vendored parser.
+tempfile = "3"
+hydra-fuzz = { path = "../hydra-fuzz" }
 tokio = { version = "1", features = ["full"] }

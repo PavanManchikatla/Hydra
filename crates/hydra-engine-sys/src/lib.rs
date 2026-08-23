@@ -99,6 +99,7 @@ mod ffi {
         ) -> i32;
         pub fn hydra_logits(c: *mut HydraContext, at_pos: i32, out: *mut f32, out_cap: i32) -> i32;
         pub fn hydra_kv_truncate(c: *mut HydraContext, pos: i32) -> c_int;
+        pub fn hydra_gguf_probe(path: *const c_char) -> i32;
     }
 }
 
@@ -113,6 +114,20 @@ mod imp {
         } else {
             Err(EngineError { code, what: "hydra FFI call failed" })
         }
+    }
+
+    /// **Audit H6 — drive the VENDORED GGUF parser over `path`.**
+    ///
+    /// `Ok(true)` = the vendored parser accepted the file, `Ok(false)` = it rejected it. **Both are
+    /// fine.** The only failure this exists to detect is the one that is not a return value at all:
+    /// a segfault, an abort, or a C++ exception crossing back into Rust.
+    ///
+    /// The 24-CPU-hour budget has been fuzzing `hydra-modelsvc`'s Rust reader — the **offline
+    /// splitter's** parser. The worker loads through *this* one. They are different programs.
+    pub fn gguf_probe(path: &str) -> Result<bool, EngineError> {
+        let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path contains a NUL" })?;
+        let rc = unsafe { ffi::hydra_gguf_probe(c.as_ptr()) };
+        Ok(rc == 0)
     }
 
     /// A loaded model (full weights). Owns the C handle; freed on drop.
@@ -394,6 +409,10 @@ mod imp {
     pub struct Context<'m>(std::marker::PhantomData<&'m ()>);
 
     impl Model {
+        pub fn gguf_probe(_path: &str) -> Result<bool, EngineError> {
+            Err(EngineError::unavailable())
+        }
+
         pub fn load(_path: &str, _n_gpu_layers: i32) -> Result<Model, EngineError> {
             Err(EngineError::unavailable())
         }
@@ -464,7 +483,7 @@ mod imp {
     }
 }
 
-pub use imp::{Context, Model};
+pub use imp::{gguf_probe, Context, Model};
 
 /// True when the real engine is linked (the vendored build tree was present at build time).
 pub const ENGINE_AVAILABLE: bool = cfg!(not(engine_unavailable));

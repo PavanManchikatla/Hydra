@@ -6,6 +6,7 @@
 #include "hydra_engine.h"
 
 #include "llama.h"
+#include "gguf.h"   /* [audit H6] the vendored parser, for the fuzz probe */
 
 #include <cstring>
 #include <string>
@@ -265,6 +266,27 @@ int32_t hydra_kv_truncate(HydraContext* c, int32_t pos) {
     if (!llama_memory_seq_rm(mem, 0, pos, -1)) return HYDRA_E_KV;
     return HYDRA_OK;
     HYDRA_GUARD_END(HYDRA_E_KV)
+}
+
+/* [audit H6] The vendored-parser fuzz entry point. Guarded like every other entry point: the
+ * point of the exercise is that a hostile GGUF must produce a return value, never an unwind into
+ * Rust and never an abort. */
+int32_t hydra_gguf_probe(const char* path) {
+    HYDRA_GUARD_BEGIN
+    if (!path) return HYDRA_E_NULL;
+    struct gguf_init_params p = { /*no_alloc=*/true, /*ctx=*/NULL };
+    struct gguf_context * g = gguf_init_from_file(path, p);
+    if (!g) return HYDRA_E_LOAD;
+    /* Walk the accessors as well: a parser that accepts a hostile file and then hands out an
+     * out-of-range value has moved the crash rather than prevented it (the same discipline the
+     * Rust gguf target uses). */
+    const int64_t n_kv = gguf_get_n_kv(g);
+    for (int64_t i = 0; i < n_kv; i++) { (void) gguf_get_kv_type(g, i); (void) gguf_get_key(g, i); }
+    const int64_t n_t = gguf_get_n_tensors(g);
+    for (int64_t i = 0; i < n_t; i++) { (void) gguf_get_tensor_name(g, i); (void) gguf_get_tensor_type(g, i); (void) gguf_get_tensor_offset(g, i); }
+    gguf_free(g);
+    return HYDRA_OK;
+    HYDRA_GUARD_END(HYDRA_E_LOAD)
 }
 
 } // extern "C"

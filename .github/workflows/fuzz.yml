@@ -66,7 +66,7 @@ jobs:
       - name: Build the fuzz driver (release)
         run: cargo build --release -p hydra-fuzz --bin hydra-fuzz
 
-      # `--target all` now covers SEVEN parsers — every parser of untrusted input in the tree, per
+      # `--target all` now covers EIGHT targets, SEVEN of which run here — every parser of untrusted input in the tree, per
       # standing rule 17 (a defect class fixed in one parser and left in another is not fixed):
       # manifest/bootstrap/wal-record added by audit Wave 1a, boundary-record by Wave 1c (C3). A
       # fixed --seconds buys proportionally less time per target. The classify step below requires
@@ -97,6 +97,10 @@ jobs:
             exit 1
           fi
           # Every target must have reported, or the run covered less than it claims.
+          # NOTE (audit H6): `vendored-gguf` is deliberately NOT in this list. It requires the real
+          # engine, and CI never builds it (audit L1 — build.rs degrades to a stub), so requiring it
+          # here would fail every run for a reason that has nothing to do with the parsers. Its CI
+          # status is UNAVAILABLE, not green, and the receipts must say which parser they protect.
           for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
           done

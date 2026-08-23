@@ -344,3 +344,118 @@ fn an_unsigned_but_structurally_hostile_manifest_never_reaches_the_parser() {
     );
     let _ = std::fs::remove_file(&hostile);
 }
+
+// ---------------------------------------------------------------------------------------------
+// **Audit H6 — the worker never ran the hardened GGUF parser, and the two opens were unrelated.**
+//
+// # Standing rule 19: what the oracle could not see, in two of the three degrees
+//
+// **SILENT.** No test in this project has ever driven the parser the worker actually loads
+// through. `Target::Gguf` fuzzes `hydra_modelsvc::gguf` — the *offline splitter's* reader — for
+// 24 CPU-hours; the worker hashed the bytes and handed the **path** to `llama.cpp`. Two different
+// programs, and the receipts said "the GGUF parser" without saying which. The new
+// `vendored-gguf` fuzz target found a **SIGABRT inside `gguf_init_from_file_ptr` on its first
+// run** (seed 1, iteration 350) — an abort, so the shim's `catch (...)` cannot see it either.
+//
+// **INDISTINGUISHING.** The hash and the load are two separate `open()`s of the same *name*, and
+// every test fed them a file nobody was modifying — under which "hash the bytes you load" and
+// "hash some bytes, then load whatever that name resolves to now" return the same answer for
+// every input the harness could produce.
+// ---------------------------------------------------------------------------------------------
+
+/// **H6 — a symlinked shard path is refused outright (`O_NOFOLLOW`).**
+///
+/// A symlink is a name that can point somewhere else a microsecond later, which is precisely the
+/// window the hash is supposed to close.
+#[test]
+fn a_symlinked_shard_path_is_refused_before_it_is_hashed() {
+    let Some((s0, _s1, mf)) = shard_set() else {
+        eprintln!("skip: shard fixture unavailable");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("qwen2-stage0-L0_12.gguf");
+    std::os::unix::fs::symlink(&s0, &link).expect("symlink");
+
+    let err = verify_shard(&mf, link.to_str().unwrap(), 0, 12, &trusted_signer(), &manifest_hash(&mf)).unwrap_err();
+    assert!(
+        matches!(err, ShardRefused::NotARegularFile { .. }),
+        "a symlinked shard must be refused, not resolved: {err:?}"
+    );
+}
+
+/// **H6 — the file that gets loaded must be the file that was hashed.**
+///
+/// The verification is performed, and *then* the file is replaced with different bytes before the
+/// load — the TOCTOU the finding names. The identity check must catch it and the model must not
+/// be produced.
+#[test]
+fn a_shard_replaced_between_verification_and_load_is_refused() {
+    let Some((s0, s1, mf)) = shard_set() else {
+        eprintln!("skip: shard fixture unavailable");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen2-stage0-L0_12.gguf");
+    std::fs::copy(&s0, &path).expect("stage the real shard");
+
+    let v = verify_shard(&mf, path.to_str().unwrap(), 0, 12, &trusted_signer(), &manifest_hash(&mf))
+        .expect("the staged copy verifies");
+
+    // Now swap the file for a different one (the other stage's shard: real GGUF, wrong bytes).
+    std::fs::remove_file(&path).unwrap();
+    std::fs::copy(&s1, &path).expect("swap in different bytes");
+
+    match hydra_worker::shard::load_verified_shard(&v, 0) {
+        Err(ShardRefused::ChangedUnderneath { .. }) => {}
+        Err(other) => panic!("expected ChangedUnderneath, got {other:?}"),
+        Ok(_) => panic!(
+            "loading after a swap was ACCEPTED — the verification proved nothing about the bytes \
+             that got mapped, which is the TOCTOU H6 names"
+        ),
+    }
+}
+
+/// **H6 — the hardened parser now runs on the worker, and it refuses what it should.**
+///
+/// The control matters as much as the refusal: a real shard must still parse, or the pre-flight
+/// would simply be an outage.
+#[test]
+fn the_hardened_parser_runs_on_the_load_path_and_refuses_a_hostile_metadata_region() {
+    use hydra_modelsvc::gguf::Gguf;
+
+    let Some((s0, _s1, _mf)) = shard_set() else {
+        eprintln!("skip: shard fixture unavailable");
+        return;
+    };
+    // Control: a real shard's metadata region parses from a bounded prefix, against the real size.
+    let len = std::fs::metadata(&s0).unwrap().len();
+    let mut prefix = vec![0u8; (64 * 1024 * 1024u64).min(len) as usize];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&s0).unwrap();
+        let n = f.read(&mut prefix).unwrap();
+        prefix.truncate(n);
+    }
+    let meta = Gguf::parse_metadata(&prefix, len).expect("a real shard's metadata parses from a prefix");
+    assert!(!meta.tensors.is_empty(), "and it actually found the tensor table");
+    assert_eq!(meta.architecture(), Some("qwen2"));
+
+    // The case that aborts the VENDORED parser (hydra-fuzz seed 1, iteration 350) is refused by
+    // the hardened one — cheaply, with a structured error, and without touching the engine.
+    let mut rng = hydra_fuzz::Rng::for_case(1, 350);
+    let hostile = hydra_fuzz::gen::gguf_case(&mut rng);
+    let out = Gguf::parse_metadata(&hostile, hostile.len() as u64);
+    assert!(
+        out.is_err(),
+        "the hardened parser must refuse the case that SIGABRTs llama.cpp's parser — that refusal \
+         is what keeps the vendored parser from ever seeing it"
+    );
+
+    // A tensor table pointing past the end of the file is refused against the REAL length, which
+    // a prefix alone could never establish.
+    assert!(
+        Gguf::parse_metadata(&prefix, 1024).is_err(),
+        "a tensor extent beyond the file length must be refused"
+    );
+}

@@ -96,6 +96,15 @@ int32_t hydra_logits(HydraContext* c, int32_t at_pos, float* out, int32_t out_ca
 /* Drop cached KV for positions >= pos (recovery truncate; I7a). */
 int32_t hydra_kv_truncate(HydraContext* c, int32_t pos);
 
+/* [audit H6] Drive the VENDORED GGUF parser (`gguf_init_from_file`) over `path` and free whatever
+ * it returns. Returns HYDRA_OK if the file parsed, HYDRA_E_LOAD if it was rejected.
+ *
+ * This exists ONLY for the fuzz arm. The project's 24-CPU-hour parser budget has been protecting
+ * `hydra-modelsvc`'s Rust GGUF reader — which is the OFFLINE SPLITTER's parser. The parser on the
+ * worker's load path is this one, the vendored C++ one, and it has never been fuzzed by this
+ * project. A crash here is a crash in the process that holds the model. */
+int32_t hydra_gguf_probe(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

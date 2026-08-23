@@ -208,9 +208,65 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// The metadata half of a GGUF: everything but the tensor data (audit H6).
+#[derive(Debug, Clone)]
+pub struct GgufMeta {
+    pub version: u32,
+    pub alignment: u64,
+    pub metadata: Vec<(String, GgufValue)>,
+    pub tensors: Vec<TensorInfo>,
+    pub data_start: u64,
+}
+
+impl GgufMeta {
+    /// The architecture string (`general.architecture`), if present.
+    pub fn architecture(&self) -> Option<&str> {
+        match self.metadata.iter().find(|(k, _)| k == "general.architecture") {
+            Some((_, GgufValue::Str(s))) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
 impl Gguf {
     /// Parse a whole GGUF file from memory.
-    pub fn parse(bytes: &[u8]) -> R<Gguf> {
+    /// **Audit H6 — parse the metadata region only, without copying the tensor data.**
+    ///
+    /// [`Gguf::parse`] ends with `bytes[data_start..].to_vec()`, which is fine for the offline
+    /// splitter (it wants the data) and impossible on a worker's load path, where a shard is
+    /// gigabytes. That is a large part of *why* the worker never ran this parser and handed the
+    /// path straight to `llama.cpp` instead — the hardened reader was shaped for the wrong caller.
+    ///
+    /// This entry point parses the header, the KV block and the tensor-info table — **the region
+    /// every GGUF parsing defect lives in** — from a bounded prefix, and validates each tensor's
+    /// extent against `file_len` (the real length on disk, which the caller knows and the prefix
+    /// does not). It copies nothing.
+    ///
+    /// `bytes` may be a prefix of the file; `file_len` must be the whole file's length.
+    pub fn parse_metadata(bytes: &[u8], file_len: u64) -> R<GgufMeta> {
+        let (metadata, tensors, data_start, version, alignment) = Self::parse_head(bytes)?;
+        if data_start > file_len {
+            return Err(GgufError::Truncated { at: data_start as usize, need: 0, have: 0 });
+        }
+        // Every tensor must lie inside the file. The splitter's `tensor_bytes` checks this against
+        // an in-memory copy; on the load path the file itself is the bound, and a tensor table
+        // that points past the end is exactly the shape that makes a mapping parser read garbage.
+        for t in &tensors {
+            let len = t.byte_len()?;
+            let end = data_start
+                .checked_add(t.offset)
+                .and_then(|o| o.checked_add(len))
+                .ok_or_else(|| GgufError::ShapeOverflow { name: t.name.clone(), what: "data_start + offset + length" })?;
+            if end > file_len {
+                return Err(GgufError::TensorOutOfRange(t.name.clone()));
+            }
+        }
+        Ok(GgufMeta { version, alignment, metadata, tensors, data_start })
+    }
+
+    /// Shared head parse for [`Gguf::parse`] and [`Gguf::parse_metadata`].
+    #[allow(clippy::type_complexity)]
+    fn parse_head(bytes: &[u8]) -> R<(Vec<(String, GgufValue)>, Vec<TensorInfo>, u64, u32, u64)> {
         let mut c = Cursor { b: bytes, i: 0 };
         if c.take(4)? != MAGIC {
             return Err(GgufError::BadMagic);
@@ -257,19 +313,22 @@ impl Gguf {
 
         // The data section begins at the next `alignment` boundary after the tensor infos.
         let data_start_u64 = align_up(c.i as u64, alignment);
+        Ok((metadata, tensors, data_start_u64, version, alignment))
+    }
+
+    pub fn parse(bytes: &[u8]) -> R<Gguf> {
+        let (metadata, tensors, data_start_u64, version, alignment) = Self::parse_head(bytes)?;
+        let c_i = data_start_u64 as usize;
         // Compare in u64 first: on any target, narrowing a saturated value to `usize` before the
         // bounds check is how an out-of-range offset becomes an in-range one.
         if data_start_u64 > bytes.len() as u64 {
             return Err(GgufError::Truncated {
-                at: c.i,
+                at: c_i.min(bytes.len()),
                 need: usize::MAX,
-                have: bytes.len().saturating_sub(c.i),
+                have: bytes.len().saturating_sub(c_i.min(bytes.len())),
             });
         }
         let data_start = data_start_u64 as usize;
-        if data_start > bytes.len() {
-            return Err(GgufError::Truncated { at: c.i, need: data_start - c.i, have: bytes.len() - c.i });
-        }
         let data = bytes[data_start..].to_vec();
 
         Ok(Gguf { version, alignment, metadata, tensors, data })
