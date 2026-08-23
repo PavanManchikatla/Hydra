@@ -14,6 +14,7 @@
 pub mod admission;
 pub mod capability;
 pub mod link;
+pub mod prefill;
 pub mod solver;
 pub mod stability;
 pub mod telemetry;

@@ -124,6 +124,8 @@ pub struct CommitStream {
     committed_sampler_checkpoint_id: u64,
     next_commit_id: u64,
     last_commit_id: u64,
+    /// Input-side watermark (spec §2.4). Advances **only** after a durable `INPUT_CHUNK_COMMIT`.
+    prefill_stable_pos: i64,
 }
 
 impl CommitStream {
@@ -144,7 +146,15 @@ impl CommitStream {
             committed_sampler_checkpoint_id: 0,
             next_commit_id: 1,
             last_commit_id: 0,
+            prefill_stable_pos: -1,
         }
+    }
+
+    /// Input-side watermark (spec §2.4): the last input position whose chunk is **durably**
+    /// committed. `-1` = none. Never advanced by anything but a completed
+    /// [`Self::append_input_chunk_commit`].
+    pub fn prefill_stable_pos(&self) -> i64 {
+        self.prefill_stable_pos
     }
 
     pub fn generation_durable_pos(&self) -> i64 {
@@ -245,6 +255,66 @@ impl CommitStream {
         self.generation_durable_pos = last_output_pos;
         self.committed_sampler_checkpoint_id =
             flatbuffers::root::<wal::GenerationCommit>(payload).expect("just built").checkpoint().checkpoint_id();
+        self.last_commit_id = commit_id;
+        self.next_commit_id += 1;
+        Ok(commit_id)
+    }
+
+    /// `INPUT_CHUNK_COMMIT` for the input chunk `[first_input_pos ..= last_input_pos]` (spec §2.4).
+    ///
+    /// **The caller must already hold the chunk's admission evidence** — S_P's `APPLIED_ACK(b−1)`
+    /// and, in a mode that requires it, the `DURABILITY_ACK` for every boundary edge — because this
+    /// record is the *durable consequence* of that evidence, not a request for it.
+    /// `boundary_durable_through` carries the per-edge durable frontier so a recovering coordinator
+    /// can tell what was safe at the moment the chunk committed.
+    ///
+    /// **`prefill_stable_pos` advances only after the `fdatasync`'d append returns** — the same
+    /// emit-after-commit discipline the generation side uses. A stalled or failing `fdatasync`
+    /// leaves the watermark exactly where it was, so an interrupted prefill truncates to a position
+    /// that is genuinely on disk.
+    ///
+    /// Refuses a non-monotonic chunk: prefill is an append-only advance of the input frontier, and
+    /// a chunk that would move the watermark backwards is a caller defect, never a silent no-op.
+    pub fn append_input_chunk_commit(
+        &mut self,
+        fence: &WalFenceCtx,
+        segment_id: u32,
+        chunk_id: u32,
+        first_input_pos: i64,
+        last_input_pos: i64,
+        boundary_durable_through: &[i64],
+    ) -> Result<u64, CommitError> {
+        if last_input_pos < first_input_pos {
+            return Err(CommitError::I19(format!(
+                "INPUT_CHUNK_COMMIT: inverted chunk [{first_input_pos}, {last_input_pos}]"
+            )));
+        }
+        if last_input_pos <= self.prefill_stable_pos {
+            return Err(CommitError::I19(format!(
+                "INPUT_CHUNK_COMMIT: last_input_pos {last_input_pos} does not advance \
+                 prefill_stable_pos {} — prefill only moves the input frontier forward",
+                self.prefill_stable_pos
+            )));
+        }
+        let commit_id = self.next_commit_id;
+        let mut fbb = FlatBufferBuilder::new();
+        let fence_off = build_fence(&mut fbb, fence);
+        let durable_off = fbb.create_vector(boundary_durable_through);
+        let icc = wal::InputChunkCommit::create(
+            &mut fbb,
+            &wal::InputChunkCommitArgs {
+                fence: Some(fence_off),
+                segment_id,
+                chunk_id,
+                first_input_pos,
+                last_input_pos,
+                boundary_durable_through: Some(durable_off),
+            },
+        );
+        fbb.finish(icc, None);
+        self.writer.append(rec_type::INPUT_CHUNK_COMMIT, 0, fbb.finished_data())?;
+        // Durable now — and only now does the input watermark move.
+        self.prefill_stable_pos = last_input_pos;
         self.last_commit_id = commit_id;
         self.next_commit_id += 1;
         Ok(commit_id)
