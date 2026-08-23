@@ -28,7 +28,7 @@ use hydra_transport::framed::Conn;
 use hydra_transport::tcp_mtls::TcpMtls;
 use hydra_worker::pair::{dev_model_path, Cluster, SubprocessWorker};
 use hydra_worker::sampler::{initial_checkpoint_bytes, SamplingConfig};
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{WorkerConfig, INITIAL_CHECKPOINT_ID};
 use hydra_worker::Bootstrap;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -50,7 +50,7 @@ enum Window {
     BetweenFsyncAndEmit,
 }
 
-fn fence() -> WalFenceCtx {
+fn wal_fence() -> WalFenceCtx {
     WalFenceCtx {
         cluster_id: CLUSTER_ID,
         session_id: SESSION_ID,
@@ -69,9 +69,9 @@ fn sampling_config() -> SamplingConfig {
     SamplingConfig { temperature: 0.8, top_p: 0.95, repeat_penalty: 1.1, penalty_last_n: 32, seed: 0xD1_D1_D1 }
 }
 
-fn sp_config(model_path: &str, keys: &SessionKeys, n_ctx: i32, recovery_id: u32, recovery_start: bool) -> WorkerConfig {
+fn sp_config(model_path: &str, fence: &SessionFence, n_ctx: i32, recovery_id: u32, recovery_start: bool) -> WorkerConfig {
     WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank: 0,
         layer_first: 0,
         layer_last: -1,
@@ -119,24 +119,24 @@ fn admission(prompt: &[u32]) -> Admission {
 
 // ------------------------- wire drivers (coordinator side) -------------------------
 
-async fn apply<S>(c: &mut Conn<S>, keys: &SessionKeys, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String>
+async fn apply<S>(c: &mut Conn<S>, fence: &SessionFence, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    c.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, no_sample)).await.map_err(|e| format!("apply send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("apply recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, no_sample)).await.map_err(|e| format!("apply send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("apply recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()),
         other => Err(format!("apply @ {input_pos}: expected APPLIED_ACK, got {other:?}")),
     }
 }
 
 /// `SAMPLE_NEXT` → `(token_id, snapshot bytes)`.
-async fn sample<S>(c: &mut Conn<S>, keys: &SessionKeys, output_pos: i64, cfg_hash: &[u8; 32]) -> Result<(u32, Vec<u8>), String>
+async fn sample<S>(c: &mut Conn<S>, fence: &SessionFence, output_pos: i64, cfg_hash: &[u8; 32]) -> Result<(u32, Vec<u8>), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    c.send(0, &wire::encode_sample_next(keys, 0, output_pos, cfg_hash, INITIAL_CHECKPOINT_ID)).await.map_err(|e| format!("sample send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("sample recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_sample_next(fence, 0, output_pos, cfg_hash, INITIAL_CHECKPOINT_ID)).await.map_err(|e| format!("sample send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("sample recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::Sampled { output_pos: p, token_id, post_sample_snapshot, .. } if p == output_pos => Ok((token_id, post_sample_snapshot)),
         Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {output_pos} errored: code {code}")),
         other => Err(format!("SAMPLE_NEXT @ {output_pos}: expected SAMPLED, got {other:?}")),
@@ -144,29 +144,29 @@ where
 }
 
 /// Prefill the prompt (NO_SAMPLE) at input positions `0..prompt.len()`.
-async fn prefill<S>(c: &mut Conn<S>, keys: &SessionKeys, prompt: &[u32]) -> Result<(), String>
+async fn prefill<S>(c: &mut Conn<S>, fence: &SessionFence, prompt: &[u32]) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     for (pos, &tok) in prompt.iter().enumerate() {
-        apply(c, keys, pos as i64, tok, true).await?;
+        apply(c, fence, pos as i64, tok, true).await?;
     }
     Ok(())
 }
 
 /// The uninterrupted seeded reference: prompt prefill then `n` autoregressive sample steps. Returns
 /// the generated token sequence.
-async fn reference_run(connector: &TcpMtls, addr: std::net::SocketAddr, name: &str, keys: &SessionKeys, prompt: &[u32], n: usize) -> Result<Vec<u32>, String> {
+async fn reference_run(connector: &TcpMtls, addr: std::net::SocketAddr, name: &str, fence: &SessionFence, prompt: &[u32], n: usize) -> Result<Vec<u32>, String> {
     let cfg_hash = sampling_config().hash();
     let mut c = connector.connect(addr, name).await.map_err(|e| format!("ref connect: {e}"))?;
-    prefill(&mut c, keys, prompt).await?;
+    prefill(&mut c, fence, prompt).await?;
     let mut out = Vec::with_capacity(n);
     let mut input_pos = prompt.len() as i64;
     for pos in 0..n as i64 {
-        let (tok, _snap) = sample(&mut c, keys, pos, &cfg_hash).await?;
+        let (tok, _snap) = sample(&mut c, fence, pos, &cfg_hash).await?;
         out.push(tok);
         if (pos as usize + 1) < n {
-            apply(&mut c, keys, input_pos, tok, false).await?;
+            apply(&mut c, fence, input_pos, tok, false).await?;
             input_pos += 1;
         }
     }
@@ -176,13 +176,13 @@ async fn reference_run(connector: &TcpMtls, addr: std::net::SocketAddr, name: &s
 /// Drive the recovery flow on an already-connected fresh replacement S_P through the REAL machinery,
 /// leaving it ACTIVE_FINAL with KV rebuilt and the sampler restored to `state`'s last durable
 /// checkpoint — ready to resume `SAMPLE_NEXT` at `generation_durable_pos + 1`.
-async fn drive_recovery<S>(c: &mut Conn<S>, keys: &SessionKeys, state: &RecoveryState) -> Result<(), String>
+async fn drive_recovery<S>(c: &mut Conn<S>, fence: &SessionFence, state: &RecoveryState) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // 1. BEGIN_RECOVERY Case A — fresh replica (empty KV) → truncate_to = 0, new recovery_id = 1.
-    c.send(0, &wire::encode_begin_recovery(keys, 0, 0, 1, 0)).await.map_err(|e| format!("begin send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("begin recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_begin_recovery(fence, 0, 0, 1, 0)).await.map_err(|e| format!("begin send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("begin recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::RecoveryAck { .. } => {}
         other => return Err(format!("BEGIN_RECOVERY: expected RECOVERY_ACK, got {other:?}")),
     }
@@ -190,18 +190,18 @@ where
     // 2. Catch-up: REBUILD_APPLY (APPLY_TOKEN NO_SAMPLE) the durable prompt+generated tokens to
     //    rebuild the engine KV, then CATCH_UP_CONTEXT advances the stage SM to FROZEN_READY.
     for (i, tok) in state.replay_tokens().into_iter().enumerate() {
-        apply(c, keys, i as i64, tok, true).await?;
+        apply(c, fence, i as i64, tok, true).await?;
     }
-    c.send(0, &wire::encode_catch_up_context(keys, 0, 1, state.input_frontier())).await.map_err(|e| format!("catchup send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("catchup recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_catch_up_context(fence, 0, 1, state.input_frontier())).await.map_err(|e| format!("catchup send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("catchup recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::CatchUpReady { applied_input_pos } if applied_input_pos == state.input_frontier() => {}
         other => return Err(format!("CATCH_UP: expected CATCH_UP_READY @ {}, got {other:?}", state.input_frontier())),
     }
 
     // 3. INSTALL_SAMPLER_CHECKPOINT from the last durable GENERATION_COMMIT's snapshot (I7b/I15
     //    restore point) — restores the exact RNG state at generation_durable_pos.
-    c.send(0, &wire::encode_install_sampler_checkpoint(keys, 0, state.checkpoint_id, &state.last_checkpoint)).await.map_err(|e| format!("install send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("install recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_install_sampler_checkpoint(fence, 0, state.checkpoint_id, &state.last_checkpoint)).await.map_err(|e| format!("install send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("install recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::SamplerCheckpointInstalled { .. } => {}
         Msg::Err { code } => return Err(format!("INSTALL_SAMPLER_CHECKPOINT errored: code {code}")),
         other => return Err(format!("INSTALL: expected SAMPLER_CHECKPOINT_INSTALLED, got {other:?}")),
@@ -209,13 +209,13 @@ where
 
     // 4. Activation transaction (RECOVERY): COMMIT → COMMITTED, FINALIZE → FINALIZED (ACTIVE_FINAL).
     let tuple = ActivationTuple { kind: ActivationKind::Recovery, epoch: 0, recovery_id: 1, attempt: 0, sampler_checkpoint_id: state.checkpoint_id };
-    c.send(0, &wire::encode_commit_activation(keys, &tuple, 1)).await.map_err(|e| format!("commit send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("commit recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_commit_activation(fence, &tuple, 1)).await.map_err(|e| format!("commit send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("commit recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::ActivationCommitted(_) => {}
         other => return Err(format!("COMMIT_ACTIVATION: expected ACTIVATION_COMMITTED, got {other:?}")),
     }
-    c.send(0, &wire::encode_finalize_activation(keys, &tuple, 1)).await.map_err(|e| format!("finalize send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("finalize recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_finalize_activation(fence, &tuple, 1)).await.map_err(|e| format!("finalize send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("finalize recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::ActivationFinalized => {}
         other => return Err(format!("FINALIZE: expected ACTIVATION_FINALIZED, got {other:?}")),
     }
@@ -228,7 +228,7 @@ struct Harness<'a> {
     cluster: &'a Cluster,
     connector: &'a TcpMtls,
     binary: &'a str,
-    keys: &'a SessionKeys,
+    fence: &'a SessionFence,
     model_path: &'a str,
     n_ctx: i32,
     prompt: &'a [u32],
@@ -239,8 +239,8 @@ struct Harness<'a> {
 /// a replacement, resume to `n`. Returns `(committed_tokens ⊕ resumed_tokens, commit_stream_path,
 /// detection_to_resumed_wall)`.
 async fn run_window(h: &Harness<'_>, window: Window) -> Result<(Vec<u32>, std::path::PathBuf, std::time::Duration), String> {
-    let (cluster, connector, binary, keys, model_path, n_ctx, prompt, n) =
-        (h.cluster, h.connector, h.binary, h.keys, h.model_path, h.n_ctx, h.prompt, h.n);
+    let (cluster, connector, binary, fence, model_path, n_ctx, prompt, n) =
+        (h.cluster, h.connector, h.binary, h.fence, h.model_path, h.n_ctx, h.prompt, h.n);
     let cfg_hash = sampling_config().hash();
     let dir = std::env::temp_dir().join(format!("hydra-d1-2b-{}-{:?}", std::process::id(), window));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -248,13 +248,13 @@ async fn run_window(h: &Harness<'_>, window: Window) -> Result<(Vec<u32>, std::p
 
     // The coordinator's durable commit stream (survives the worker kill — only S_P dies).
     let mut cs = CommitStream::create(&cs_path, CLUSTER_ID, SESSION_ID).map_err(|e| e.to_string())?;
-    cs.append_initial_commit(&fence(), &admission(prompt), &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &sampling_config()), 1).map_err(|e| e.to_string())?;
+    cs.append_initial_commit(&wal_fence(), &admission(prompt), &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &sampling_config()), 1).map_err(|e| e.to_string())?;
     let mut group = GroupCommitter::new(K);
 
     // Initial S_P subprocess.
-    let mut sp = SubprocessWorker::spawn(binary, &boot(cluster, "sp-init", sp_config(model_path, keys, n_ctx, 0, false))).map_err(|e| e.to_string())?;
+    let mut sp = SubprocessWorker::spawn(binary, &boot(cluster, "sp-init", sp_config(model_path, fence, n_ctx, 0, false))).map_err(|e| e.to_string())?;
     let mut c = connector.connect(sp.addr, "sp-init").await.map_err(|e| format!("init connect: {e}"))?;
-    prefill(&mut c, keys, prompt).await?;
+    prefill(&mut c, fence, prompt).await?;
 
     // The kill boundary (which durable group to stop at). Positions 0-indexed; durable at K-1, 2K-1…
     // Steady/BetweenFsyncAndEmit kill right after a commit; SampledAhead kills after sampling past it.
@@ -264,14 +264,14 @@ async fn run_window(h: &Harness<'_>, window: Window) -> Result<(Vec<u32>, std::p
     let mut killed = false;
 
     for pos in 0..n as i64 {
-        let (tok, snap) = sample(&mut c, keys, pos, &cfg_hash).await?;
+        let (tok, snap) = sample(&mut c, fence, pos, &cfg_hash).await?;
         generated_before_kill.push(tok);
         group.push(pos, tok, snap);
 
         // Commit on the count threshold.
         if group.count_ready() {
             let b = group.take().unwrap();
-            cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
+            cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
 
             // Window 1 & 3 kill AT a commit boundary (durable just advanced to b.last_pos).
             if !killed && b.last_pos == durable_target && matches!(window, Window::Steady | Window::BetweenFsyncAndEmit) {
@@ -287,7 +287,7 @@ async fn run_window(h: &Harness<'_>, window: Window) -> Result<(Vec<u32>, std::p
         }
 
         if (pos as usize + 1) < n {
-            apply(&mut c, keys, input_pos, tok, false).await?;
+            apply(&mut c, fence, input_pos, tok, false).await?;
             input_pos += 1;
         }
     }
@@ -309,30 +309,30 @@ async fn run_window(h: &Harness<'_>, window: Window) -> Result<(Vec<u32>, std::p
     let committed = state.generated_token_ids();
 
     // Spawn the replacement S_P (FROZEN) and drive recovery through the real machinery.
-    let mut rp = SubprocessWorker::spawn(binary, &boot(cluster, "sp-recover", sp_config(model_path, keys, n_ctx, 1, true))).map_err(|e| e.to_string())?;
+    let mut rp = SubprocessWorker::spawn(binary, &boot(cluster, "sp-recover", sp_config(model_path, fence, n_ctx, 1, true))).map_err(|e| e.to_string())?;
     let mut rc = connector.connect(rp.addr, "sp-recover").await.map_err(|e| format!("recover connect: {e}"))?;
-    drive_recovery(&mut rc, keys, &state).await?;
+    drive_recovery(&mut rc, fence, &state).await?;
     let detect_to_resumed = t_detect.elapsed();
 
     // Resume: SAMPLE_NEXT at durable+1, feeding back autoregressively, committing in k-groups.
     let mut resumed: Vec<u32> = Vec::new();
     input_pos = state.input_frontier();
     for pos in (durable_pos + 1)..n as i64 {
-        let (tok, snap) = sample(&mut rc, keys, pos, &cfg_hash).await?;
+        let (tok, snap) = sample(&mut rc, fence, pos, &cfg_hash).await?;
         resumed.push(tok);
         group.push(pos, tok, snap);
         if group.count_ready() {
             let b = group.take().unwrap();
-            cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
+            cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
         }
         if (pos as usize + 1) < n {
-            apply(&mut rc, keys, input_pos, tok, false).await?;
+            apply(&mut rc, fence, input_pos, tok, false).await?;
             input_pos += 1;
         }
     }
     // Flush any trailing partial group durably (finish-of-generation).
     if let Some(b) = group.take() {
-        cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
+        cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot).map_err(|e| e.to_string())?;
     }
     drop(rc);
     rp.kill9().ok();
@@ -362,18 +362,18 @@ async fn d1_recovery_three_kill_windows_are_byte_identical_to_an_uninterrupted_s
     let n = 9usize; // generated tokens (spans 3 group commits at k=3)
     let n_ctx = prompt.len() as i32 + n as i32 + 8;
 
-    let keys = SessionKeys::dev(0xD1);
+    let fence = SessionFence::dev(0xD1);
     let cluster = Cluster::new().unwrap();
     let connector = cluster.coordinator_connector().unwrap();
     let binary = env!("CARGO_BIN_EXE_hydra-worker");
 
     // The uninterrupted seeded reference (in-process endpoint; deterministic).
     let ref_id = cluster.issue("sp-ref").unwrap();
-    let ref_addr = hydra_worker::pair::spawn_endpoint(sp_config(&model_path, &keys, n_ctx, 0, false), cluster.ca.server_config(&ref_id).unwrap());
-    let reference = reference_run(&connector, ref_addr, "sp-ref", &keys, &prompt, n).await.expect("reference run");
+    let ref_addr = hydra_worker::pair::spawn_endpoint(sp_config(&model_path, &fence, n_ctx, 0, false), cluster.ca.server_config(&ref_id).unwrap());
+    let reference = reference_run(&connector, ref_addr, "sp-ref", &fence, &prompt, n).await.expect("reference run");
     assert_eq!(reference.len(), n);
 
-    let harness = Harness { cluster: &cluster, connector: &connector, binary, keys: &keys, model_path: &model_path, n_ctx, prompt: &prompt, n };
+    let harness = Harness { cluster: &cluster, connector: &connector, binary, fence: &fence, model_path: &model_path, n_ctx, prompt: &prompt, n };
     for window in [Window::Steady, Window::SampledAhead, Window::BetweenFsyncAndEmit] {
         let (visible, cs_path, timing) = run_window(&harness, window)
             .await

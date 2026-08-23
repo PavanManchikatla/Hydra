@@ -17,7 +17,7 @@ use hydra_transport::framed::Conn;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::retain::R3Buffer;
-use crate::wire::{self, SessionKeys};
+use crate::wire::{self, SessionFence};
 use crate::worker::WorkerError;
 
 /// P2·8 — the durability mode, made explicit rather than carried as a bare bool.
@@ -60,7 +60,7 @@ impl DurabilityMode {
 
 /// Forwarding-stage boundary durability: emit `BOUNDARY_COPY` + retain under R3′ until both acks clear.
 pub struct DurableForwarder {
-    keys: SessionKeys,
+    fence: SessionFence,
     epoch: Epoch,
     retain: R3Buffer,
     /// Monotone id assigned to each forwarded boundary (correlates its `DURABILITY_ACK`).
@@ -80,9 +80,9 @@ impl DurableForwarder {
     /// on the downstream ack alone). `capacity` is the R3′ retention bound (spec §5: ≤ max(in-flight
     /// window, one durability chunk)) — the point at which the forward path backpressures on durability
     /// rather than growing retention without bound; it must be ≥ 1.
-    pub fn new(keys: SessionKeys, epoch: Epoch, require_durable: bool, capacity: usize) -> DurableForwarder {
+    pub fn new(fence: SessionFence, epoch: Epoch, require_durable: bool, capacity: usize) -> DurableForwarder {
         DurableForwarder {
-            keys,
+            fence,
             epoch,
             retain: R3Buffer::new(require_durable),
             next_boundary_id: 0,
@@ -110,7 +110,7 @@ impl DurableForwarder {
         // happens: R3′ holds the boundary for the in-flight window and releases on the downstream
         // ack alone (R3Buffer was already constructed with that rule).
         if self.mode.copies_boundaries() {
-            dur.send(0, &wire::encode_boundary_copy(&self.keys, self.epoch, bid, input_pos, 0, boundary)).await?;
+            dur.send(0, &wire::encode_boundary_copy(&self.fence, self.epoch, bid, input_pos, 0, boundary)).await?;
         }
         self.retain.retain(input_pos, boundary.to_vec());
         Ok(bid)

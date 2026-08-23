@@ -14,15 +14,15 @@ use hydra_state::{ActivationKind, ActivationTuple};
 use hydra_transport::tcp_mtls::TcpMtls;
 use hydra_transport::ClusterCa;
 use hydra_worker::pair::spawn_multiconn_endpoint;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::WorkerConfig;
 
 const WORKER_NAME: &str = "s_p";
 const COORD_NAME: &str = "coordinator";
 
-fn control_plane_cfg(keys: SessionKeys) -> WorkerConfig {
+fn control_plane_cfg(fence: SessionFence) -> WorkerConfig {
     WorkerConfig {
-        keys,
+        fence,
         rank: 0,
         layer_first: 0,
         layer_last: -1,
@@ -62,9 +62,9 @@ async fn a_second_connection_is_served_while_the_first_is_held_open() {
     let ca = ClusterCa::new().unwrap();
     let worker_id = ca.issue(WORKER_NAME).unwrap();
     let coord_id = ca.issue(COORD_NAME).unwrap();
-    let keys = SessionKeys::dev(11);
+    let fence = SessionFence::dev(11);
 
-    let addr = spawn_multiconn_endpoint(control_plane_cfg(keys.clone()), ca.server_config(&worker_id).unwrap());
+    let addr = spawn_multiconn_endpoint(control_plane_cfg(fence.clone()), ca.server_config(&worker_id).unwrap());
     let connector = TcpMtls::from_config(ca.client_config(&coord_id).unwrap()).unwrap();
 
     // A: connect and hold open, idle (no frames) — occupies a serve task, parked on recv.
@@ -72,24 +72,24 @@ async fn a_second_connection_is_served_while_the_first_is_held_open() {
 
     // B: connect *while A is open* and drive COMMIT_ACTIVATION → ACTIVATION_COMMITTED.
     let mut conn_b = connect(&connector, addr).await;
-    conn_b.send(0, &wire::encode_commit_activation(&keys, &tuple(), 1)).await.unwrap();
+    conn_b.send(0, &wire::encode_commit_activation(&fence, &tuple(), 1)).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(10), conn_b.recv())
         .await
         .expect("B was not served while A was held open (sequential-accept deadlock)")
         .unwrap();
-    match wire::decode(&reply.payload, &keys).unwrap().1 {
+    match wire::decode(&reply.payload, &fence).unwrap().1 {
         Msg::ActivationCommitted(t) => assert_eq!((t.epoch, t.attempt), (0, 0)),
         other => panic!("expected ActivationCommitted on B, got {other:?}"),
     }
 
     // A is still live: FINALIZE over A drives the SAME shared stage SM (committed by B) to ACTIVE_FINAL.
-    conn_a.send(0, &wire::encode_finalize_activation(&keys, &tuple(), 1)).await.unwrap();
+    conn_a.send(0, &wire::encode_finalize_activation(&fence, &tuple(), 1)).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(10), conn_a.recv())
         .await
         .expect("A's finalize was not served")
         .unwrap();
     assert!(
-        matches!(wire::decode(&reply.payload, &keys).unwrap().1, Msg::ActivationFinalized),
+        matches!(wire::decode(&reply.payload, &fence).unwrap().1, Msg::ActivationFinalized),
         "expected ActivationFinalized on A — proves A and B share one Worker/stage SM"
     );
 }
@@ -103,9 +103,9 @@ async fn many_concurrent_connections_are_each_served() {
     let ca = ClusterCa::new().unwrap();
     let worker_id = ca.issue(WORKER_NAME).unwrap();
     let coord_id = ca.issue(COORD_NAME).unwrap();
-    let keys = SessionKeys::dev(12);
+    let fence = SessionFence::dev(12);
 
-    let addr = spawn_multiconn_endpoint(control_plane_cfg(keys.clone()), ca.server_config(&worker_id).unwrap());
+    let addr = spawn_multiconn_endpoint(control_plane_cfg(fence.clone()), ca.server_config(&worker_id).unwrap());
     let connector = TcpMtls::from_config(ca.client_config(&coord_id).unwrap()).unwrap();
 
     // Open several connections and hold them all open simultaneously.
@@ -116,13 +116,13 @@ async fn many_concurrent_connections_are_each_served() {
     // Drive the LAST-opened connection first: if the accept loop were sequential it would be parked
     // behind the first, so serving the newest proves genuine concurrent accept.
     for conn in conns.iter_mut().rev() {
-        conn.send(0, &wire::encode_commit_activation(&keys, &tuple(), 1)).await.unwrap();
+        conn.send(0, &wire::encode_commit_activation(&fence, &tuple(), 1)).await.unwrap();
         let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv())
             .await
             .expect("a held-open connection was not served (starved behind another)")
             .unwrap();
         assert!(
-            matches!(wire::decode(&reply.payload, &keys).unwrap().1, Msg::ActivationCommitted(_)),
+            matches!(wire::decode(&reply.payload, &fence).unwrap().1, Msg::ActivationCommitted(_)),
             "each concurrent connection gets its own reply from the shared Worker"
         );
     }

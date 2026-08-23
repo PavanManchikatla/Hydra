@@ -32,7 +32,7 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_worker::bootstrap::{Bootstrap, ForwardingBootstrap};
 use hydra_worker::pair::{spawn_multiconn_forwarding_durable_endpoint, Cluster};
 use hydra_worker::sampler::{initial_checkpoint_bytes, SamplingConfig};
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{DownTarget, WorkerConfig, INITIAL_CHECKPOINT_ID};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -55,7 +55,7 @@ fn mac_model_path() -> String {
     std::env::var("HYDRA_TEST_MODEL").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/qwen2.5-0.5b-instruct-fp16.gguf").to_string())
 }
 fn greedy() -> SamplingConfig { SamplingConfig { temperature: 0.0, top_p: 1.0, repeat_penalty: 1.0, penalty_last_n: 0, seed: 5 } }
-fn fence() -> WalFenceCtx { WalFenceCtx { cluster_id: CLUSTER_ID, session_id: SESSION_ID, model_instance_id: [3; 16], manifest_hash: [4; 32], epoch: 0, recovery_id: 0, activation_attempt_id: 0 } }
+fn wal_fence() -> WalFenceCtx { WalFenceCtx { cluster_id: CLUSTER_ID, session_id: SESSION_ID, model_instance_id: [3; 16], manifest_hash: [4; 32], epoch: 0, recovery_id: 0, activation_attempt_id: 0 } }
 fn admission(p: &[u32]) -> Admission { Admission { tokenizer_hash: [1; 32], chat_template_hash: [2; 32], rendered_prompt_bytes_hash: [3; 32], rendered_prompt: String::new(), prompt_tokens: p.to_vec() } }
 
 fn split3(n_layer: i32) -> (i32, i32) {
@@ -97,7 +97,7 @@ fn start_remote(ssh: &str, local_boot: &str, remote_boot: &str, log: &str) -> Re
     Err(format!("{ssh}: no engine= within 80s"))
 }
 
-fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::path::PathBuf, keys: SessionKeys) -> Result<SocketAddr, String> {
+fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::path::PathBuf, fence: SessionFence) -> Result<SocketAddr, String> {
     let id = cluster.issue(name).map_err(|e| e.to_string())?;
     let server_cfg = cluster.ca.server_config(&id).map_err(|e| e.to_string())?;
     let bind: SocketAddr = format!("{MAC_TS_IP}:{port}").parse().map_err(|e| format!("{e}"))?;
@@ -111,9 +111,9 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
             let Ok(a) = listener.accept().await else { return };
             let mut conn = a.conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
                     let d = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).unwrap_or(-1);
-                    if conn.send(0, &wire::encode_durability_ack(&keys, view.epoch, boundary_id, d, 0)).await.is_err() { break; }
+                    if conn.send(0, &wire::encode_durability_ack(&fence, view.epoch, boundary_id, d, 0)).await.is_err() { break; }
                 }
             }
         });
@@ -121,13 +121,13 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
     rx.recv().map_err(|e| e.to_string())?
 }
 
-fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32, recovery_start: bool) -> Bootstrap {
+fn sp_bootstrap(cluster: &Cluster, fence: &SessionFence, k2: i32, n_ctx: i32, recovery_start: bool) -> Bootstrap {
     let id = cluster.issue("sp").unwrap();
     Bootstrap {
         listen_addr: format!("{VM1_TS_IP}:{SP_PORT}"), device_name: "sp".into(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
-        cfg: WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start, shard_manifest: None },
+        cfg: WorkerConfig { fence: fence.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start, shard_manifest: None },
         expected_peers: vec![
             ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
             ("s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
@@ -137,13 +137,13 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32, reco
         forwarding: None,
     }
 }
-fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: i32, dur2: SocketAddr) -> Bootstrap {
+fn s2_bootstrap(cluster: &Cluster, fence: &SessionFence, k1: i32, k2: i32, n_ctx: i32, dur2: SocketAddr) -> Bootstrap {
     let id = cluster.issue("s2").unwrap();
     Bootstrap {
         listen_addr: format!("{VM2_TS_IP}:{S2_PORT}"), device_name: "s2".into(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
-        cfg: WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None },
+        cfg: WorkerConfig { fence: fence.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None },
         expected_peers: vec![
             ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
             ("s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
@@ -155,28 +155,28 @@ fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: 
 }
 
 // coordinator drivers (generic over the connection)
-async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, kind: ActivationKind, epoch: u32, rid: u32) -> Result<(), String> {
+async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, kind: ActivationKind, epoch: u32, rid: u32) -> Result<(), String> {
     let t = ActivationTuple { kind, epoch, recovery_id: rid, attempt: 0, sampler_checkpoint_id: if matches!(kind, ActivationKind::Recovery) { INITIAL_CHECKPOINT_ID } else { 0 } };
-    c.send(0, &wire::encode_commit_activation(keys, &t, 1)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::ActivationCommitted(_) => {} o => return Err(format!("expected COMMITTED, got {o:?}")) }
-    c.send(0, &wire::encode_finalize_activation(keys, &t, 1)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::ActivationFinalized => Ok(()), o => Err(format!("expected FINALIZED, got {o:?}")) }
+    c.send(0, &wire::encode_commit_activation(fence, &t, 1)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::ActivationCommitted(_) => {} o => return Err(format!("expected COMMITTED, got {o:?}")) }
+    c.send(0, &wire::encode_finalize_activation(fence, &t, 1)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::ActivationFinalized => Ok(()), o => Err(format!("expected FINALIZED, got {o:?}")) }
 }
-async fn chain_apply<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, keys: &SessionKeys, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String> {
-    c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c1.recv().await.map_err(|e| format!("recv chain ack: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()), o => Err(format!("chain @ {input_pos}: expected APPLIED_ACK, got {o:?}")) }
+async fn chain_apply<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn<S>, fence: &SessionFence, input_pos: i64, token: u32, no_sample: bool) -> Result<(), String> {
+    c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, no_sample)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c1.recv().await.map_err(|e| format!("recv chain ack: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()), o => Err(format!("chain @ {input_pos}: expected APPLIED_ACK, got {o:?}")) }
 }
-async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
-    c.send(0, &wire::encode_sample_next(keys, 0, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::Sampled { token_id, post_sample_snapshot, .. } => Ok((token_id, post_sample_snapshot)), Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {output_pos} err {code}")), o => Err(format!("SAMPLE_NEXT @ {output_pos}: expected SAMPLED, got {o:?}")) }
+async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, output_pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
+    c.send(0, &wire::encode_sample_next(fence, 0, output_pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::Sampled { token_id, post_sample_snapshot, .. } => Ok((token_id, post_sample_snapshot)), Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {output_pos} err {code}")), o => Err(format!("SAMPLE_NEXT @ {output_pos}: expected SAMPLED, got {o:?}")) }
 }
-async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
-    c.send(0, &wire::encode_fwd(keys, 0, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()), o => Err(format!("rebuild @ {input_pos}: expected APPLIED_ACK, got {o:?}")) }
+async fn rebuild_apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, input_pos: i64, boundary: &[f32]) -> Result<(), String> {
+    c.send(0, &wire::encode_fwd(fence, 0, input_pos, true, boundary)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == input_pos => Ok(()), o => Err(format!("rebuild @ {input_pos}: expected APPLIED_ACK, got {o:?}")) }
 }
-async fn begin_recovery<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, truncate_to: i64) -> Result<(), String> {
-    c.send(0, &wire::encode_begin_recovery(keys, 0, 1, 1, truncate_to)).await.map_err(|e| e.to_string())?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 { Msg::RecoveryAck { .. } => Ok(()), o => Err(format!("expected RECOVERY_ACK, got {o:?}")) }
+async fn begin_recovery<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, truncate_to: i64) -> Result<(), String> {
+    c.send(0, &wire::encode_begin_recovery(fence, 0, 1, 1, truncate_to)).await.map_err(|e| e.to_string())?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 { Msg::RecoveryAck { .. } => Ok(()), o => Err(format!("expected RECOVERY_ACK, got {o:?}")) }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 3)]
@@ -195,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== hydra-3node-kill: real S_P kill-window, Mac S1 [0,{k1}) → myVm-2 S2 [{k1},{k2}) → myVm-1 S_P [{k2},{n_layer}) ==");
     println!("   cap-weighted 4.0/2.1/1.0; WAN/Tailscale; cross-arch → mixed tier (argmax agreement, spec I8); n={n}, kill after m={m}");
 
-    let keys = SessionKeys::dev(0x5C);
+    let fence = SessionFence::dev(0x5C);
     let cfg_hash = greedy().hash();
     let cluster = Cluster::new()?;
     let (vm1, vm2) = (vm1_ssh(), vm2_ssh());
@@ -204,26 +204,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d2 = dir.join("hydra-3nk-s2.wal");
     let _ = std::fs::remove_file(&d1);
     let _ = std::fs::remove_file(&d2);
-    let dur1 = spawn_mac_durability(&cluster, "dur1", DUR1_PORT, d1.clone(), keys.clone())?;
-    let dur2 = spawn_mac_durability(&cluster, "dur2", DUR2_PORT, d2.clone(), keys.clone())?;
+    let dur1 = spawn_mac_durability(&cluster, "dur1", DUR1_PORT, d1.clone(), fence.clone())?;
+    let dur2 = spawn_mac_durability(&cluster, "dur2", DUR2_PORT, d2.clone(), fence.clone())?;
     println!("[mac] durability up: dur1={dur1} dur2={dur2}");
 
     kill_remote(&vm1);
     kill_remote(&vm2);
     std::thread::sleep(std::time::Duration::from_millis(600));
     let sp_boot = dir.join("hydra-3nk-sp.boot");
-    sp_bootstrap(&cluster, &keys, k2, n_ctx, false).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx, false).write_to(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3nk.boot", "/home/azureuser/hydra/sp-3nk.log")?;
     println!("[vm1] S_P up on {VM1_TS_IP}:{SP_PORT}");
     let s2_boot = dir.join("hydra-3nk-s2.boot");
-    s2_bootstrap(&cluster, &keys, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
+    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
     start_remote(&vm2, s2_boot.to_str().unwrap(), "/home/azureuser/hydra/s2-3nk.boot", "/home/azureuser/hydra/s2-3nk.log")?;
     println!("[vm2] S2 up on {VM2_TS_IP}:{S2_PORT} (forwarding→S_P, durability→Mac)");
 
     // S1 local (Mac), forwarding-durable, down = S2 (vm2), dur = dur1 (local). Re-linkable target.
     let s2_addr: SocketAddr = format!("{VM2_TS_IP}:{S2_PORT}").parse()?;
     let s1_id = cluster.issue("s1")?;
-    let s1_cfg = WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None };
+    let s1_cfg = WorkerConfig { fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None };
     let s1_down: DownTarget = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
         s1_cfg, cluster.ca.server_config(&s1_id)?,
@@ -238,28 +238,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cs_path = dir.join("hydra-3nk-commit.wal");
     let _ = std::fs::remove_file(&cs_path);
     let mut cs = CommitStream::create(&cs_path, CLUSTER_ID, SESSION_ID)?;
-    cs.append_initial_commit(&fence(), &admission(&prompt), &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()), 1)?;
+    cs.append_initial_commit(&wal_fence(), &admission(&prompt), &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()), 1)?;
     let mut group = GroupCommitter::new(2);
 
     let mut c1 = connector.connect(s1_addr, "s1").await?;
     let mut cp = connector.connect(sp_addr, "sp").await?;
     let mut c2 = connector.connect(s2_addr, "s2").await?;
-    activate(&mut c1, &keys, ActivationKind::Initial, 0, 0).await?;
-    activate(&mut c2, &keys, ActivationKind::Initial, 0, 0).await?;
-    activate(&mut cp, &keys, ActivationKind::Initial, 0, 0).await?;
+    activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await?;
+    activate(&mut c2, &fence, ActivationKind::Initial, 0, 0).await?;
+    activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await?;
 
-    for (i, &t) in prompt.iter().enumerate() { chain_apply(&mut c1, &keys, i as i64, t, true).await?; }
+    for (i, &t) in prompt.iter().enumerate() { chain_apply(&mut c1, &fence, i as i64, t, true).await?; }
     let mut committed: Vec<u32> = Vec::new();
     let mut input_pos = prompt.len() as i64;
     for q in 0..m as i64 {
-        let (tok, snap) = sample(&mut cp, &keys, q, &cfg_hash).await?;
+        let (tok, snap) = sample(&mut cp, &fence, q, &cfg_hash).await?;
         committed.push(tok);
         group.push(q, tok, snap);
-        if group.count_ready() { let b = group.take().unwrap(); cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
-        chain_apply(&mut c1, &keys, input_pos, tok, false).await?;
+        if group.count_ready() { let b = group.take().unwrap(); cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
+        chain_apply(&mut c1, &fence, input_pos, tok, false).await?;
         input_pos += 1;
     }
-    if let Some(b) = group.take() { cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
+    if let Some(b) = group.take() { cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
     println!("[gen] pre-kill committed {committed:?} (vs reference {:?})", &reference[..m]);
 
     // Let S2's durable copies (over WAN) settle, then confirm the rebuild source.
@@ -273,35 +273,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(cp);
     println!("[kill] myVm-1 S_P killed (pkill -9)");
     // Survivors S1 (local) + S2 (myVm-2) freeze (Case A).
-    begin_recovery(&mut c1, &keys, input_pos).await?;
-    begin_recovery(&mut c2, &keys, input_pos).await?;
+    begin_recovery(&mut c1, &fence, input_pos).await?;
+    begin_recovery(&mut c2, &fence, input_pos).await?;
 
     // Replacement S_P on myVm-1 at the SAME address (so S2 re-links via connection-failure).
     std::thread::sleep(std::time::Duration::from_millis(800)); // let the listen port free
-    sp_bootstrap(&cluster, &keys, k2, n_ctx, true).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx, true).write_to(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3nk.boot", "/home/azureuser/hydra/sp-3nk.log")?;
     println!("[vm1] replacement S_P up on {VM1_TS_IP}:{SP_PORT} (recovery_start)");
     let mut rcp = connector.connect(sp_addr, "sp").await?;
-    begin_recovery(&mut rcp, &keys, 0).await?;
-    for b in boundaries.iter().take(input_pos as usize) { rebuild_apply(&mut rcp, &keys, b.first_input_pos, &b.activations).await?; }
-    rcp.send(0, &wire::encode_catch_up_context(&keys, 0, 1, input_pos)).await?;
-    match wire::decode(&rcp.recv().await?.payload, &keys)?.1 { Msg::CatchUpReady { .. } => {} o => return Err(format!("expected CATCH_UP_READY, got {o:?}").into()) }
-    rcp.send(0, &wire::encode_install_sampler_checkpoint(&keys, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await?;
-    match wire::decode(&rcp.recv().await?.payload, &keys)?.1 { Msg::SamplerCheckpointInstalled { .. } => {} o => return Err(format!("expected INSTALLED, got {o:?}").into()) }
-    activate(&mut rcp, &keys, ActivationKind::Recovery, 1, 1).await?;
+    begin_recovery(&mut rcp, &fence, 0).await?;
+    for b in boundaries.iter().take(input_pos as usize) { rebuild_apply(&mut rcp, &fence, b.first_input_pos, &b.activations).await?; }
+    rcp.send(0, &wire::encode_catch_up_context(&fence, 0, 1, input_pos)).await?;
+    match wire::decode(&rcp.recv().await?.payload, &fence)?.1 { Msg::CatchUpReady { .. } => {} o => return Err(format!("expected CATCH_UP_READY, got {o:?}").into()) }
+    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await?;
+    match wire::decode(&rcp.recv().await?.payload, &fence)?.1 { Msg::SamplerCheckpointInstalled { .. } => {} o => return Err(format!("expected INSTALLED, got {o:?}").into()) }
+    activate(&mut rcp, &fence, ActivationKind::Recovery, 1, 1).await?;
     let detect_to_resumed = t_detect.elapsed();
     println!("[recover] replacement S_P rebuilt from S2's durable boundaries + activated; S2 re-links on next forward");
 
     // ---- resume: sample from the replacement S_P; feedback through S1 → S2 → (re-link) → replacement ----
     let mut resumed = Vec::new();
     for q in (m as i64)..n as i64 {
-        let (tok, snap) = sample(&mut rcp, &keys, q, &cfg_hash).await?;
+        let (tok, snap) = sample(&mut rcp, &fence, q, &cfg_hash).await?;
         resumed.push(tok);
         group.push(q, tok, snap);
-        if group.count_ready() { let b = group.take().unwrap(); cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
-        if (q as usize + 1) < n { chain_apply(&mut c1, &keys, input_pos, tok, false).await?; input_pos += 1; }
+        if group.count_ready() { let b = group.take().unwrap(); cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
+        if (q as usize + 1) < n { chain_apply(&mut c1, &fence, input_pos, tok, false).await?; input_pos += 1; }
     }
-    if let Some(b) = group.take() { cs.append_generation_commit(&fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
+    if let Some(b) = group.take() { cs.append_generation_commit(&wal_fence(), b.first_pos, b.last_pos, &b.tokens, &b.snapshot)?; }
     drop(cs);
 
     // ---- three assertions ----

@@ -26,5 +26,5 @@ pub mod worker;
 
 pub use bootstrap::Bootstrap;
 pub use durable::DurableForwarder;
-pub use wire::{Msg, SessionKeys, WireError};
+pub use wire::{Msg, SessionFence, WireError};
 pub use worker::{serve_conn, Worker, WorkerConfig, WorkerError};

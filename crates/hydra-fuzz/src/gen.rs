@@ -215,12 +215,12 @@ pub fn wire_body_case(rng: &mut Rng) -> Vec<u8> {
     if rng.below(4) == 0 {
         return noise(rng, 256);
     }
-    let keys = hydra_worker::wire::SessionKeys::dev(0x5E);
+    let fence = hydra_worker::wire::SessionFence::dev(0x5E);
     let mut buf = match rng.below(4) {
-        0 => hydra_worker::wire::encode_apply_token(&keys, 0, 0, 1, true),
-        1 => hydra_worker::wire::encode_fwd(&keys, 0, 0, true, &vec![0.5f32; 64]),
-        2 => hydra_worker::wire::encode_applied_ack(&keys, 0, 0, &[0u8; 32]),
-        _ => hydra_worker::wire::encode_sample_next(&keys, 0, 0, &[0u8; 32], 1),
+        0 => hydra_worker::wire::encode_apply_token(&fence, 0, 0, 1, true),
+        1 => hydra_worker::wire::encode_fwd(&fence, 0, 0, true, &vec![0.5f32; 64]),
+        2 => hydra_worker::wire::encode_applied_ack(&fence, 0, 0, &[0u8; 32]),
+        _ => hydra_worker::wire::encode_sample_next(&fence, 0, 0, &[0u8; 32], 1),
     };
     // 1..=8 bit flips: enough to break invariants, few enough that the buffer stays FlatBuffers-ish.
     let flips = 1 + rng.below(8);

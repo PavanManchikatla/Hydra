@@ -13,7 +13,7 @@ use hydra_worker::pair::{
     dev_model_path, golden_next_token, run_generation, sample_next_twice, Cluster, Endpoints,
 };
 use hydra_worker::sampler::{initial_checkpoint_bytes, SamplingConfig};
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{WorkerConfig, INITIAL_CHECKPOINT_ID};
 
 const S1: &str = "worker-s1";
@@ -22,32 +22,32 @@ const S2: &str = "worker-s2";
 struct Pipe {
     cluster: Cluster,
     ep: Endpoints,
-    keys: SessionKeys,
+    fence: SessionFence,
 }
 
 /// Stand up a two-worker pipeline (S1 embeddings `[0,k)`, S2 logits+sampler `[k,end)`) with the
 /// given sampler config on S2.
 fn spin_up(path: &str, n_layer: i32, n_ctx: i32, seed_byte: u8, sampler: SamplingConfig) -> Pipe {
-    let keys = SessionKeys::dev(seed_byte);
+    let fence = SessionFence::dev(seed_byte);
     let cluster = Cluster::new().unwrap();
     let s1_id = cluster.issue(S1).unwrap();
     let s2_id = cluster.issue(S2).unwrap();
     let k = (n_layer / 2).max(1);
     let s1_cfg = WorkerConfig {
-        keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
+        fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(path.to_string()),
         n_gpu_layers: 0, n_ctx, sampler_config: None,
         recovery_start: false, shard_manifest: None,
     };
     let s2_cfg = WorkerConfig {
-        keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
+        fence: fence.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(path.to_string()),
         n_gpu_layers: 0, n_ctx, sampler_config: Some(sampler),
         recovery_start: false, shard_manifest: None,
     };
     let s1_addr = hydra_worker::pair::spawn_endpoint(s1_cfg, cluster.ca.server_config(&s1_id).unwrap());
     let s2_addr = hydra_worker::pair::spawn_endpoint(s2_cfg, cluster.ca.server_config(&s2_id).unwrap());
-    Pipe { cluster, ep: Endpoints::new(s1_addr, S1, s2_addr, S2), keys }
+    Pipe { cluster, ep: Endpoints::new(s1_addr, S1, s2_addr, S2), fence }
 }
 
 fn setup() -> Option<(String, Vec<u32>, i32)> {
@@ -72,7 +72,7 @@ async fn greedy_sample_across_pipeline_matches_unsplit_argmax() {
     let n_ctx = tokens.len() as i32 + 8;
     let pipe = spin_up(&path, n_layer, n_ctx, 0xC1, SamplingConfig::greedy());
     let connector = pipe.cluster.coordinator_connector().unwrap();
-    let seq = run_generation(&connector, &pipe.ep, &pipe.keys, &SamplingConfig::greedy(), &tokens, 1)
+    let seq = run_generation(&connector, &pipe.ep, &pipe.fence, &SamplingConfig::greedy(), &tokens, 1)
         .await
         .expect("generation");
     assert_eq!(seq, vec![golden], "greedy sampling across the pipeline must equal the unsplit argmax (bit-exact)");
@@ -91,12 +91,12 @@ async fn seeded_sampling_is_reproducible_across_two_full_runs() {
     let a = {
         let p = spin_up(&path, n_layer, n_ctx, 0xA1, cfg.clone());
         let conn = p.cluster.coordinator_connector().unwrap();
-        run_generation(&conn, &p.ep, &p.keys, &cfg, &tokens, 8).await.expect("run a")
+        run_generation(&conn, &p.ep, &p.fence, &cfg, &tokens, 8).await.expect("run a")
     };
     let b = {
         let p = spin_up(&path, n_layer, n_ctx, 0xA2, cfg.clone());
         let conn = p.cluster.coordinator_connector().unwrap();
-        run_generation(&conn, &p.ep, &p.keys, &cfg, &tokens, 8).await.expect("run b")
+        run_generation(&conn, &p.ep, &p.fence, &cfg, &tokens, 8).await.expect("run b")
     };
     assert_eq!(a.len(), 8);
     assert_eq!(a, b, "same seed/config/prompt must yield an identical token sequence across two runs");
@@ -114,7 +114,7 @@ async fn duplicate_sample_next_is_idempotent_and_does_not_advance_rng() {
     let pipe = spin_up(&path, n_layer, n_ctx, 0xC3, cfg.clone());
     let connector = pipe.cluster.coordinator_connector().unwrap();
 
-    let (first, second) = sample_next_twice(&connector, &pipe.ep, &pipe.keys, &cfg, &tokens)
+    let (first, second) = sample_next_twice(&connector, &pipe.ep, &pipe.fence, &cfg, &tokens)
         .await
         .expect("sample twice");
     match (first, second) {
@@ -144,9 +144,9 @@ async fn install_sampler_checkpoint_round_trips_over_mtls() {
     // it into S_P; the worker acks the exact checkpoint (I17).
     let snapshot = initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &cfg);
     let mut c2 = connector.connect(pipe.ep.s2_addr, S2).await.expect("connect s2");
-    c2.send(0, &wire::encode_install_sampler_checkpoint(&pipe.keys, 0, INITIAL_CHECKPOINT_ID, &snapshot)).await.unwrap();
+    c2.send(0, &wire::encode_install_sampler_checkpoint(&pipe.fence, 0, INITIAL_CHECKPOINT_ID, &snapshot)).await.unwrap();
     let reply = c2.recv().await.unwrap();
-    match wire::decode(&reply.payload, &pipe.keys).unwrap().1 {
+    match wire::decode(&reply.payload, &pipe.fence).unwrap().1 {
         Msg::SamplerCheckpointInstalled { checkpoint_id, .. } => {
             assert_eq!(checkpoint_id, INITIAL_CHECKPOINT_ID, "installed the exact checkpoint (I17)");
         }

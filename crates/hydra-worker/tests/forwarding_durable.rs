@@ -20,7 +20,7 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
 use hydra_worker::pair::{dev_model_path, spawn_multiconn_forwarding_durable_endpoint};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{WorkerConfig, INITIAL_CHECKPOINT_ID};
 use hydra_worker::DurableForwarder;
 
@@ -37,7 +37,7 @@ fn store_path() -> std::path::PathBuf {
 
 /// A durability target that persists each `BOUNDARY_COPY` to a real `BoundaryStore` and replies
 /// `DURABILITY_ACK{durable_through = fdatasync'd frontier}`. Accepts exactly one connection.
-fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::PathBuf, keys: SessionKeys) -> SocketAddr {
+fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::PathBuf, fence: SessionFence) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -47,9 +47,9 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
             let mut store = BoundaryStore::create(&path, [1; 16], [2; 16]).expect("store");
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
                     let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).expect("persist");
-                    let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, durable_through, 0);
+                    let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                     if conn.send(0, &ack).await.is_err() {
                         break;
                     }
@@ -63,7 +63,7 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
 /// A downstream stage stand-in: for each inbound `FWD{first_input_pos}` it **sleeps** `delay` (so the
 /// survivor's forward is genuinely *in flight*) and replies `APPLIED_ACK{cumulative = first_input_pos}`.
 /// Engine-free — the panic vector is about the serve loop's locks, not the downstream's compute.
-fn spawn_slow_downstream(server_cfg: rustls::ServerConfig, keys: SessionKeys, delay: Duration) -> SocketAddr {
+fn spawn_slow_downstream(server_cfg: rustls::ServerConfig, fence: SessionFence, delay: Duration) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -72,9 +72,9 @@ fn spawn_slow_downstream(server_cfg: rustls::ServerConfig, keys: SessionKeys, de
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::Fwd { first_input_pos, .. })) = wire::decode(&frame.payload, &keys) {
+                if let Ok((view, Msg::Fwd { first_input_pos, .. })) = wire::decode(&frame.payload, &fence) {
                     tokio::time::sleep(delay).await;
-                    let ack = wire::encode_applied_ack(&keys, view.epoch, first_input_pos, &[0u8; 32]);
+                    let ack = wire::encode_applied_ack(&fence, view.epoch, first_input_pos, &[0u8; 32]);
                     if conn.send(0, &ack).await.is_err() {
                         break;
                     }
@@ -87,7 +87,7 @@ fn spawn_slow_downstream(server_cfg: rustls::ServerConfig, keys: SessionKeys, de
 
 /// A durability target that quietly **absorbs** `BOUNDARY_COPY`s and acks each (`durable_through =
 /// first_input_pos`). Used where durability must not gate the forward path (the panic vector).
-fn spawn_absorbing_durability(server_cfg: rustls::ServerConfig, keys: SessionKeys) -> SocketAddr {
+fn spawn_absorbing_durability(server_cfg: rustls::ServerConfig, fence: SessionFence) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -96,8 +96,8 @@ fn spawn_absorbing_durability(server_cfg: rustls::ServerConfig, keys: SessionKey
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, .. })) = wire::decode(&frame.payload, &keys) {
-                    let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, first_input_pos, 0);
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, .. })) = wire::decode(&frame.payload, &fence) {
+                    let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, first_input_pos, 0);
                     if conn.send(0, &ack).await.is_err() {
                         break;
                     }
@@ -120,15 +120,15 @@ async fn full_queue_holds_every_copy_and_frees_only_on_durability() {
     let ca = ClusterCa::new().unwrap();
     let dur_id = ca.issue("dur").unwrap();
     let s1_id = ca.issue("s1").unwrap();
-    let keys = SessionKeys::dev(0xB1);
+    let fence = SessionFence::dev(0xB1);
     let path = store_path();
 
-    let dur_addr = spawn_durability_endpoint(ca.server_config(&dur_id).unwrap(), path.clone(), keys.clone());
+    let dur_addr = spawn_durability_endpoint(ca.server_config(&dur_id).unwrap(), path.clone(), fence.clone());
     let connector = TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap();
     let mut dur = connector.connect(dur_addr, "dur").await.expect("connect durability");
 
     // D1 forwarding stage, R3′ bound = 2.
-    let mut fwd = DurableForwarder::new(keys.clone(), 0, true, 2);
+    let mut fwd = DurableForwarder::new(fence.clone(), 0, true, 2);
     assert_eq!(fwd.capacity(), 2);
 
     // Copy+retain two boundaries (real BOUNDARY_COPY over mTLS). Downstream has applied both, but we
@@ -146,7 +146,7 @@ async fn full_queue_holds_every_copy_and_frees_only_on_durability() {
 
     // Drain ONE durability ack → durable advances to 0 → slot 0 frees, in order; below the bound again.
     let f = dur.recv().await.unwrap();
-    match wire::decode(&f.payload, &keys).unwrap().1 {
+    match wire::decode(&f.payload, &fence).unwrap().1 {
         Msg::DurabilityAck { durable_through_input_pos, .. } => fwd.on_durability_ack(durable_through_input_pos),
         o => panic!("expected DURABILITY_ACK, got {o:?}"),
     }
@@ -156,7 +156,7 @@ async fn full_queue_holds_every_copy_and_frees_only_on_durability() {
 
     // The second ack frees position 1.
     let f = dur.recv().await.unwrap();
-    match wire::decode(&f.payload, &keys).unwrap().1 {
+    match wire::decode(&f.payload, &fence).unwrap().1 {
         Msg::DurabilityAck { durable_through_input_pos, .. } => fwd.on_durability_ack(durable_through_input_pos),
         o => panic!("expected DURABILITY_ACK, got {o:?}"),
     }
@@ -172,9 +172,9 @@ async fn full_queue_holds_every_copy_and_frees_only_on_durability() {
 
 // --------------------------- 2. the multi-conn base of the durable loop ---------------------------
 
-fn control_fwd_cfg(keys: SessionKeys) -> WorkerConfig {
+fn control_fwd_cfg(fence: SessionFence) -> WorkerConfig {
     WorkerConfig {
-        keys,
+        fence,
         rank: 0,
         layer_first: 0,
         layer_last: 4, // a forwarding (non-final) stage shape; control-plane only (no engine)
@@ -211,19 +211,19 @@ async fn concurrent_control_connections_are_each_served() {
     let down_id = ca.issue("down").unwrap();
     let dur_id = ca.issue("dur").unwrap();
     let coord_id = ca.issue("coordinator").unwrap();
-    let keys = SessionKeys::dev(0xB2);
+    let fence = SessionFence::dev(0xB2);
 
     // Downstream + durability stand-ins (dialed at startup though this test sends only control frames).
-    let down_keys = keys.clone();
+    let down_keys = fence.clone();
     let down_addr = spawn_slow_downstream(ca.server_config(&down_id).unwrap(), down_keys, Duration::from_millis(0));
-    let dur_addr = spawn_absorbing_durability(ca.server_config(&dur_id).unwrap(), keys.clone());
+    let dur_addr = spawn_absorbing_durability(ca.server_config(&dur_id).unwrap(), fence.clone());
     // Two dialers (TcpMtls is not Clone): one for the down-link, one for the durability link.
     let s2_down_dialer = TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap();
     let s2_dur_dialer = TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap();
     let s2_down = std::sync::Arc::new(std::sync::Mutex::new((down_addr, "down".to_string())));
 
     let addr = spawn_multiconn_forwarding_durable_endpoint(
-        control_fwd_cfg(keys.clone()),
+        control_fwd_cfg(fence.clone()),
         ca.server_config(&s2_id).unwrap(),
         s2_down_dialer,
         s2_down,
@@ -248,13 +248,13 @@ async fn concurrent_control_connections_are_each_served() {
         );
     }
     for conn in conns.iter_mut().rev() {
-        conn.send(0, &wire::encode_commit_activation(&keys, &tuple(), 1)).await.unwrap();
+        conn.send(0, &wire::encode_commit_activation(&fence, &tuple(), 1)).await.unwrap();
         let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv())
             .await
             .expect("a held-open connection was not served (starved behind another)")
             .unwrap();
         assert!(
-            matches!(wire::decode(&reply.payload, &keys).unwrap().1, Msg::ActivationCommitted(_)),
+            matches!(wire::decode(&reply.payload, &fence).unwrap().1, Msg::ActivationCommitted(_)),
             "each concurrent connection is served by the shared Worker via the durable forwarding loop"
         );
     }
@@ -262,9 +262,9 @@ async fn concurrent_control_connections_are_each_served() {
 
 // --------------------------- 3. the panic vector (engine-gated, 100×) ---------------------------
 
-fn s1_fwd_cfg(model: &str, keys: &SessionKeys, k: i32, n_ctx: i32) -> WorkerConfig {
+fn s1_fwd_cfg(model: &str, fence: &SessionFence, k: i32, n_ctx: i32) -> WorkerConfig {
     WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank: 0,
         layer_first: 0,
         layer_last: k,
@@ -301,7 +301,7 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
     };
     let iters = 100usize;
     let n_ctx = prompt.len() as i32 + iters as i32 + 8;
-    let keys = SessionKeys::dev(0xB3);
+    let fence = SessionFence::dev(0xB3);
     let cfg_hash = SamplingConfig { temperature: 0.0, top_p: 1.0, repeat_penalty: 1.0, penalty_last_n: 0, seed: 1 }.hash();
 
     let ca = ClusterCa::new().unwrap();
@@ -313,12 +313,12 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
     let s1_dur_dialer = TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap();
 
     // Slow downstream (15 ms per FWD → the forward is genuinely in flight) + absorbing durability.
-    let down_addr = spawn_slow_downstream(ca.server_config(&down_id).unwrap(), keys.clone(), Duration::from_millis(15));
-    let dur_addr = spawn_absorbing_durability(ca.server_config(&dur_id).unwrap(), keys.clone());
+    let down_addr = spawn_slow_downstream(ca.server_config(&down_id).unwrap(), fence.clone(), Duration::from_millis(15));
+    let dur_addr = spawn_absorbing_durability(ca.server_config(&dur_id).unwrap(), fence.clone());
     let s1_down = std::sync::Arc::new(std::sync::Mutex::new((down_addr, "down".to_string())));
 
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
-        s1_fwd_cfg(&model, &keys, k, n_ctx),
+        s1_fwd_cfg(&model, &fence, k, n_ctx),
         ca.server_config(&s1_id).unwrap(),
         s1_down_dialer,
         s1_down,
@@ -341,8 +341,8 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
         let tok = prompt[i % prompt.len()];
         // Fire A's forward and B's SAMPLE_NEXT so both are outstanding at S1 at once. A parks in the
         // downstream recv (15 ms); B's SAMPLE_NEXT must be served during that window.
-        ca_conn.send(0, &wire::encode_apply_token(&keys, 0, pos, tok, true)).await.unwrap();
-        cb_conn.send(0, &wire::encode_sample_next(&keys, 0, i as i64, &cfg_hash, INITIAL_CHECKPOINT_ID)).await.unwrap();
+        ca_conn.send(0, &wire::encode_apply_token(&fence, 0, pos, tok, true)).await.unwrap();
+        cb_conn.send(0, &wire::encode_sample_next(&fence, 0, i as i64, &cfg_hash, INITIAL_CHECKPOINT_ID)).await.unwrap();
 
         // B is answered first (A is still awaiting the slow downstream) — but assert only correctness,
         // not ordering (ordering is timing-dependent; a borrow-across-await panic is deterministic).
@@ -351,7 +351,7 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
             .expect("SAMPLE_NEXT was not served during an in-flight forward (deadlock or panic)")
             .unwrap();
         assert!(
-            matches!(wire::decode(&b.payload, &keys).unwrap().1, Msg::Err { .. }),
+            matches!(wire::decode(&b.payload, &fence).unwrap().1, Msg::Err { .. }),
             "S1 has no sampler → SAMPLE_NEXT is answered with ERR (the point is that on_frame ran, borrowing the shared Worker, with no double-borrow panic)"
         );
 
@@ -359,7 +359,7 @@ async fn panic_vector_concurrent_sample_next_during_an_inflight_fwd() {
             .await
             .expect("the in-flight forward never completed")
             .unwrap();
-        match wire::decode(&a.payload, &keys).unwrap().1 {
+        match wire::decode(&a.payload, &fence).unwrap().1 {
             Msg::AppliedAck { cumulative_input_pos, .. } => assert_eq!(cumulative_input_pos, pos),
             o => panic!("iter {i}: expected APPLIED_ACK relayed from downstream, got {o:?}"),
         }

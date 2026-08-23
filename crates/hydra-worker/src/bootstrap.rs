@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use hydra_transport::{CertificateDer, DeviceIdentity};
 
 use crate::sampler::SamplingConfig;
-use crate::wire::{SessionKeys, CLUSTER_ID_LEN, HASH_LEN, MODEL_INSTANCE_ID_LEN, SESSION_ID_LEN};
+use crate::wire::{SessionFence, CLUSTER_ID_LEN, HASH_LEN, MODEL_INSTANCE_ID_LEN, SESSION_ID_LEN};
 use crate::worker::WorkerConfig;
 
 /// The downstream + durability wiring a **forwarding** stage (S1/S2 in a chained pipeline) needs to
@@ -122,10 +122,10 @@ impl Bootstrap {
         }
         w.bytes(&self.key_pkcs8_der);
         // config
-        w.bytes(&self.cfg.keys.cluster_id);
-        w.bytes(&self.cfg.keys.manifest_hash);
-        w.bytes(&self.cfg.keys.model_instance_id);
-        w.bytes(&self.cfg.keys.session_id);
+        w.bytes(&self.cfg.fence.cluster_id);
+        w.bytes(&self.cfg.fence.manifest_hash);
+        w.bytes(&self.cfg.fence.model_instance_id);
+        w.bytes(&self.cfg.fence.session_id);
         w.u32(self.cfg.rank as u32);
         w.i32(self.cfg.layer_first);
         w.i32(self.cfg.layer_last);
@@ -204,7 +204,7 @@ impl Bootstrap {
             cert_chain_der.push(r.bytes()?);
         }
         let key_pkcs8_der = r.bytes()?;
-        let keys = SessionKeys {
+        let fence = SessionFence {
             cluster_id: r.arr::<CLUSTER_ID_LEN>()?,
             manifest_hash: r.arr::<HASH_LEN>()?,
             model_instance_id: r.arr::<MODEL_INSTANCE_ID_LEN>()?,
@@ -285,7 +285,7 @@ impl Bootstrap {
             forwarding,
             expected_peers,
             cfg: WorkerConfig {
-                keys,
+                fence,
                 rank,
                 layer_first,
                 layer_last,
@@ -407,7 +407,7 @@ mod tests {
             ],
             forwarding: None,
             cfg: WorkerConfig {
-                keys: SessionKeys::dev(9),
+                fence: SessionFence::dev(9),
                 rank: 0,
                 layer_first: 0,
                 layer_last: 12,
@@ -435,7 +435,7 @@ mod tests {
             expected_peers: vec![("coordinator".into(), ROLE_COORDINATOR), ("s1".into(), ROLE_STAGE_BASE)],
             key_pkcs8_der: vec![9, 9, 9],
             cfg: WorkerConfig {
-                keys: SessionKeys::dev(7),
+                fence: SessionFence::dev(7),
                 rank: 0,
                 layer_first: 0,
                 layer_last: 12,
@@ -455,7 +455,7 @@ mod tests {
         let back = Bootstrap::decode(&bytes).unwrap();
         assert_eq!(back.device_name, "worker-1");
         assert_eq!(back.cert_chain_der, vec![vec![4, 5], vec![6]]);
-        assert_eq!(back.cfg.keys, SessionKeys::dev(7));
+        assert_eq!(back.cfg.fence, SessionFence::dev(7));
         assert_eq!(back.cfg.layer_last, 12);
         assert_eq!(back.cfg.model_path.as_deref(), Some("/models/x.gguf"));
         assert!(back.cfg.receives_tokens && !back.cfg.is_final);
@@ -504,7 +504,7 @@ mod tests {
             key_pkcs8_der: vec![3],
             expected_peers: vec![("coordinator".into(), ROLE_COORDINATOR), ("s1".into(), ROLE_STAGE_BASE)],
             cfg: WorkerConfig {
-                keys: SessionKeys::dev(8),
+                fence: SessionFence::dev(8),
                 rank: 1,
                 layer_first: 14,
                 layer_last: 21,

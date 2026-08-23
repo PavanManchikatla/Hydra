@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (rank, lf, ll, is_final, toks) =
         (boot.cfg.rank, boot.cfg.layer_first, boot.cfg.layer_last, boot.cfg.is_final, boot.cfg.receives_tokens);
-    let keys = boot.cfg.keys.clone();
+    let fence = boot.cfg.fence.clone();
     let epoch = boot.cfg.epoch;
     // A forwarding stage dials its downstream + durability target as a client (presenting its own
     // identity, trusting the cluster CA). Capture the mTLS material as owned values BEFORE moving
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let dur_conn = TcpMtls::from_config(client_cfg()?)?;
                     let dur = dur_conn.connect(f.dur_addr.parse()?, &f.dur_name).await?;
                     eprintln!("hydra-worker: forwarding down→{} (re-linkable) durability→{}", f.down_addr, f.dur_addr);
-                    let forwarder = DurableForwarder::new(keys.clone(), epoch, f.require_durable, f.capacity as usize);
+                    let forwarder = DurableForwarder::new(fence.clone(), epoch, f.require_durable, f.capacity as usize);
                     let down_state = shared_down(DownstreamState {
                         down: None,
                         down_connected_to: None,
@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dur,
                         forwarder,
                     });
-                    serve_multi_conn_forwarding_durable(shared(worker), down_state, keys, listener).await
+                    serve_multi_conn_forwarding_durable(shared(worker), down_state, fence, listener).await
                 }
                 // Final stage (S_P): multi-conn (samples; never forwards).
                 None => serve_multi_conn(shared(worker), listener).await,

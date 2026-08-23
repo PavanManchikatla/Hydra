@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 
 const PEER: &str = "echo-peer";
 /// A stand-in sampler snapshot, sized like the real one (`SamplerCheckpointRec`: Philox key +
@@ -36,7 +36,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// An mTLS peer that decodes each `APPLY_TOKEN` and replies with a real `FWD` carrying an
 /// `n_embd`-float boundary — the same encode/decode/BLAKE3/mTLS work a stage does, **without the
 /// inference**. That is the whole point: everything it spends is protocol.
-fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: usize) -> SocketAddr {
+fn spawn_echo_peer(server_cfg: rustls::ServerConfig, fence: SessionFence, n_embd: usize) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -48,9 +48,9 @@ fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: 
             let mut conn = listener.accept().await.expect("accept").conn;
             let boundary = vec![0.5f32; n_embd];
             while let Ok(frame) = conn.recv().await {
-                match wire::decode(&frame.payload, &keys) {
+                match wire::decode(&frame.payload, &fence) {
                     Ok((view, Msg::ApplyToken { input_pos, .. })) => {
-                        let reply = wire::encode_fwd(&keys, view.epoch, input_pos, true, &boundary);
+                        let reply = wire::encode_fwd(&fence, view.epoch, input_pos, true, &boundary);
                         if conn.send(0, &reply).await.is_err() {
                             break;
                         }
@@ -58,7 +58,7 @@ fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: 
                     Ok((view, Msg::Fwd { first_input_pos, .. })) => {
                         // Decode-path ack: no logits witness (see `Worker::retain_and_ack`), so the
                         // bench frames what production frames, not what the anchor harness frames.
-                        let reply = wire::encode_applied_ack(&keys, view.epoch, first_input_pos, &[]);
+                        let reply = wire::encode_applied_ack(&fence, view.epoch, first_input_pos, &[]);
                         if conn.send(0, &reply).await.is_err() {
                             break;
                         }
@@ -67,7 +67,7 @@ fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: 
                         // The third crossing of a production decode step. `SAMPLED` carries the
                         // sampler snapshot; the peer runs no sampler, so what this costs is frame
                         // work alone.
-                        let reply = wire::encode_sampled(&keys, view.epoch, output_pos, 7, &SNAPSHOT, &[0u8; 32]);
+                        let reply = wire::encode_sampled(&fence, view.epoch, output_pos, 7, &SNAPSHOT, &[0u8; 32]);
                         if conn.send(0, &reply).await.is_err() {
                             break;
                         }
@@ -91,9 +91,9 @@ async fn one_coordinator_stage_exchange_costs() {
     let ca = ClusterCa::new().unwrap();
     let peer_id = ca.issue(PEER).unwrap();
     let client_id = ca.issue(CLIENT).unwrap();
-    let keys = SessionKeys::dev(0x7A);
+    let fence = SessionFence::dev(0x7A);
 
-    let addr = spawn_echo_peer(ca.server_config(&peer_id).unwrap(), keys.clone(), N_EMBD);
+    let addr = spawn_echo_peer(ca.server_config(&peer_id).unwrap(), fence.clone(), N_EMBD);
     let connector = TcpMtls::from_config(ca.client_config(&client_id).unwrap()).unwrap();
     // Connected BEFORE any timing — the same discipline the calibration harness now uses.
     let mut conn = connector.connect(addr, PEER).await.expect("connect");
@@ -104,9 +104,9 @@ async fn one_coordinator_stage_exchange_costs() {
     let mut a_samples = Vec::new();
     for i in 0..(WARMUP + CYCLES) {
         let t = Instant::now();
-        conn.send(0, &wire::encode_apply_token(&keys, 0, i as i64, 1, true)).await.expect("send");
+        conn.send(0, &wire::encode_apply_token(&fence, 0, i as i64, 1, true)).await.expect("send");
         let f = conn.recv().await.expect("recv");
-        let _ = wire::decode(&f.payload, &keys).expect("decode");
+        let _ = wire::decode(&f.payload, &fence).expect("decode");
         if i >= WARMUP {
             a_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -116,9 +116,9 @@ async fn one_coordinator_stage_exchange_costs() {
     let mut b_samples = Vec::new();
     for i in 0..(WARMUP + CYCLES) {
         let t = Instant::now();
-        conn.send(0, &wire::encode_fwd(&keys, 0, i as i64, true, &boundary)).await.expect("send");
+        conn.send(0, &wire::encode_fwd(&fence, 0, i as i64, true, &boundary)).await.expect("send");
         let f = conn.recv().await.expect("recv");
-        let _ = wire::decode(&f.payload, &keys).expect("decode");
+        let _ = wire::decode(&f.payload, &fence).expect("decode");
         if i >= WARMUP {
             b_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -129,9 +129,9 @@ async fn one_coordinator_stage_exchange_costs() {
     let mut c_samples = Vec::new();
     for i in 0..(WARMUP + CYCLES) {
         let t = Instant::now();
-        conn.send(0, &wire::encode_sample_next(&keys, 0, i as i64, &[0u8; 32], 1)).await.expect("send");
+        conn.send(0, &wire::encode_sample_next(&fence, 0, i as i64, &[0u8; 32], 1)).await.expect("send");
         let f = conn.recv().await.expect("recv");
-        let _ = wire::decode(&f.payload, &keys).expect("decode");
+        let _ = wire::decode(&f.payload, &fence).expect("decode");
         if i >= WARMUP {
             c_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }

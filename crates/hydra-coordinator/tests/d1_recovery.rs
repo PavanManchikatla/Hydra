@@ -29,7 +29,7 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
     d.join("commit-stream.wal")
 }
 
-fn fence() -> WalFenceCtx {
+fn wal_fence() -> WalFenceCtx {
     WalFenceCtx {
         cluster_id: [1; 16],
         session_id: [2; 16],
@@ -85,11 +85,11 @@ fn recovery_state_reconstructs_from_the_durable_ledger_and_is_i19_no_double() {
     let path = temp_path("disk");
     let prompt = [10u32, 20, 30];
     let mut cs = CommitStream::create(&path, [1; 16], [2; 16]).unwrap();
-    cs.append_initial_commit(&fence(), &admission(&prompt), &snapshot(1, -1), 1).unwrap();
+    cs.append_initial_commit(&wal_fence(), &admission(&prompt), &snapshot(1, -1), 1).unwrap();
     // Three group commits: positions [0..=2], [3..=5], [6..=8]; tokens 100+pos.
-    cs.append_generation_commit(&fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2)).unwrap();
-    cs.append_generation_commit(&fence(), 3, 5, &[(3, 103), (4, 104), (5, 105)], &snapshot(1, 5)).unwrap();
-    cs.append_generation_commit(&fence(), 6, 8, &[(6, 106), (7, 107), (8, 108)], &snapshot(1, 8)).unwrap();
+    cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2)).unwrap();
+    cs.append_generation_commit(&wal_fence(), 3, 5, &[(3, 103), (4, 104), (5, 105)], &snapshot(1, 5)).unwrap();
+    cs.append_generation_commit(&wal_fence(), 6, 8, &[(6, 106), (7, 107), (8, 108)], &snapshot(1, 8)).unwrap();
     drop(cs);
 
     // Reconstruct recovery inputs from the durable ledger alone (I3).
@@ -118,10 +118,10 @@ fn a_position_committed_twice_is_rejected_on_read() {
     // across records, so this is a real guard, not a tautology.
     let path = temp_path("double");
     let mut cs = CommitStream::create(&path, [1; 16], [2; 16]).unwrap();
-    cs.append_initial_commit(&fence(), &admission(&[10, 20]), &snapshot(1, -1), 1).unwrap();
-    cs.append_generation_commit(&fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2)).unwrap();
+    cs.append_initial_commit(&wal_fence(), &admission(&[10, 20]), &snapshot(1, -1), 1).unwrap();
+    cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2)).unwrap();
     // A "retry" whose group overlaps position 2 (duplicate) — each record is individually I19-valid.
-    cs.append_generation_commit(&fence(), 2, 4, &[(2, 102), (3, 103), (4, 104)], &snapshot(1, 4)).unwrap();
+    cs.append_generation_commit(&wal_fence(), 2, 4, &[(2, 102), (3, 103), (4, 104)], &snapshot(1, 4)).unwrap();
     drop(cs);
 
     match recovery::read(&path) {
@@ -145,8 +145,8 @@ impl PieceSource for StubPieces {
 /// `0..tokens.len()`) in k-sized groups and return `(events, full_text)`.
 fn run_session(path: &std::path::Path, prompt: &[u32], tokens: &[u32], k: usize) -> (Vec<(u64, String)>, String) {
     let mut cs = CommitStream::create(path, [1; 16], [2; 16]).unwrap();
-    cs.append_initial_commit(&fence(), &admission(prompt), &snapshot(1, -1), 1).unwrap();
-    let mut s = Session::new(cs, fence(), Box::new(StubPieces), k, 1_000_000);
+    cs.append_initial_commit(&wal_fence(), &admission(prompt), &snapshot(1, -1), 1).unwrap();
+    let mut s = Session::new(cs, wal_fence(), Box::new(StubPieces), k, 1_000_000);
     let mut events = Vec::new();
     for (pos, &tok) in tokens.iter().enumerate() {
         s.push_sampled(SampledToken { output_pos: pos as i64, token_id: tok, snapshot: snapshot(1, pos as i64) });
@@ -177,8 +177,8 @@ fn sse_ids_are_continuous_and_bytes_identical_across_a_reconstruction() {
     let kill_path = temp_path("kill");
     {
         let mut cs = CommitStream::create(&kill_path, [1; 16], [2; 16]).unwrap();
-        cs.append_initial_commit(&fence(), &admission(&prompt), &snapshot(1, -1), 1).unwrap();
-        let mut s = Session::new(cs, fence(), Box::new(StubPieces), k, 1_000_000);
+        cs.append_initial_commit(&wal_fence(), &admission(&prompt), &snapshot(1, -1), 1).unwrap();
+        let mut s = Session::new(cs, wal_fence(), Box::new(StubPieces), k, 1_000_000);
         for pos in 0..6i64 {
             s.push_sampled(SampledToken { output_pos: pos, token_id: tokens[pos as usize], snapshot: snapshot(1, pos) });
             let _ = s.try_commit_by_count().unwrap();
@@ -196,8 +196,8 @@ fn sse_ids_are_continuous_and_bytes_identical_across_a_reconstruction() {
 
     let recovered_path = temp_path("recovered");
     let mut cs = CommitStream::create(&recovered_path, [1; 16], [2; 16]).unwrap();
-    cs.append_initial_commit(&fence(), &admission(&state.prompt_tokens), &snapshot(1, -1), 1).unwrap();
-    let mut s = Session::new(cs, fence(), Box::new(StubPieces), k, 1_000_000);
+    cs.append_initial_commit(&wal_fence(), &admission(&state.prompt_tokens), &snapshot(1, -1), 1).unwrap();
+    let mut s = Session::new(cs, wal_fence(), Box::new(StubPieces), k, 1_000_000);
     let mut events_rec = Vec::new();
     // Replay the durable prefix (reconstruct the pre-kill events identically).
     for (pos, tok) in state.generated_tokens.iter().copied() {

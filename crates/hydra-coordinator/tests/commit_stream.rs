@@ -22,7 +22,7 @@ fn temp_dir() -> std::path::PathBuf {
     d
 }
 
-fn fence() -> WalFenceCtx {
+fn wal_fence() -> WalFenceCtx {
     WalFenceCtx {
         cluster_id: [1; 16],
         session_id: [2; 16],
@@ -77,14 +77,14 @@ fn initial_and_generation_commits_are_durable_and_i19_valid() {
     let path = dir.join("commit-stream.wal");
     let mut cs = CommitStream::create(&path, [1; 16], [2; 16]).expect("create");
 
-    cs.append_initial_commit(&fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+    cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
     assert_eq!(cs.generation_durable_pos(), -1, "no generation durable yet");
     assert_eq!(cs.committed_sampler_checkpoint_id(), 1);
 
     // Two group commits: positions [0..=2] then [3..=5]. Each embeds snapshot(last).
-    let c1 = cs.append_generation_commit(&fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2, 2)).expect("gen1");
+    let c1 = cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2, 2)).expect("gen1");
     assert_eq!(cs.generation_durable_pos(), 2, "durable pos advances after fdatasync");
-    let c2 = cs.append_generation_commit(&fence(), 3, 5, &[(3, 103), (4, 104), (5, 105)], &snapshot(1, 5, 5)).expect("gen2");
+    let c2 = cs.append_generation_commit(&wal_fence(), 3, 5, &[(3, 103), (4, 104), (5, 105)], &snapshot(1, 5, 5)).expect("gen2");
     assert_eq!(cs.generation_durable_pos(), 5);
     assert_eq!((c1, c2), (1, 2), "commit ids are dense");
     let durable_len = cs.durable_len();
@@ -113,11 +113,11 @@ fn i19_violating_snapshot_is_refused_before_the_disk() {
     let dir = temp_dir();
     let path = dir.join("commit-stream.wal");
     let mut cs = CommitStream::create(&path, [1; 16], [2; 16]).expect("create");
-    cs.append_initial_commit(&fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+    cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
     let len_before = cs.durable_len();
 
     // snapshot(generated_through=1) but last_output_pos=2 → I19 (generated_through != last).
-    let err = cs.append_generation_commit(&fence(), 0, 2, &[(0, 1), (1, 2), (2, 3)], &snapshot(1, 1, 1)).unwrap_err();
+    let err = cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 1), (1, 2), (2, 3)], &snapshot(1, 1, 1)).unwrap_err();
     assert!(matches!(err, hydra_coordinator::CommitError::I19(_)), "got {err:?}");
     assert_eq!(cs.durable_len(), len_before, "nothing was written on an I19 violation");
     assert_eq!(cs.generation_durable_pos(), -1, "durable pos did not advance");

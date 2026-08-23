@@ -62,7 +62,7 @@ use std::time::Instant;
 
 use hydra_worker::pair::{dev_model_path, time_generation_pipeline, time_teacher_forced_pipeline, Cluster, Endpoints};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::WorkerConfig;
 
 /// Per-crossing protocol costs, measured by `protocol_microbench.rs` with **zero inference** in the
@@ -160,17 +160,17 @@ struct Pair {
     _cluster: Cluster,
     connector: hydra_transport::tcp_mtls::TcpMtls,
     endpoints: Endpoints,
-    keys: SessionKeys,
+    fence: SessionFence,
 }
 
 fn spawn_pair(path: &str, k: i32, n_ctx: i32, seed: u8) -> Pair {
-    let keys = SessionKeys::dev(seed);
+    let fence = SessionFence::dev(seed);
     let cluster = Cluster::new().unwrap();
     let s1_id = cluster.issue("worker-s1").unwrap();
     let s2_id = cluster.issue("worker-s2").unwrap();
     let connector = cluster.coordinator_connector().unwrap();
     let cfg = |rank: u16, first: i32, last: i32, is_final: bool, recv: bool| WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank,
         layer_first: first,
         layer_last: last,
@@ -188,7 +188,7 @@ fn spawn_pair(path: &str, k: i32, n_ctx: i32, seed: u8) -> Pair {
     let a = hydra_worker::pair::spawn_endpoint(cfg(0, 0, k, false, true), cluster.ca.server_config(&s1_id).unwrap());
     let b = hydra_worker::pair::spawn_endpoint(cfg(1, k, -1, true, false), cluster.ca.server_config(&s2_id).unwrap());
     let endpoints = Endpoints::new(a, "worker-s1", b, "worker-s2");
-    Pair { _cluster: cluster, connector, endpoints, keys }
+    Pair { _cluster: cluster, connector, endpoints, fence }
 }
 
 /// **THE M3 GATE (row 8).** Predicted vs measured TPOT on the production-shaped decode path.
@@ -217,7 +217,7 @@ async fn production_shaped_tpot_is_within_15_percent_of_the_solver_prediction() 
     let mut worst_err: f64 = 0.0;
     for (i, k) in [c.n_layer / 2, c.n_layer / 3].into_iter().enumerate() {
         let p = spawn_pair(&path, k as i32, n_ctx, 0xC0 + i as u8);
-        let per_token = time_generation_pipeline(&p.connector, &p.endpoints, &p.keys, &config, &prompt, STEPS)
+        let per_token = time_generation_pipeline(&p.connector, &p.endpoints, &p.fence, &config, &prompt, STEPS)
             .await
             .expect("generation pipeline");
         let steady: Vec<f64> = per_token[WARMUP..].iter().map(|d| d.as_secs_f64() * 1000.0).collect();
@@ -270,7 +270,7 @@ async fn anchor_path_tpot_is_within_15_percent_when_the_harness_witness_is_attri
     let mut worst_err: f64 = 0.0;
     for (i, k) in [c.n_layer / 2, c.n_layer / 3].into_iter().enumerate() {
         let p = spawn_pair(&path, k as i32, n_ctx, 0xA0 + i as u8);
-        let per_token = time_teacher_forced_pipeline(&p.connector, &p.endpoints, &p.keys, &tokens).await.expect("pipeline");
+        let per_token = time_teacher_forced_pipeline(&p.connector, &p.endpoints, &p.fence, &tokens).await.expect("pipeline");
         let steady: Vec<f64> = per_token[WARMUP..].iter().map(|d| d.as_secs_f64() * 1000.0).collect();
         let measured = median(steady);
 

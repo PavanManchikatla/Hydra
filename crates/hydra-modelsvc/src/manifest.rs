@@ -295,7 +295,7 @@ pub fn chat_template_hash(g: &Gguf) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// BLAKE3 over the architecture hyper-parameter metadata (`{arch}.*`, excluding tokenizer keys) — the
+/// BLAKE3 over the architecture hyper-parameter metadata (`{arch}.*`, excluding tokenizer fence) — the
 /// inference-config identity (context length, dims, heads, rope, etc.).
 pub fn inference_config_hash(g: &Gguf) -> [u8; 32] {
     let arch = g.architecture().unwrap_or("");

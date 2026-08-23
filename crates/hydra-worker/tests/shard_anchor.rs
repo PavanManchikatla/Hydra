@@ -21,7 +21,7 @@
 
 use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster};
 use hydra_worker::shard::{verify_shard, ShardRefused, TrustedSigner};
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::{ShardManifestConfig, WorkerConfig};
 
 /// `(stage0_shard, stage1_shard, manifest)` for the 2-stage `[0,12)` / `[12,24)` dev split.
@@ -52,10 +52,10 @@ fn manifest_hash(manifest_path: &str) -> [u8; 32] {
     *blake3::hash(&std::fs::read(manifest_path).expect("read manifest")).as_bytes()
 }
 
-/// Session keys whose fence tuple actually names this manifest (H14). Building them any other way
+/// Session fence whose fence tuple actually names this manifest (H14). Building them any other way
 /// is now a refusal, which is the point: a worker's session and its weights must agree on identity.
-fn keys_for(manifest_path: &str, seed: u8) -> SessionKeys {
-    let mut k = SessionKeys::dev(seed);
+fn keys_for(manifest_path: &str, seed: u8) -> SessionFence {
+    let mut k = SessionFence::dev(seed);
     k.manifest_hash = manifest_hash(manifest_path);
     k
 }
@@ -79,9 +79,9 @@ async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
     };
     let k = (n_layer / 2).max(1);
     assert_eq!(k, 12, "the committed shard fixture is the 24-layer dev model split at 12");
-    // H14: the fence tuple names this manifest. `SessionKeys::dev(0xB2)` alone would now be
+    // H14: the fence tuple names this manifest. `SessionFence::dev(0xB2)` alone would now be
     // REFUSED — a valid signature says "one of ours", never "the one this session agreed on".
-    let keys = keys_for(&manifest, 0xB2);
+    let fence = keys_for(&manifest, 0xB2);
     let signer = trusted_signer();
     let n_ctx = tokens.len() as i32 + 8;
 
@@ -92,14 +92,14 @@ async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
     // The ONLY difference from the standing anchor: each worker points at its own shard file plus
     // the signed manifest. Same ranks, same layer ranges, same everything else.
     let s1_cfg = WorkerConfig {
-        keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
+        fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(s0.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
         recovery_start: false,
         shard_manifest: Some(ShardManifestConfig { path: manifest.clone(), trusted_signer: signer.0 }),
     };
     let s2_cfg = WorkerConfig {
-        keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
+        fence: fence.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
         receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(s1.clone()), n_gpu_layers: 0, n_ctx,
         sampler_config: None,
         recovery_start: false,
@@ -110,7 +110,7 @@ async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
 
     let connector = cluster.coordinator_connector().unwrap();
     let ep = hydra_worker::pair::Endpoints::new(s1_addr, "worker-s1", s2_addr, "worker-s2");
-    let digest = run_teacher_forced_pipeline(&connector, &ep, &keys, &tokens).await.expect("pipeline");
+    let digest = run_teacher_forced_pipeline(&connector, &ep, &fence, &tokens).await.expect("pipeline");
 
     assert_eq!(
         digest, golden,

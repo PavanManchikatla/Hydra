@@ -34,7 +34,7 @@
 //! `model_instance_id` was already correct, and is asserted here so it stays that way.
 
 use hydra_proto::proto;
-use hydra_worker::wire::{self, SessionKeys, WireError};
+use hydra_worker::wire::{self, SessionFence, WireError};
 
 // ---------------------------------------------------------------------------------------------
 // A frame builder that can emit values the real encoder never emits. That is the point: an audit
@@ -42,9 +42,9 @@ use hydra_worker::wire::{self, SessionKeys, WireError};
 // ---------------------------------------------------------------------------------------------
 
 /// Build an `APPLY_TOKEN` frame with a caller-chosen `branch_id`.
-fn apply_token_with_branch(keys: &SessionKeys, branch_id: u32) -> Vec<u8> {
+fn apply_token_with_branch(fence: &SessionFence, branch_id: u32) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, branch_id);
+    let wf = build_fence(&mut fbb, fence, branch_id);
     let body = proto::ApplyToken::create(
         &mut fbb,
         &proto::ApplyTokenArgs {
@@ -54,13 +54,13 @@ fn apply_token_with_branch(keys: &SessionKeys, branch_id: u32) -> Vec<u8> {
             commit_up_to_output_pos: -1,
         },
     );
-    finish(fbb, fence, proto::Body::ApplyToken, body.as_union_value())
+    finish(fbb, wf, proto::Body::ApplyToken, body.as_union_value())
 }
 
 /// Build a `FWD` frame with a caller-chosen tensor dtype and optional `block_scales`.
-fn fwd_with_tensor(keys: &SessionKeys, dtype: proto::DType, block_scales: Option<&[u8]>) -> Vec<u8> {
+fn fwd_with_tensor(fence: &SessionFence, dtype: proto::DType, block_scales: Option<&[u8]>) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, 0);
+    let wf = build_fence(&mut fbb, fence, 0);
     let data = fbb.create_vector::<u8>(&[0u8; 16]);
     let dims = fbb.create_vector::<u32>(&[1, 4]);
     let scales = block_scales.map(|b| fbb.create_vector::<u8>(b));
@@ -78,18 +78,18 @@ fn fwd_with_tensor(keys: &SessionKeys, dtype: proto::DType, block_scales: Option
             commit_up_to_output_pos: -1,
         },
     );
-    finish(fbb, fence, proto::Body::Fwd, body.as_union_value())
+    finish(fbb, wf, proto::Body::Fwd, body.as_union_value())
 }
 
 fn build_fence<'a>(
     fbb: &mut flatbuffers::FlatBufferBuilder<'a>,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     branch_id: u32,
 ) -> flatbuffers::WIPOffset<proto::Fence<'a>> {
-    let cluster_id = fbb.create_vector::<u8>(&keys.cluster_id);
-    let manifest_hash = fbb.create_vector::<u8>(&keys.manifest_hash);
-    let model_instance_id = fbb.create_vector::<u8>(&keys.model_instance_id);
-    let session_id = fbb.create_vector::<u8>(&keys.session_id);
+    let cluster_id = fbb.create_vector::<u8>(&fence.cluster_id);
+    let manifest_hash = fbb.create_vector::<u8>(&fence.manifest_hash);
+    let model_instance_id = fbb.create_vector::<u8>(&fence.model_instance_id);
+    let session_id = fbb.create_vector::<u8>(&fence.session_id);
     proto::Fence::create(
         fbb,
         &proto::FenceArgs {
@@ -132,18 +132,18 @@ fn finish(
 /// because a reserved hook that quietly disappears breaks forward compatibility silently.
 #[test]
 fn every_reserved_field_exists_in_hydra_proto_with_its_declared_type() {
-    let keys = SessionKeys::dev(0x11);
-    let payload = apply_token_with_branch(&keys, 0);
+    let fence = SessionFence::dev(0x11);
+    let payload = apply_token_with_branch(&fence, 0);
     let frame = flatbuffers::root::<proto::Frame>(&payload).expect("frame");
-    let fence = frame.fence();
+    let wire_fence = frame.fence();
 
     // `model_instance_id` — [uint8], exactly 16 bytes (spec §1.4 Option B hook).
-    let mid: &[u8] = fence.model_instance_id().bytes();
+    let mid: &[u8] = wire_fence.model_instance_id().bytes();
     assert_eq!(mid.len(), 16, "model_instance_id is a 16-byte field");
-    assert_eq!(mid, keys.model_instance_id, "and it is carried on the wire, not dropped");
+    assert_eq!(mid, fence.model_instance_id, "and it is carried on the wire, not dropped");
 
     // `branch_id` — uint32, carried on every frame.
-    let _branch: u32 = fence.branch_id();
+    let _branch: u32 = wire_fence.branch_id();
 
     // `DType::I8_BLOCKQ` — still in the enum (append-only schema evolution: the dtype stays so
     // that re-enabling it later is a transport change, not a protocol or engine change).
@@ -157,8 +157,8 @@ fn every_reserved_field_exists_in_hydra_proto_with_its_declared_type() {
 fn frame_tensor_type_is_optional() -> bool {
     // A tensor built without block_scales must read back as `None` — i.e. the field is genuinely
     // optional rather than defaulted to an empty vector, which is what "present iff" requires.
-    let keys = SessionKeys::dev(0x12);
-    let payload = fwd_with_tensor(&keys, proto::DType::F32, None);
+    let fence = SessionFence::dev(0x12);
+    let payload = fwd_with_tensor(&fence, proto::DType::F32, None);
     let frame = flatbuffers::root::<proto::Frame>(&payload).expect("frame");
     frame.body_as_fwd().expect("fwd").activations().block_scales().is_none()
 }
@@ -172,16 +172,16 @@ fn frame_tensor_type_is_optional() -> bool {
 /// served under v1 semantics as if it had never asked.
 #[test]
 fn a_nonzero_branch_id_is_refused() {
-    let keys = SessionKeys::dev(0x21);
+    let fence = SessionFence::dev(0x21);
 
     // Control: the same frame with branch_id = 0 decodes. Without this the test could pass because
     // the builder is broken rather than because the fence works (the same pairing principle as the
     // D0 zero-traffic test and the TLC cert legs).
-    let ok = wire::decode(&apply_token_with_branch(&keys, 0), &keys);
+    let ok = wire::decode(&apply_token_with_branch(&fence, 0), &fence);
     assert!(ok.is_ok(), "control: branch_id = 0 must decode, got {ok:?}");
 
     for branch in [1u32, 2, 0xFFFF_FFFF] {
-        let err = wire::decode(&apply_token_with_branch(&keys, branch), &keys).unwrap_err();
+        let err = wire::decode(&apply_token_with_branch(&fence, branch), &fence).unwrap_err();
         assert_eq!(
             err,
             WireError::ReservedInUse("branch_id"),
@@ -195,12 +195,12 @@ fn a_nonzero_branch_id_is_refused() {
 /// dtype stays in the schema; a peer must not be able to put this build on that path.
 #[test]
 fn an_i8_blockq_boundary_is_refused_as_reserved() {
-    let keys = SessionKeys::dev(0x22);
+    let fence = SessionFence::dev(0x22);
 
-    let ok = wire::decode(&fwd_with_tensor(&keys, proto::DType::F32, None), &keys);
+    let ok = wire::decode(&fwd_with_tensor(&fence, proto::DType::F32, None), &fence);
     assert!(ok.is_ok(), "control: an F32 boundary must decode, got {ok:?}");
 
-    let err = wire::decode(&fwd_with_tensor(&keys, proto::DType::I8_BLOCKQ, Some(&[1, 2, 3, 4])), &keys).unwrap_err();
+    let err = wire::decode(&fwd_with_tensor(&fence, proto::DType::I8_BLOCKQ, Some(&[1, 2, 3, 4])), &fence).unwrap_err();
     assert_eq!(err, WireError::ReservedInUse("DType::I8_BLOCKQ"));
 }
 
@@ -209,9 +209,9 @@ fn an_i8_blockq_boundary_is_refused_as_reserved() {
 /// narrower payload would turn a ratified precision decision into an accident.
 #[test]
 fn a_non_f32_boundary_is_refused_rather_than_widened() {
-    let keys = SessionKeys::dev(0x23);
+    let fence = SessionFence::dev(0x23);
     for dt in [proto::DType::F16, proto::DType::BF16] {
-        let err = wire::decode(&fwd_with_tensor(&keys, dt, None), &keys).unwrap_err();
+        let err = wire::decode(&fwd_with_tensor(&fence, dt, None), &fence).unwrap_err();
         assert!(
             matches!(err, WireError::Malformed(ref m) if m.contains("F32")),
             "dtype {dt:?} must be refused, got {err:?}"
@@ -224,8 +224,8 @@ fn a_non_f32_boundary_is_refused_rather_than_widened() {
 /// field a future peer could use to smuggle state past a build that does not understand it.
 #[test]
 fn block_scales_on_a_non_i8_tensor_is_refused_not_ignored() {
-    let keys = SessionKeys::dev(0x24);
-    let err = wire::decode(&fwd_with_tensor(&keys, proto::DType::F32, Some(&[9, 9, 9, 9])), &keys).unwrap_err();
+    let fence = SessionFence::dev(0x24);
+    let err = wire::decode(&fwd_with_tensor(&fence, proto::DType::F32, Some(&[9, 9, 9, 9])), &fence).unwrap_err();
     assert_eq!(err, WireError::ReservedInUse("Tensor::block_scales (valid only with I8_BLOCKQ)"));
 }
 
@@ -233,11 +233,11 @@ fn block_scales_on_a_non_i8_tensor_is_refused_not_ignored() {
 /// any engine work.
 #[test]
 fn a_foreign_model_instance_id_is_refused_at_f1() {
-    let ours = SessionKeys::dev(0x31);
+    let ours = SessionFence::dev(0x31);
     let mut theirs = ours.clone();
     theirs.model_instance_id = [0xAB; 16];
 
-    // A frame built with *their* instance id, decoded against *our* keys.
+    // A frame built with *their* instance id, decoded against *our* fence.
     let payload = apply_token_with_branch(&theirs, 0);
     let err = wire::decode(&payload, &ours).unwrap_err();
     assert_eq!(err, WireError::FenceMismatch("model_instance_id"));
@@ -250,8 +250,8 @@ fn a_foreign_model_instance_id_is_refused_at_f1() {
 /// handed.
 #[test]
 fn model_instance_id_and_branch_id_never_reach_decision_making_code() {
-    let keys = SessionKeys::dev(0x32);
-    let (view, _msg) = wire::decode(&apply_token_with_branch(&keys, 0), &keys).expect("decode");
+    let fence = SessionFence::dev(0x32);
+    let (view, _msg) = wire::decode(&apply_token_with_branch(&fence, 0), &fence).expect("decode");
 
     // Exhaustive destructure: adding a field to FenceView breaks this line.
     let wire::FenceView { epoch, recovery_id, activation_attempt_id, stage_generation } = view;
@@ -327,15 +327,15 @@ fn the_wire_body_union_is_exactly_the_spec_4_message_inventory() {
 /// on a frame or says it cannot.
 #[test]
 fn an_unimplemented_but_in_spec_body_is_refused_never_silently_dropped() {
-    let keys = SessionKeys::dev(0x41);
+    let fence = SessionFence::dev(0x41);
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, &keys, 0);
+    let wf = build_fence(&mut fbb, &fence, 0);
     // `CANCEL` is in spec §4 and deliberately not wired up yet (the DELETE surface is a named
     // deferral in §0(c)); it stands in for every not-yet-implemented variant.
     let body = proto::Cancel::create(&mut fbb, &proto::CancelArgs {});
-    let payload = finish(fbb, fence, proto::Body::Cancel, body.as_union_value());
+    let payload = finish(fbb, wf, proto::Body::Cancel, body.as_union_value());
 
-    let err = wire::decode(&payload, &keys).unwrap_err();
+    let err = wire::decode(&payload, &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::UnsupportedBody,
@@ -447,8 +447,8 @@ fn an_unparseable_frame_is_refused_by_the_gate_rather_than_passed_to_the_decoder
     );
 
     // Control: a real coordinator frame passes the gate.
-    let keys = SessionKeys::dev(0x71);
-    let frame = wire::encode_apply_token(&keys, 0, 0, 1, true);
+    let fence = SessionFence::dev(0x71);
+    let frame = wire::encode_apply_token(&fence, 0, 0, 1, true);
     check_role(PeerRole::Coordinator, &frame).expect("control: a coordinator may send APPLY_TOKEN");
     // …and the same frame from a durability target does not.
     check_role(PeerRole::DurabilityTarget, &frame)

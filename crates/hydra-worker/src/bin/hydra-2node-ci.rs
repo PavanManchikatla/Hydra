@@ -23,7 +23,7 @@ use std::time::Duration;
 use hydra_state::{ActivationKind, ActivationTuple};
 use hydra_transport::framed::Conn;
 use hydra_worker::pair::Cluster;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::WorkerConfig;
 use hydra_worker::Bootstrap;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -102,7 +102,7 @@ fn write_boot(cluster: &Cluster, name: &str, dir: &std::path::Path, recovery_sta
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: SessionKeys::dev(0xC1), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
+            fence: SessionFence::dev(0xC1), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None, recovery_start, shard_manifest: None,
         },
@@ -128,19 +128,19 @@ async fn connect_retry(connector: &hydra_transport::tcp_mtls::TcpMtls, addr: std
     panic!("could not connect to {name} at {addr} within 20s");
 }
 
-async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, kind: ActivationKind, epoch: u32, rid: u32) {
+async fn activate<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, kind: ActivationKind, epoch: u32, rid: u32) {
     let t = ActivationTuple { kind, epoch, recovery_id: rid, attempt: 0, sampler_checkpoint_id: 0 };
-    c.send(0, &wire::encode_commit_activation(keys, &t, 1)).await.unwrap();
-    assert!(matches!(wire::decode(&c.recv().await.unwrap().payload, keys).unwrap().1, Msg::ActivationCommitted(_)), "COMMIT_ACTIVATION");
-    c.send(0, &wire::encode_finalize_activation(keys, &t, 1)).await.unwrap();
-    assert!(matches!(wire::decode(&c.recv().await.unwrap().payload, keys).unwrap().1, Msg::ActivationFinalized), "FINALIZE_ACTIVATION");
+    c.send(0, &wire::encode_commit_activation(fence, &t, 1)).await.unwrap();
+    assert!(matches!(wire::decode(&c.recv().await.unwrap().payload, fence).unwrap().1, Msg::ActivationCommitted(_)), "COMMIT_ACTIVATION");
+    c.send(0, &wire::encode_finalize_activation(fence, &t, 1)).await.unwrap();
+    assert!(matches!(wire::decode(&c.recv().await.unwrap().payload, fence).unwrap().1, Msg::ActivationFinalized), "FINALIZE_ACTIVATION");
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Preflight: docker present.
     docker(&["version", "--format", "{{.Server.Version}}"]).expect("docker daemon must be available");
-    let keys = SessionKeys::dev(0xC1);
+    let fence = SessionFence::dev(0xC1);
     let cluster = Cluster::new().unwrap();
     let connector = cluster.coordinator_connector().unwrap();
     let dir = std::env::temp_dir().join(format!("hydra-2node-ci-{}", std::process::id()));
@@ -157,8 +157,8 @@ async fn main() {
     let mut cp = connect_retry(&connector, sp.addr(), "sp").await;
 
     // 2. activate both across the real container mTLS.
-    activate(&mut c1, &keys, ActivationKind::Initial, 0, 0).await;
-    activate(&mut cp, &keys, ActivationKind::Initial, 0, 0).await;
+    activate(&mut c1, &fence, ActivationKind::Initial, 0, 0).await;
+    activate(&mut cp, &fence, ActivationKind::Initial, 0, 0).await;
     eprintln!("[ci] both workers ACTIVE_FINAL over real container mTLS");
 
     // 3. docker kill S_P (kill -9).
@@ -167,18 +167,18 @@ async fn main() {
     eprintln!("[ci] docker kill sp (SIGKILL)");
 
     // 4. survivor S1 takes BEGIN_RECOVERY Case A (freeze, epoch 0->1).
-    c1.send(0, &wire::encode_begin_recovery(&keys, 0, 1, 1, 0)).await.unwrap();
-    assert!(matches!(wire::decode(&c1.recv().await.unwrap().payload, &keys).unwrap().1, Msg::RecoveryAck { .. }), "survivor S1 Case A freeze");
+    c1.send(0, &wire::encode_begin_recovery(&fence, 0, 1, 1, 0)).await.unwrap();
+    assert!(matches!(wire::decode(&c1.recv().await.unwrap().payload, &fence).unwrap().1, Msg::RecoveryAck { .. }), "survivor S1 Case A freeze");
     eprintln!("[ci] survivor S1 froze (Case A)");
 
     // 5. replacement S_P container: Case A -> catch-up -> recovery activation.
     let rsp = ContainerWorker::spawn(&cluster, "hydra-ci-sp2", &spr_boot).expect("run replacement sp container");
     let mut rcp = connect_retry(&connector, rsp.addr(), "sp-recover").await;
-    rcp.send(0, &wire::encode_begin_recovery(&keys, 0, 1, 1, 0)).await.unwrap();
-    assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::RecoveryAck { .. }), "replacement S_P Case A");
-    rcp.send(0, &wire::encode_catch_up_context(&keys, 1, 1, 3)).await.unwrap();
-    assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &keys).unwrap().1, Msg::CatchUpReady { .. }), "replacement S_P catch-up");
-    activate(&mut rcp, &keys, ActivationKind::Recovery, 1, 1).await;
+    rcp.send(0, &wire::encode_begin_recovery(&fence, 0, 1, 1, 0)).await.unwrap();
+    assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::RecoveryAck { .. }), "replacement S_P Case A");
+    rcp.send(0, &wire::encode_catch_up_context(&fence, 1, 1, 3)).await.unwrap();
+    assert!(matches!(wire::decode(&rcp.recv().await.unwrap().payload, &fence).unwrap().1, Msg::CatchUpReady { .. }), "replacement S_P catch-up");
+    activate(&mut rcp, &fence, ActivationKind::Recovery, 1, 1).await;
     eprintln!("[ci] replacement S_P recovered + ACTIVE_FINAL (Case A -> catch-up -> activation)");
 
     // Success — the workflow gates on this exact line (rule-16 spirit).

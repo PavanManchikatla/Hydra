@@ -28,7 +28,7 @@ use tower::ServiceExt;
 
 // ---------------- stubs ----------------
 
-fn fence() -> WalFenceCtx {
+fn wal_fence() -> WalFenceCtx {
     WalFenceCtx { cluster_id: [1; 16], session_id: [2; 16], model_instance_id: [3; 16], manifest_hash: [4; 32], epoch: 0, recovery_id: 0, activation_attempt_id: 0 }
 }
 
@@ -78,7 +78,7 @@ impl PieceSource for MapPieces {
 }
 
 fn session(disk: Box<dyn Durability>, pieces: Box<dyn PieceSource>, k: usize, cap: usize) -> Session {
-    Session::new(CommitStream::with_durability(disk), fence(), pieces, k, cap)
+    Session::new(CommitStream::with_durability(disk), wal_fence(), pieces, k, cap)
 }
 
 // ---------------- Session-level: the gate is the law ----------------

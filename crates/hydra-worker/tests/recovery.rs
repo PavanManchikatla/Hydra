@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{serve_conn, Worker, WorkerConfig};
 
 const W: &str = "worker-r";
@@ -48,11 +48,11 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
     let ca = ClusterCa::new().unwrap();
     let w_id = ca.issue(W).unwrap();
     let c_id = ca.issue(C).unwrap();
-    let keys = SessionKeys::dev(0xC5);
+    let fence = SessionFence::dev(0xC5);
 
     // A recovery-replacement worker: starts FROZEN (recovery_start = true), control-plane only.
     let cfg = WorkerConfig {
-        keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true, receives_tokens: true,
+        fence: fence.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true, receives_tokens: true,
         epoch: 0, recovery_id: 0, model_path: None, n_gpu_layers: 0, n_ctx: 64, sampler_config: None,
         recovery_start: true, shard_manifest: None,
     };
@@ -61,15 +61,15 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
     let mut conn = connector.connect(addr, W).await.expect("connect");
 
     // 1. BEGIN_RECOVERY Case A (base=target=0, new recovery_id=1, truncate_to=0 for a fresh replica).
-    conn.send(0, &wire::encode_begin_recovery(&keys, 0, 0, 1, 0)).await.unwrap();
-    match wire::decode(&conn.recv().await.unwrap().payload, &keys).unwrap().1 {
+    conn.send(0, &wire::encode_begin_recovery(&fence, 0, 0, 1, 0)).await.unwrap();
+    match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::RecoveryAck { .. } => {}
         other => panic!("Case A must ack RECOVERY_ACK, got {other:?}"),
     }
 
     // 2. CATCH_UP_CONTEXT{goal=3} → the stage RebuildStep-s to FROZEN_READY → CATCH_UP_READY.
-    conn.send(0, &wire::encode_catch_up_context(&keys, 0, 1, 3)).await.unwrap();
-    match wire::decode(&conn.recv().await.unwrap().payload, &keys).unwrap().1 {
+    conn.send(0, &wire::encode_catch_up_context(&fence, 0, 1, 3)).await.unwrap();
+    match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::CatchUpReady { applied_input_pos } => assert_eq!(applied_input_pos, 3, "caught up to goal"),
         other => panic!("catch-up must ack CATCH_UP_READY, got {other:?}"),
     }
@@ -78,14 +78,14 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
     let tuple = hydra_state::ActivationTuple {
         kind: hydra_state::ActivationKind::Recovery, epoch: 0, recovery_id: 1, attempt: 0, sampler_checkpoint_id: 0,
     };
-    conn.send(0, &wire::encode_commit_activation(&keys, &tuple, 1)).await.unwrap();
-    match wire::decode(&conn.recv().await.unwrap().payload, &keys).unwrap().1 {
+    conn.send(0, &wire::encode_commit_activation(&fence, &tuple, 1)).await.unwrap();
+    match wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1 {
         Msg::ActivationCommitted(t) => assert_eq!((t.epoch, t.recovery_id, t.attempt), (0, 1, 0)),
         other => panic!("expected ActivationCommitted, got {other:?}"),
     }
-    conn.send(0, &wire::encode_finalize_activation(&keys, &tuple, 1)).await.unwrap();
+    conn.send(0, &wire::encode_finalize_activation(&fence, &tuple, 1)).await.unwrap();
     assert!(
-        matches!(wire::decode(&conn.recv().await.unwrap().payload, &keys).unwrap().1, Msg::ActivationFinalized),
+        matches!(wire::decode(&conn.recv().await.unwrap().payload, &fence).unwrap().1, Msg::ActivationFinalized),
         "the recovered stage reaches ACTIVE_FINAL"
     );
 }

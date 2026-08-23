@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use hydra_coordinator::BoundaryStore;
 use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::DurableForwarder;
 
 const DUR_NAME: &str = "durability-target";
@@ -34,7 +34,7 @@ fn store_path() -> std::path::PathBuf {
 /// A durability target: accept one connection and, for each inbound `BOUNDARY_COPY`, persist it to a
 /// real `BoundaryStore` and reply `DURABILITY_ACK{durable_through}` (the fdatasync'd frontier). This
 /// is the coordinator's durability role (spec §7), stood up as a real mTLS endpoint.
-fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::PathBuf, keys: SessionKeys) -> SocketAddr {
+fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::PathBuf, fence: SessionFence) -> SocketAddr {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -44,10 +44,10 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
             let mut store = BoundaryStore::create(&path, [1; 16], [2; 16]).expect("store");
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                match wire::decode(&frame.payload, &keys) {
+                match wire::decode(&frame.payload, &fence) {
                     Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) => {
                         let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).expect("persist");
-                        let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, durable_through, 0);
+                        let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                         if conn.send(0, &ack).await.is_err() {
                             break;
                         }
@@ -70,16 +70,16 @@ async fn a_recovery_needed_boundary_is_never_released_early_in_the_live_serve_pa
     let ca = ClusterCa::new().unwrap();
     let dur_id = ca.issue(DUR_NAME).unwrap();
     let s1_id = ca.issue(S1_NAME).unwrap();
-    let keys = SessionKeys::dev(0xB0);
+    let fence = SessionFence::dev(0xB0);
     let path = store_path();
 
-    let dur_addr = spawn_durability_endpoint(ca.server_config(&dur_id).unwrap(), path.clone(), keys.clone());
+    let dur_addr = spawn_durability_endpoint(ca.server_config(&dur_id).unwrap(), path.clone(), fence.clone());
     let connector = TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap();
     let mut dur = connector.connect(dur_addr, DUR_NAME).await.expect("connect durability");
 
     // D1 forwarding stage: require_durable = true. Capacity 8 (comfortably above the 3 boundaries
     // here — this test exercises the release gate, not the backpressure bound).
-    let mut fwd = DurableForwarder::new(keys.clone(), 0, true, 8);
+    let mut fwd = DurableForwarder::new(fence.clone(), 0, true, 8);
 
     // Forward + copy three boundaries (real BOUNDARY_COPY over mTLS; the endpoint persists each).
     let boundaries: Vec<Vec<f32>> = (0..3).map(|p| vec![p as f32, p as f32 + 0.5, -1.0]).collect();
@@ -94,7 +94,7 @@ async fn a_recovery_needed_boundary_is_never_released_early_in_the_live_serve_pa
     fwd.on_applied_ack(2);
     for _ in 0..2 {
         let f = dur.recv().await.unwrap();
-        match wire::decode(&f.payload, &keys).unwrap().1 {
+        match wire::decode(&f.payload, &fence).unwrap().1 {
             Msg::DurabilityAck { durable_through_input_pos, .. } => fwd.on_durability_ack(durable_through_input_pos),
             other => panic!("expected DURABILITY_ACK, got {other:?}"),
         }
@@ -108,7 +108,7 @@ async fn a_recovery_needed_boundary_is_never_released_early_in_the_live_serve_pa
 
     // Process the third DURABILITY_ACK → now position 2 may release.
     let f = dur.recv().await.unwrap();
-    match wire::decode(&f.payload, &keys).unwrap().1 {
+    match wire::decode(&f.payload, &fence).unwrap().1 {
         Msg::DurabilityAck { durable_through_input_pos, .. } => fwd.on_durability_ack(durable_through_input_pos),
         other => panic!("expected DURABILITY_ACK, got {other:?}"),
     }

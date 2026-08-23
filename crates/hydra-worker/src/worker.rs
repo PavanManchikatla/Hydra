@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::durable::DurableForwarder;
 use crate::sampler::{Sampler, SamplerError, SamplingConfig};
-use crate::wire::{self, Msg, SessionKeys, WireError};
+use crate::wire::{self, Msg, SessionFence, WireError};
 use hydra_transport::roles::PeerRole;
 
 /// `ERR_FENCED` on the wire (`proto::ErrCode::ERR_FENCED`).
@@ -59,7 +59,7 @@ struct SampledEntry {
 /// in the manifest itself.
 ///
 /// The **H14** half of the binding needs no field here: the expected `manifest_hash` is already in
-/// `WorkerConfig::keys` (spec §1.1's fence tuple), which is exactly the value the cluster agreed on
+/// `WorkerConfig::fence` (spec §1.1's fence tuple), which is exactly the value the cluster agreed on
 /// for this session. Taking it from anywhere else would be inventing a second source of truth.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ShardManifestConfig {
@@ -74,7 +74,7 @@ pub struct ShardManifestConfig {
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
-    pub keys: SessionKeys,
+    pub fence: SessionFence,
     pub rank: StageRank,
     /// First hosted layer (`l0`).
     pub layer_first: i32,
@@ -163,7 +163,7 @@ impl Engine {
                     cfg.layer_first,
                     cfg.layer_last,
                     &crate::shard::TrustedSigner(sm.trusted_signer),
-                    &cfg.keys.manifest_hash,
+                    &cfg.fence.manifest_hash,
                 )?;
                 crate::shard::load_verified_shard(&verified, cfg.n_gpu_layers)?
             }
@@ -263,7 +263,7 @@ impl Worker {
     /// Decode one inbound frame, act on it, and return zero or more reply frames (each already a
     /// complete `Frame` payload ready for `Conn::send`). Pure of I/O.
     pub fn on_frame(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, WorkerError> {
-        let (view, msg) = wire::decode(payload, &self.cfg.keys)?;
+        let (view, msg) = wire::decode(payload, &self.cfg.fence)?;
         match msg {
             Msg::ApplyToken { input_pos, token_id, no_sample } => {
                 if !self.cfg.receives_tokens {
@@ -272,14 +272,14 @@ impl Worker {
                 }
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_token(token_id as i32, input_pos as i32)? {
-                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, input_pos, no_sample, &boundary)]),
+                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, input_pos, no_sample, &boundary)]),
                     None => self.retain_and_ack(view.epoch, input_pos, no_sample),
                 }
             }
             Msg::Fwd { first_input_pos, no_sample, activations } => {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
                 match eng.apply_boundary(&activations, first_input_pos as i32)? {
-                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.keys, view.epoch, first_input_pos, no_sample, &boundary)]),
+                    Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, first_input_pos, no_sample, &boundary)]),
                     None => self.retain_and_ack(view.epoch, first_input_pos, no_sample),
                 }
             }
@@ -339,7 +339,7 @@ impl Worker {
         for _ in 0..goal.max(0) + 2 {
             for eff in self.stage.step(StageEvent::RebuildStep { goal }) {
                 if let StageEffect::Ready { recovery_id, applied, .. } = eff {
-                    ready = Some(wire::encode_catch_up_ready(&self.cfg.keys, self.stage.epoch(), recovery_id, applied));
+                    ready = Some(wire::encode_catch_up_ready(&self.cfg.fence, self.stage.epoch(), recovery_id, applied));
                 }
             }
             if ready.is_some() {
@@ -373,7 +373,7 @@ impl Worker {
         let logits = eng.last_logits()?;
         let witness = if no_sample { logits_digest(&logits).to_vec() } else { Vec::new() };
         self.latest_logits = Some(logits);
-        Ok(vec![wire::encode_applied_ack(&self.cfg.keys, epoch, pos, &witness)])
+        Ok(vec![wire::encode_applied_ack(&self.cfg.fence, epoch, pos, &witness)])
     }
 
     /// `SAMPLE_NEXT` (spec §3, I14): fence the checkpoint id + config hash (drift is fatal), serve a
@@ -386,28 +386,28 @@ impl Worker {
         config_hash: &[u8],
         expected_checkpoint_id: u64,
     ) -> Result<Vec<Vec<u8>>, WorkerError> {
-        let keys = &self.cfg.keys;
+        let fence = &self.cfg.fence;
         let Some(sampler) = self.sampler.as_mut() else {
-            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+            return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         };
         // Fatal drift → reject loudly, never silently repair (spec §2.6b).
         if sampler.check_fence(expected_checkpoint_id, config_hash).is_err() {
-            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+            return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         }
         // I14: a duplicate SAMPLE_NEXT is served from the SAMPLED cache; the RNG never re-advances.
         if let Some(entry) = self.sampled_ring.get(&output_pos) {
-            return Ok(vec![wire::encode_sampled(keys, epoch, output_pos, entry.token_id, &entry.snapshot, &entry.state_digest)]);
+            return Ok(vec![wire::encode_sampled(fence, epoch, output_pos, entry.token_id, &entry.snapshot, &entry.state_digest)]);
         }
         let Some(logits) = self.latest_logits.as_ref() else {
             // No retained logits for this position (I14: sample only from retained logits).
-            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+            return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         };
         let out = sampler.sample(output_pos, logits);
         self.sampled_ring.insert(
             output_pos,
             SampledEntry { token_id: out.token_id, snapshot: out.snapshot.clone(), state_digest: out.state_digest },
         );
-        Ok(vec![wire::encode_sampled(keys, epoch, output_pos, out.token_id, &out.snapshot, &out.state_digest)])
+        Ok(vec![wire::encode_sampled(fence, epoch, output_pos, out.token_id, &out.snapshot, &out.state_digest)])
     }
 
     /// `INSTALL_SAMPLER_CHECKPOINT` (I17): install the exact state into S_P's sampler (idempotent),
@@ -418,19 +418,19 @@ impl Worker {
         checkpoint_id: u64,
         snapshot: &[u8],
     ) -> Result<Vec<Vec<u8>>, WorkerError> {
-        let keys = &self.cfg.keys;
+        let fence = &self.cfg.fence;
         let Some(sampler) = self.sampler.as_mut() else {
-            return Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
+            return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         };
         match sampler.install(snapshot) {
             Ok(()) => {
                 let digest = *blake3::hash(snapshot).as_bytes();
-                Ok(vec![wire::encode_sampler_checkpoint_installed(keys, epoch, checkpoint_id, sampler.sampled_pos(), &digest)])
+                Ok(vec![wire::encode_sampler_checkpoint_installed(fence, epoch, checkpoint_id, sampler.sampled_pos(), &digest)])
             }
             Err(SamplerError::BadChecksum) | Err(SamplerError::BadSnapshot(_)) | Err(SamplerError::ConfigDrift) => {
-                Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)])
+                Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)])
             }
-            Err(_) => Ok(vec![wire::encode_error(keys, epoch, 0, ERR_CHECKPOINT_MISMATCH)]),
+            Err(_) => Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]),
         }
     }
 
@@ -440,22 +440,22 @@ impl Worker {
     }
 
     fn encode_effect(&self, eff: StageEffect) -> Option<Vec<u8>> {
-        let keys = &self.cfg.keys;
+        let fence = &self.cfg.fence;
         let gen = self.stage.generation();
         match eff {
             StageEffect::Committed { epoch, recovery_id, attempt, .. } => {
                 let t = ActivationTuple { kind: ActivationKind::Initial, epoch, recovery_id, attempt, sampler_checkpoint_id: 0 };
-                Some(wire::encode_activation_committed(keys, &t, gen))
+                Some(wire::encode_activation_committed(fence, &t, gen))
             }
-            StageEffect::Finalized { attempt, .. } => Some(wire::encode_activation_finalized(keys, self.stage.epoch(), attempt)),
+            StageEffect::Finalized { attempt, .. } => Some(wire::encode_activation_finalized(fence, self.stage.epoch(), attempt)),
             StageEffect::RecoveryAck { target, recovery_id, .. } => {
-                Some(wire::encode_recovery_ack(keys, target, recovery_id, self.stage.applied()))
+                Some(wire::encode_recovery_ack(fence, target, recovery_id, self.stage.applied()))
             }
             StageEffect::ResetAck { recovery_id, .. } => {
-                Some(wire::encode_recovery_ack(keys, self.stage.epoch(), recovery_id, self.stage.applied()))
+                Some(wire::encode_recovery_ack(fence, self.stage.epoch(), recovery_id, self.stage.applied()))
             }
-            StageEffect::RecoveryCompleted { target, .. } => Some(wire::encode_error(keys, target, 0, ERR_RECOVERY_COMPLETED)),
-            StageEffect::Fenced { attempt, .. } => Some(wire::encode_error(keys, self.stage.epoch(), attempt, ERR_FENCED)),
+            StageEffect::RecoveryCompleted { target, .. } => Some(wire::encode_error(fence, target, 0, ERR_RECOVERY_COMPLETED)),
+            StageEffect::Fenced { attempt, .. } => Some(wire::encode_error(fence, self.stage.epoch(), attempt, ERR_FENCED)),
             // `Ready` is an internal catch-up milestone (no wire ack in this slice).
             StageEffect::Ready { .. } => None,
         }
@@ -797,10 +797,10 @@ pub fn shared_down(state: DownstreamState) -> SharedDown {
 /// bound, and return the downstream's response to relay upstream. This is the FWD sub-step of the
 /// serve loop, extracted so the worker borrow is provably not in scope: its only `Worker` input is
 /// the already-decoded `(input_pos, boundary)` bytes.
-async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionKeys) -> Result<Vec<u8>, WorkerError> {
+async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], fence: &SessionFence) -> Result<Vec<u8>, WorkerError> {
     // Decode the boundary out of the FWD reply for the durability copy (the raw bytes are still what
     // we forward downstream — the direct S1→S2 path is byte-preserving).
-    let (input_pos, boundary) = match wire::decode(reply, keys)?.1 {
+    let (input_pos, boundary) = match wire::decode(reply, fence)?.1 {
         Msg::Fwd { first_input_pos, activations, .. } => (first_input_pos, activations),
         _ => return Err(WorkerError::Wire(WireError::Malformed("forward_and_copy: reply is not FWD".into()))),
     };
@@ -811,7 +811,7 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
     // bound it is durability that must catch up.
     while d.forwarder.is_at_capacity() {
         let ack = d.dur.recv().await?;
-        match wire::decode(&ack.payload, keys)?.1 {
+        match wire::decode(&ack.payload, fence)?.1 {
             Msg::DurabilityAck { durable_through_input_pos, .. } => d.forwarder.on_durability_ack(durable_through_input_pos),
             _ => return Err(WorkerError::Wire(WireError::Malformed("expected DURABILITY_ACK on the durability link".into()))),
         }
@@ -838,7 +838,7 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
 
     // The downstream's response to a boundary FWD is its APPLIED_ACK — advance the R3′ downstream
     // frontier from it so release can proceed.
-    if let Ok((_, Msg::AppliedAck { cumulative_input_pos, .. })) = wire::decode(&resp_payload, keys) {
+    if let Ok((_, Msg::AppliedAck { cumulative_input_pos, .. })) = wire::decode(&resp_payload, fence) {
         forwarder.on_applied_ack(cumulative_input_pos);
     }
 
@@ -857,7 +857,7 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
 /// e.g. `SAMPLE_NEXT`→`SAMPLED` on a coordinator connection) goes straight back upstream. Several of
 /// these run at once against one `Worker`/one `DownstreamState`; only FWD-carrying connections contend
 /// the downstream lock. See the module contract on the two locks' opposite await disciplines.
-pub async fn serve_conn_forwarding_durable_shared<S>(worker: &SharedWorker, down: &SharedDown, conn: &mut Conn<S>, keys: &SessionKeys, role: PeerRole) -> Result<(), WorkerError>
+pub async fn serve_conn_forwarding_durable_shared<S>(worker: &SharedWorker, down: &SharedDown, conn: &mut Conn<S>, fence: &SessionFence, role: PeerRole) -> Result<(), WorkerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -875,7 +875,7 @@ where
             if wire::is_fwd_frame(&reply) {
                 // FWD branch: lock the downstream ONLY here; the worker borrow is already dropped.
                 let mut d = down.lock().await;
-                let resp = forward_and_copy(&mut d, &reply, keys).await?;
+                let resp = forward_and_copy(&mut d, &reply, fence).await?;
                 conn.send(0, &resp).await?;
             } else {
                 conn.send(0, &reply).await?;
@@ -888,7 +888,7 @@ where
 /// and one shared `DownstreamState` (durable worker→worker forwarding). Must run inside a
 /// `tokio::task::LocalSet` on a current-thread runtime (the `Worker`/`Rc` are `!Send`). A
 /// per-connection error drops only that connection; a listener error ends the loop.
-pub async fn serve_multi_conn_forwarding_durable(worker: SharedWorker, down: SharedDown, keys: SessionKeys, listener: TcpMtlsListener) -> Result<(), WorkerError> {
+pub async fn serve_multi_conn_forwarding_durable(worker: SharedWorker, down: SharedDown, fence: SessionFence, listener: TcpMtlsListener) -> Result<(), WorkerError> {
     loop {
         let (mut conn, role) = match listener.accept().await {
             Ok(a) => (a.conn, a.peer.role),
@@ -896,7 +896,7 @@ pub async fn serve_multi_conn_forwarding_durable(worker: SharedWorker, down: Sha
         };
         let w = worker.clone();
         let d = down.clone();
-        let k = keys.clone();
+        let k = fence.clone();
         tokio::task::spawn_local(async move {
             if let Err(e) = serve_conn_forwarding_durable_shared(&w, &d, &mut conn, &k, role).await {
                 eprintln!("hydra-worker: durable forwarding connection ended with error: {e}");

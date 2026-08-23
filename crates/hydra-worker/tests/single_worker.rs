@@ -17,7 +17,7 @@ use std::sync::mpsc;
 
 use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{serve_conn, Worker, WorkerConfig};
 
 const WORKER_NAME: &str = "worker-1";
@@ -56,10 +56,10 @@ async fn control_plane_activation_round_trips_through_the_real_stage_sm() {
     let ca = ClusterCa::new().unwrap();
     let worker_id = ca.issue(WORKER_NAME).unwrap();
     let coord_id = ca.issue(COORD_NAME).unwrap();
-    let keys = SessionKeys::dev(1);
+    let fence = SessionFence::dev(1);
 
     let cfg = WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank: 0,
         layer_first: 0,
         layer_last: -1,
@@ -86,18 +86,18 @@ async fn control_plane_activation_round_trips_through_the_real_stage_sm() {
         attempt: 0,
         sampler_checkpoint_id: 0,
     };
-    conn.send(0, &wire::encode_commit_activation(&keys, &tuple, 1)).await.unwrap();
+    conn.send(0, &wire::encode_commit_activation(&fence, &tuple, 1)).await.unwrap();
     let reply = conn.recv().await.unwrap();
-    match wire::decode(&reply.payload, &keys).unwrap().1 {
+    match wire::decode(&reply.payload, &fence).unwrap().1 {
         Msg::ActivationCommitted(t) => assert_eq!((t.epoch, t.attempt), (0, 0)),
         other => panic!("expected ActivationCommitted, got {other:?}"),
     }
 
     // FINALIZE_ACTIVATION → ACTIVATION_FINALIZED (stage now ACTIVE_FINAL).
-    conn.send(0, &wire::encode_finalize_activation(&keys, &tuple, 1)).await.unwrap();
+    conn.send(0, &wire::encode_finalize_activation(&fence, &tuple, 1)).await.unwrap();
     let reply = conn.recv().await.unwrap();
     assert!(
-        matches!(wire::decode(&reply.payload, &keys).unwrap().1, Msg::ActivationFinalized),
+        matches!(wire::decode(&reply.payload, &fence).unwrap().1, Msg::ActivationFinalized),
         "expected ActivationFinalized"
     );
 }
@@ -106,8 +106,8 @@ async fn control_plane_activation_round_trips_through_the_real_stage_sm() {
 async fn f1_fence_mismatch_is_rejected_before_action() {
     // A frame carrying a foreign session identity must be dropped by the F1 check, never decoded to
     // an action. (Exercised directly on the codec — the same gate the worker applies per frame.)
-    let ours = SessionKeys::dev(2);
-    let theirs = SessionKeys::dev(3);
+    let ours = SessionFence::dev(2);
+    let theirs = SessionFence::dev(3);
     let tuple = hydra_state::ActivationTuple {
         kind: hydra_state::ActivationKind::Initial,
         epoch: 0,
@@ -132,11 +132,11 @@ async fn data_plane_apply_token_echo_over_mtls() {
     let ca = ClusterCa::new().unwrap();
     let worker_id = ca.issue(WORKER_NAME).unwrap();
     let coord_id = ca.issue(COORD_NAME).unwrap();
-    let keys = SessionKeys::dev(4);
+    let fence = SessionFence::dev(4);
 
     // Full-range worker: hosts every layer, ingests tokens, produces logits.
     let cfg = WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank: 0,
         layer_first: 0,
         layer_last: -1,
@@ -159,9 +159,9 @@ async fn data_plane_apply_token_echo_over_mtls() {
     let tokens: [u32; 3] = [40, 1770, 374];
     let mut last_digest = Vec::new();
     for (pos, &tok) in tokens.iter().enumerate() {
-        conn.send(0, &wire::encode_apply_token(&keys, 0, pos as i64, tok, true)).await.unwrap();
+        conn.send(0, &wire::encode_apply_token(&fence, 0, pos as i64, tok, true)).await.unwrap();
         let reply = conn.recv().await.unwrap();
-        match wire::decode(&reply.payload, &keys).unwrap().1 {
+        match wire::decode(&reply.payload, &fence).unwrap().1 {
             Msg::AppliedAck { cumulative_input_pos, output_checksum } => {
                 assert_eq!(cumulative_input_pos, pos as i64, "position echoes back");
                 assert_eq!(output_checksum.len(), 32, "32-byte logits digest");

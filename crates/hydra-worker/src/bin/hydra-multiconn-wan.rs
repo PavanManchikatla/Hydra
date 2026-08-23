@@ -22,7 +22,7 @@ use hydra_engine_sys::Model;
 use hydra_worker::bootstrap::Bootstrap;
 use hydra_worker::pair::{run_direct_fwd_generation, Cluster, Endpoints};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::{DownTarget, WorkerConfig};
 
 // myVm-2 (B2als_v2, 4 GiB, x86-64) — Tailscale-only. Override via env for a different node.
@@ -106,7 +106,7 @@ fn start_remote_sp(local_boot: &str) -> Result<(), String> {
     Err("remote S_P did not report engine= within 60s".into())
 }
 
-fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32) -> Bootstrap {
+fn sp_bootstrap(cluster: &Cluster, fence: &SessionFence, k: i32, n_ctx: i32) -> Bootstrap {
     let id = cluster.issue("sp").unwrap();
     Bootstrap {
         listen_addr: format!("{VM_IP}:{VM_PORT}"),
@@ -115,7 +115,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32) -> Bo
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
+            fence: fence.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.to_string()),
             n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None,
         },
@@ -150,10 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   S_P serves S1's direct FWD AND the coordinator's SAMPLE_NEXT concurrently (multi-conn serve loop, P1·1a)");
     println!("   prompt {} tokens, greedy {n} steps; cross-arch → mixed-backend tier (NOT bit-exact, spec I8)", prompt.len());
 
-    let keys = SessionKeys::dev(0x11);
+    let fence = SessionFence::dev(0x11);
     let cluster = Cluster::new()?;
     let local_boot = std::env::temp_dir().join("hydra-mc-sp.boot");
-    sp_bootstrap(&cluster, &keys, k, n_ctx).write_to(local_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k, n_ctx).write_to(local_boot.to_str().unwrap())?;
     let vm_addr: SocketAddr = format!("{VM_IP}:{VM_PORT}").parse()?;
     let connector = cluster.coordinator_connector()?;
 
@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fresh_s1 = |sp: SocketAddr| -> Result<SocketAddr, Box<dyn std::error::Error>> {
         let id = cluster.issue("s1")?;
         let cfg = WorkerConfig {
-            keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
+            fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
             receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
             n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
         };
@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s1 = fresh_s1(vm_addr)?;
     let t = Instant::now();
     let ep = Endpoints::new(s1, "s1", vm_addr, "sp");
-    let got = run_direct_fwd_generation(&connector, &ep, &keys, &greedy(), &prompt, n)
+    let got = run_direct_fwd_generation(&connector, &ep, &fence, &greedy(), &prompt, n)
         .await
         .map_err(|e| format!("direct-fwd gen: {e}"))?;
     let wall = t.elapsed();
@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_remote_sp(local_boot.to_str().unwrap())?;
     let s1b = fresh_s1(vm_addr)?;
     let ep2 = Endpoints::new(s1b, "s1", vm_addr, "sp");
-    let got2 = run_direct_fwd_generation(&connector, &ep2, &keys, &greedy(), &prompt, n)
+    let got2 = run_direct_fwd_generation(&connector, &ep2, &fence, &greedy(), &prompt, n)
         .await
         .map_err(|e| format!("direct-fwd gen2: {e}"))?;
     println!("   deterministic replay (fresh workers): {}", if got2 == got { "IDENTICAL ✓" } else { "DIVERGED ✗" });

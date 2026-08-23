@@ -44,18 +44,48 @@ pub enum WireError {
 }
 
 /// The stable part of the F1 fence tuple — one session's identity. Constant in v1 (spec §1.4).
+///
+/// # ⚠️ THIS IS NOT A SECRET, AND IT WAS NAMED AS IF IT WERE
+///
+/// This type was called `SessionKeys` until 2026-08-23. **It has never held a key.** Every field
+/// travels **in cleartext inside every frame** — that is the whole point of a fence tuple — so
+/// anyone who can read one frame can reproduce all four values and forge the tuple perfectly.
+///
+/// The name mattered because of what it suppressed. "Session keys, checked on every frame" reads
+/// like an authentication mechanism, so **nobody asked where authentication actually lived** — and
+/// the answer, until audit C2, was *nowhere*: mTLS proved a peer was in the cluster and nothing
+/// bound it to a role. The old name did not merely mislead, it made the real gap uninteresting to
+/// look for. That is PROJECT_STATE §7.31 (*a name that promises more than the construction delivers
+/// terminates inquiry*) at the **design** layer rather than the test layer, and it is recorded as
+/// §7.35.
+///
+/// # What it actually does, which is worth keeping
+///
+/// **Misrouting prevention (I4/F1), an accident-class property.** It answers *"is this frame for
+/// THIS session?"* — rejecting a stale frame from a previous session, a crossed wire between two
+/// clusters, a replay from a dead epoch. Those are real failures and this really prevents them.
+///
+/// | Field | What it does now |
+/// |---|---|
+/// | `cluster_id` | Nothing security-relevant — mTLS proves cluster membership cryptographically |
+/// | `manifest_hash` | **More** than before: audit H14's model-identity binding — but as a *public* identity, not a secret |
+/// | `model_instance_id` | Nothing — `[RESERVED]`, constant in v1, validated-never-branched (§7.27) |
+/// | `session_id` | Rejects stale traffic from a previous session — the correctness job |
+///
+/// **Authentication is the peer certificate; authorisation is `hydra_transport::roles::PeerRole`.**
+/// If you are reaching for this type to answer "may this peer do that?", you want the role table.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct SessionKeys {
+pub struct SessionFence {
     pub cluster_id: [u8; CLUSTER_ID_LEN],
     pub manifest_hash: [u8; HASH_LEN],
     pub model_instance_id: [u8; MODEL_INSTANCE_ID_LEN],
     pub session_id: [u8; SESSION_ID_LEN],
 }
 
-impl SessionKeys {
+impl SessionFence {
     /// A deterministic test/dev identity derived from a single seed byte (no RNG in this crate).
     pub fn dev(seed: u8) -> Self {
-        SessionKeys {
+        SessionFence {
             cluster_id: [seed; CLUSTER_ID_LEN],
             manifest_hash: [seed ^ 0x5a; HASH_LEN],
             model_instance_id: [seed ^ 0x11; MODEL_INSTANCE_ID_LEN],
@@ -125,25 +155,25 @@ fn fixed<const N: usize>(v: flatbuffers::Vector<'_, u8>, what: &'static str) -> 
     b.try_into().map_err(|_| WireError::Malformed(format!("{what}: expected {N} bytes, got {}", b.len())))
 }
 
-/// Parse a `Frame` payload, enforce the **F1 fence** against `keys`, and return the varying fence
+/// Parse a `Frame` payload, enforce the **F1 fence** against `fence`, and return the varying fence
 /// fields + the native body. Rejects any frame whose identity tuple does not match this session —
 /// **before** any boundary allocation (the fence read is O(1) and touches no payload tensors).
-pub fn decode(payload: &[u8], keys: &SessionKeys) -> Result<(FenceView, Msg), WireError> {
+pub fn decode(payload: &[u8], fence: &SessionFence) -> Result<(FenceView, Msg), WireError> {
     let frame = flatbuffers::root::<proto::Frame>(payload)
         .map_err(|e| WireError::Malformed(format!("not a Frame flatbuffer: {e}")))?;
-    let fence = frame.fence();
+    let wire_fence = frame.fence();
 
     // F1: identity match. A stale/foreign frame is dropped here, never acted on.
-    if fixed::<CLUSTER_ID_LEN>(fence.cluster_id(), "cluster_id")? != keys.cluster_id {
+    if fixed::<CLUSTER_ID_LEN>(wire_fence.cluster_id(), "cluster_id")? != fence.cluster_id {
         return Err(WireError::FenceMismatch("cluster_id"));
     }
-    if fixed::<HASH_LEN>(fence.manifest_hash(), "manifest_hash")? != keys.manifest_hash {
+    if fixed::<HASH_LEN>(wire_fence.manifest_hash(), "manifest_hash")? != fence.manifest_hash {
         return Err(WireError::FenceMismatch("manifest_hash"));
     }
-    if fixed::<MODEL_INSTANCE_ID_LEN>(fence.model_instance_id(), "model_instance_id")? != keys.model_instance_id {
+    if fixed::<MODEL_INSTANCE_ID_LEN>(wire_fence.model_instance_id(), "model_instance_id")? != fence.model_instance_id {
         return Err(WireError::FenceMismatch("model_instance_id"));
     }
-    if fixed::<SESSION_ID_LEN>(fence.session_id(), "session_id")? != keys.session_id {
+    if fixed::<SESSION_ID_LEN>(wire_fence.session_id(), "session_id")? != fence.session_id {
         return Err(WireError::FenceMismatch("session_id"));
     }
 
@@ -151,15 +181,15 @@ pub fn decode(payload: &[u8], keys: &SessionKeys) -> Result<(FenceView, Msg), Wi
     // check above and is **never branched on** — note it is deliberately absent from [`FenceView`],
     // so no downstream code *can* branch on it. `branch_id` has no identity to check against: the
     // schema says "must be 0 in v1", and this is where that becomes true rather than aspirational.
-    if fence.branch_id() != 0 {
+    if wire_fence.branch_id() != 0 {
         return Err(WireError::ReservedInUse("branch_id"));
     }
 
     let view = FenceView {
-        epoch: fence.session_epoch(),
-        recovery_id: fence.recovery_id(),
-        activation_attempt_id: fence.activation_attempt_id(),
-        stage_generation: fence.stage_generation(),
+        epoch: wire_fence.session_epoch(),
+        recovery_id: wire_fence.recovery_id(),
+        activation_attempt_id: wire_fence.activation_attempt_id(),
+        stage_generation: wire_fence.stage_generation(),
     };
 
     let msg = decode_body(&frame, view)?;
@@ -390,13 +420,13 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
 
 fn build_fence<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     view: FenceView,
 ) -> flatbuffers::WIPOffset<proto::Fence<'a>> {
-    let cluster_id = Some(fbb.create_vector(&keys.cluster_id));
-    let manifest_hash = Some(fbb.create_vector(&keys.manifest_hash));
-    let model_instance_id = Some(fbb.create_vector(&keys.model_instance_id));
-    let session_id = Some(fbb.create_vector(&keys.session_id));
+    let cluster_id = Some(fbb.create_vector(&fence.cluster_id));
+    let manifest_hash = Some(fbb.create_vector(&fence.manifest_hash));
+    let model_instance_id = Some(fbb.create_vector(&fence.model_instance_id));
+    let session_id = Some(fbb.create_vector(&fence.session_id));
     proto::Fence::create(
         fbb,
         &proto::FenceArgs {
@@ -460,9 +490,9 @@ fn build_tuple<'a>(
     )
 }
 
-pub fn encode_apply_token(keys: &SessionKeys, epoch: Epoch, input_pos: i64, token_id: u32, no_sample: bool) -> Vec<u8> {
+pub fn encode_apply_token(fence: &SessionFence, epoch: Epoch, input_pos: i64, token_id: u32, no_sample: bool) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::ApplyToken::create(
         &mut fbb,
         &proto::ApplyTokenArgs {
@@ -475,9 +505,9 @@ pub fn encode_apply_token(keys: &SessionKeys, epoch: Epoch, input_pos: i64, toke
     finish_frame(&mut fbb, fence, proto::Body::ApplyToken, body.as_union_value())
 }
 
-pub fn encode_fwd(keys: &SessionKeys, epoch: Epoch, first_input_pos: i64, no_sample: bool, activations: &[f32]) -> Vec<u8> {
+pub fn encode_fwd(fence: &SessionFence, epoch: Epoch, first_input_pos: i64, no_sample: bool, activations: &[f32]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let data = fbb.create_vector(&f32_to_bytes_le(activations));
     let dims = fbb.create_vector(&[activations.len() as u32]);
     let tensor = proto::Tensor::create(
@@ -504,9 +534,9 @@ pub fn encode_fwd(keys: &SessionKeys, epoch: Epoch, first_input_pos: i64, no_sam
     finish_frame(&mut fbb, fence, proto::Body::Fwd, body.as_union_value())
 }
 
-pub fn encode_applied_ack(keys: &SessionKeys, epoch: Epoch, cumulative_input_pos: i64, checksum: &[u8]) -> Vec<u8> {
+pub fn encode_applied_ack(fence: &SessionFence, epoch: Epoch, cumulative_input_pos: i64, checksum: &[u8]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let output_checksum = fbb.create_vector(checksum);
     let body = proto::AppliedAck::create(
         &mut fbb,
@@ -515,9 +545,9 @@ pub fn encode_applied_ack(keys: &SessionKeys, epoch: Epoch, cumulative_input_pos
     finish_frame(&mut fbb, fence, proto::Body::AppliedAck, body.as_union_value())
 }
 
-pub fn encode_boundary_copy(keys: &SessionKeys, epoch: Epoch, boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Vec<u8> {
+pub fn encode_boundary_copy(fence: &SessionFence, epoch: Epoch, boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let data = fbb.create_vector(&f32_to_bytes_le(activations));
     let dims = fbb.create_vector(&[activations.len() as u32]);
     let tensor = proto::Tensor::create(
@@ -531,9 +561,9 @@ pub fn encode_boundary_copy(keys: &SessionKeys, epoch: Epoch, boundary_id: u32, 
     finish_frame(&mut fbb, fence, proto::Body::BoundaryCopy, body.as_union_value())
 }
 
-pub fn encode_durability_ack(keys: &SessionKeys, epoch: Epoch, boundary_id: u32, durable_through_input_pos: i64, storage_generation: u64) -> Vec<u8> {
+pub fn encode_durability_ack(fence: &SessionFence, epoch: Epoch, boundary_id: u32, durable_through_input_pos: i64, storage_generation: u64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::DurabilityAck::create(
         &mut fbb,
         &proto::DurabilityAckArgs { boundary_id, durable_through_input_pos, storage_generation },
@@ -541,25 +571,25 @@ pub fn encode_durability_ack(keys: &SessionKeys, epoch: Epoch, boundary_id: u32,
     finish_frame(&mut fbb, fence, proto::Body::DurabilityAck, body.as_union_value())
 }
 
-pub fn encode_commit_ack(keys: &SessionKeys, epoch: Epoch, committed_through_output_pos: i64) -> Vec<u8> {
+pub fn encode_commit_ack(fence: &SessionFence, epoch: Epoch, committed_through_output_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::CommitAck::create(&mut fbb, &proto::CommitAckArgs { committed_through_output_pos });
     finish_frame(&mut fbb, fence, proto::Body::CommitAck, body.as_union_value())
 }
 
-pub fn encode_commit_sync(keys: &SessionKeys, epoch: Epoch, commit_up_to_output_pos: i64) -> Vec<u8> {
+pub fn encode_commit_sync(fence: &SessionFence, epoch: Epoch, commit_up_to_output_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::CommitSync::create(&mut fbb, &proto::CommitSyncArgs { commit_up_to_output_pos });
     finish_frame(&mut fbb, fence, proto::Body::CommitSync, body.as_union_value())
 }
 
-pub fn encode_commit_activation(keys: &SessionKeys, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
+pub fn encode_commit_activation(fence: &SessionFence, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(
         &mut fbb,
-        keys,
+        fence,
         FenceView { epoch: t.epoch, recovery_id: t.recovery_id, activation_attempt_id: t.attempt, stage_generation },
     );
     let tuple = build_tuple(&mut fbb, t, stage_generation);
@@ -567,11 +597,11 @@ pub fn encode_commit_activation(keys: &SessionKeys, t: &ActivationTuple, stage_g
     finish_frame(&mut fbb, fence, proto::Body::CommitActivation, body.as_union_value())
 }
 
-pub fn encode_activation_committed(keys: &SessionKeys, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
+pub fn encode_activation_committed(fence: &SessionFence, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(
         &mut fbb,
-        keys,
+        fence,
         FenceView { epoch: t.epoch, recovery_id: t.recovery_id, activation_attempt_id: t.attempt, stage_generation },
     );
     let tuple = build_tuple(&mut fbb, t, stage_generation);
@@ -579,11 +609,11 @@ pub fn encode_activation_committed(keys: &SessionKeys, t: &ActivationTuple, stag
     finish_frame(&mut fbb, fence, proto::Body::ActivationCommitted, body.as_union_value())
 }
 
-pub fn encode_finalize_activation(keys: &SessionKeys, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
+pub fn encode_finalize_activation(fence: &SessionFence, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(
         &mut fbb,
-        keys,
+        fence,
         FenceView { epoch: t.epoch, recovery_id: t.recovery_id, activation_attempt_id: t.attempt, stage_generation },
     );
     let tuple = build_tuple(&mut fbb, t, stage_generation);
@@ -595,16 +625,16 @@ pub fn encode_finalize_activation(keys: &SessionKeys, t: &ActivationTuple, stage
     finish_frame(&mut fbb, fence, proto::Body::FinalizeActivation, body.as_union_value())
 }
 
-pub fn encode_activation_finalized(keys: &SessionKeys, epoch: Epoch, attempt: AttemptId) -> Vec<u8> {
+pub fn encode_activation_finalized(fence: &SessionFence, epoch: Epoch, attempt: AttemptId) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: attempt, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: attempt, stage_generation: 0 });
     let body = proto::ActivationFinalized::create(&mut fbb, &proto::ActivationFinalizedArgs { completion_id: 0 });
     finish_frame(&mut fbb, fence, proto::Body::ActivationFinalized, body.as_union_value())
 }
 
-pub fn encode_begin_recovery(keys: &SessionKeys, base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64) -> Vec<u8> {
+pub fn encode_begin_recovery(fence: &SessionFence, base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch: target, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch: target, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::BeginRecovery::create(
         &mut fbb,
         &proto::BeginRecoveryArgs { base_epoch: base, target_epoch: target, truncate_to_input_pos: truncate_to },
@@ -612,16 +642,16 @@ pub fn encode_begin_recovery(keys: &SessionKeys, base: Epoch, target: Epoch, rec
     finish_frame(&mut fbb, fence, proto::Body::BeginRecovery, body.as_union_value())
 }
 
-pub fn encode_recovery_ack(keys: &SessionKeys, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
+pub fn encode_recovery_ack(fence: &SessionFence, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::RecoveryAck::create(&mut fbb, &proto::RecoveryAckArgs { applied_input_pos });
     finish_frame(&mut fbb, fence, proto::Body::RecoveryAck, body.as_union_value())
 }
 
-pub fn encode_sample_next(keys: &SessionKeys, epoch: Epoch, output_pos: i64, sampling_config_hash: &[u8], expected_sampler_checkpoint_id: u64) -> Vec<u8> {
+pub fn encode_sample_next(fence: &SessionFence, epoch: Epoch, output_pos: i64, sampling_config_hash: &[u8], expected_sampler_checkpoint_id: u64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let cfg = fbb.create_vector(sampling_config_hash);
     let body = proto::SampleNext::create(
         &mut fbb,
@@ -630,9 +660,9 @@ pub fn encode_sample_next(keys: &SessionKeys, epoch: Epoch, output_pos: i64, sam
     finish_frame(&mut fbb, fence, proto::Body::SampleNext, body.as_union_value())
 }
 
-pub fn encode_sampled(keys: &SessionKeys, epoch: Epoch, output_pos: i64, token_id: u32, snapshot: &[u8], state_digest: &[u8]) -> Vec<u8> {
+pub fn encode_sampled(fence: &SessionFence, epoch: Epoch, output_pos: i64, token_id: u32, snapshot: &[u8], state_digest: &[u8]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let snap = fbb.create_vector(snapshot);
     let dig = fbb.create_vector(state_digest);
     let body = proto::Sampled::create(
@@ -649,17 +679,17 @@ pub fn encode_sampled(keys: &SessionKeys, epoch: Epoch, output_pos: i64, token_i
     finish_frame(&mut fbb, fence, proto::Body::Sampled, body.as_union_value())
 }
 
-pub fn encode_install_sampler_checkpoint(keys: &SessionKeys, epoch: Epoch, checkpoint_id: u64, snapshot: &[u8]) -> Vec<u8> {
+pub fn encode_install_sampler_checkpoint(fence: &SessionFence, epoch: Epoch, checkpoint_id: u64, snapshot: &[u8]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let snap = fbb.create_vector(snapshot);
     let body = proto::InstallSamplerCheckpoint::create(&mut fbb, &proto::InstallSamplerCheckpointArgs { checkpoint_id, snapshot: Some(snap) });
     finish_frame(&mut fbb, fence, proto::Body::InstallSamplerCheckpoint, body.as_union_value())
 }
 
-pub fn encode_sampler_checkpoint_installed(keys: &SessionKeys, epoch: Epoch, checkpoint_id: u64, sampled_output_pos: i64, state_digest: &[u8]) -> Vec<u8> {
+pub fn encode_sampler_checkpoint_installed(fence: &SessionFence, epoch: Epoch, checkpoint_id: u64, sampled_output_pos: i64, state_digest: &[u8]) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let dig = fbb.create_vector(state_digest);
     let body = proto::SamplerCheckpointInstalled::create(
         &mut fbb,
@@ -668,23 +698,23 @@ pub fn encode_sampler_checkpoint_installed(keys: &SessionKeys, epoch: Epoch, che
     finish_frame(&mut fbb, fence, proto::Body::SamplerCheckpointInstalled, body.as_union_value())
 }
 
-pub fn encode_catch_up_context(keys: &SessionKeys, epoch: Epoch, recovery_id: RecoveryId, goal_input_pos: i64) -> Vec<u8> {
+pub fn encode_catch_up_context(fence: &SessionFence, epoch: Epoch, recovery_id: RecoveryId, goal_input_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::CatchUpContext::create(&mut fbb, &proto::CatchUpContextArgs { goal_input_pos });
     finish_frame(&mut fbb, fence, proto::Body::CatchUpContext, body.as_union_value())
 }
 
-pub fn encode_catch_up_ready(keys: &SessionKeys, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
+pub fn encode_catch_up_ready(fence: &SessionFence, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
     let body = proto::CatchUpReady::create(&mut fbb, &proto::CatchUpReadyArgs { applied_input_pos });
     finish_frame(&mut fbb, fence, proto::Body::CatchUpReady, body.as_union_value())
 }
 
-pub fn encode_error(keys: &SessionKeys, epoch: Epoch, attempt: AttemptId, code: u16) -> Vec<u8> {
+pub fn encode_error(fence: &SessionFence, epoch: Epoch, attempt: AttemptId, code: u16) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, keys, FenceView { epoch, recovery_id: 0, activation_attempt_id: attempt, stage_generation: 0 });
+    let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: attempt, stage_generation: 0 });
     let body = proto::Error::create(&mut fbb, &proto::ErrorArgs { code: proto::ErrCode(code), state: None, detail: None });
     finish_frame(&mut fbb, fence, proto::Body::Error, body.as_union_value())
 }

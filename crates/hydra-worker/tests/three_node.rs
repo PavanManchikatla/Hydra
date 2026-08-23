@@ -22,7 +22,7 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::ClusterCa;
 use hydra_worker::pair::{dev_model_path, run_direct_fwd_generation, spawn_multiconn_endpoint, spawn_multiconn_forwarding_durable_endpoint, Endpoints};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::WorkerConfig;
 
 const CLUSTER_ID: [u8; 16] = [0x3D; 16];
@@ -47,14 +47,14 @@ fn split3(n_layer: i32) -> (i32, i32) {
     (k1, k2)
 }
 
-fn s1_cfg(model: &str, keys: &SessionKeys, k1: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
+fn s1_cfg(model: &str, fence: &SessionFence, k1: i32, n_ctx: i32) -> WorkerConfig {
+    WorkerConfig { fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false, receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
 }
-fn s2_cfg(model: &str, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
+fn s2_cfg(model: &str, fence: &SessionFence, k1: i32, k2: i32, n_ctx: i32) -> WorkerConfig {
+    WorkerConfig { fence: fence.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None }
 }
-fn sp_cfg(model: &str, keys: &SessionKeys, k2: i32, n_ctx: i32) -> WorkerConfig {
-    WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None }
+fn sp_cfg(model: &str, fence: &SessionFence, k2: i32, n_ctx: i32) -> WorkerConfig {
+    WorkerConfig { fence: fence.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(model.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None }
 }
 
 /// The unsplit greedy reference: prefill the prompt, then argmax-decode `n` tokens feeding each back
@@ -103,7 +103,7 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
     assert!(0 < k1 && k1 < k2 && k2 < n_layer, "valid 3-way split [0,{k1}) [{k1},{k2}) [{k2},{n_layer})");
     let n = 8usize;
     let n_ctx = prompt.len() as i32 + n as i32 + 8;
-    let keys = SessionKeys::dev(0x3D);
+    let fence = SessionFence::dev(0x3D);
     let cfg = greedy();
 
     // ---- reference: unsplit greedy ----
@@ -118,18 +118,18 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
 
     // Durability targets (one per forwarding edge): a mid-stage's copies rebuild the DOWNSTREAM stage
     // on recovery (seam C). Each persists BOUNDARY_COPY → BoundaryStore and acks DURABILITY_ACK.
-    let dur1 = spawn_durability_endpoint(&ca, "dur1", store1.clone(), keys.clone());
-    let dur2 = spawn_durability_endpoint(&ca, "dur2", store2.clone(), keys.clone());
+    let dur1 = spawn_durability_endpoint(&ca, "dur1", store1.clone(), fence.clone());
+    let dur2 = spawn_durability_endpoint(&ca, "dur2", store2.clone(), fence.clone());
 
     // S_P: final sampler stage, multi-conn (serves S2's FWD + the coordinator's SAMPLE_NEXT).
     let sp_id = ca.issue("sp").unwrap();
-    let sp_addr = spawn_multiconn_endpoint(sp_cfg(&model, &keys, k2, n_ctx), ca.server_config(&sp_id).unwrap());
+    let sp_addr = spawn_multiconn_endpoint(sp_cfg(&model, &fence, k2, n_ctx), ca.server_config(&sp_id).unwrap());
 
     // S2: middle forwarding+durable stage, down = S_P, dur = dur2.
     let s2_id = ca.issue("s2").unwrap();
     let s2_down = std::sync::Arc::new(std::sync::Mutex::new((sp_addr, "sp".to_string())));
     let s2_addr = spawn_multiconn_forwarding_durable_endpoint(
-        s2_cfg(&model, &keys, k1, k2, n_ctx), ca.server_config(&s2_id).unwrap(),
+        s2_cfg(&model, &fence, k1, k2, n_ctx), ca.server_config(&s2_id).unwrap(),
         TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap(), s2_down, 8,
         TcpMtls::from_config(ca.client_config(&s2_id).unwrap()).unwrap(), dur2, "dur2",
         true, 64,
@@ -139,7 +139,7 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
     let s1_id = ca.issue("s1").unwrap();
     let s1_down = std::sync::Arc::new(std::sync::Mutex::new((s2_addr, "s2".to_string())));
     let s1_addr = spawn_multiconn_forwarding_durable_endpoint(
-        s1_cfg(&model, &keys, k1, n_ctx), ca.server_config(&s1_id).unwrap(),
+        s1_cfg(&model, &fence, k1, n_ctx), ca.server_config(&s1_id).unwrap(),
         TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap(), s1_down, 8,
         TcpMtls::from_config(ca.client_config(&s1_id).unwrap()).unwrap(), dur1, "dur1",
         true, 64,
@@ -149,7 +149,7 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
     // S1→S2→S_P chaining is transparent to it. `Endpoints{s1, s2=S_P}` reuses the direct-FWD driver.
     let connector = TcpMtls::from_config(ca.client_config(&ca.issue("coordinator").unwrap()).unwrap()).unwrap();
     let ep = Endpoints::new(s1_addr, "s1", sp_addr, "sp");
-    let tokens = run_direct_fwd_generation(&connector, &ep, &keys, &cfg, &prompt, n).await.expect("3-node generation");
+    let tokens = run_direct_fwd_generation(&connector, &ep, &fence, &cfg, &prompt, n).await.expect("3-node generation");
 
     // (1) BYTE-IDENTICAL: the chained 3-node stream == the unsplit greedy run.
     assert_eq!(tokens, reference, "3-node chained direct FWD reproduces unsplit greedy byte-for-byte");
@@ -171,7 +171,7 @@ async fn three_node_chained_direct_fwd_is_byte_identical_to_unsplit_greedy() {
 
 /// A durability target: persist each `BOUNDARY_COPY` to a real `BoundaryStore`, ack the fdatasync'd
 /// frontier. (Same shape as `durable_live`/`forwarding_durable`; inlined so this test is standalone.)
-fn spawn_durability_endpoint(ca: &ClusterCa, name: &str, path: std::path::PathBuf, keys: SessionKeys) -> std::net::SocketAddr {
+fn spawn_durability_endpoint(ca: &ClusterCa, name: &str, path: std::path::PathBuf, fence: SessionFence) -> std::net::SocketAddr {
     use hydra_worker::wire::{self, Msg};
     use std::sync::mpsc;
     let id = ca.issue(name).unwrap();
@@ -185,9 +185,9 @@ fn spawn_durability_endpoint(ca: &ClusterCa, name: &str, path: std::path::PathBu
             let mut store = BoundaryStore::create(&path, CLUSTER_ID, SESSION_ID).expect("store");
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
                     let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).expect("persist");
-                    let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, durable_through, 0);
+                    let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                     if conn.send(0, &ack).await.is_err() {
                         break;
                     }

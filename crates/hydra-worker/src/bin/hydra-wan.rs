@@ -22,7 +22,7 @@ use hydra_transport::framed::Conn;
 use hydra_worker::bootstrap::Bootstrap;
 use hydra_worker::pair::{run_generation, Cluster, Endpoints};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::{WorkerConfig, INITIAL_CHECKPOINT_ID};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -114,7 +114,7 @@ fn kill_remote_sp() {
     let _ = sh(&["ssh", VM_SSH, "pkill -9 -f hydra-worker; exit 0"]);
 }
 
-fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32, recovery_start: bool) -> Bootstrap {
+fn sp_bootstrap(cluster: &Cluster, fence: &SessionFence, k: i32, n_ctx: i32, recovery_start: bool) -> Bootstrap {
     let id = cluster.issue("sp").unwrap();
     Bootstrap {
         listen_addr: format!("{VM_IP}:{VM_PORT}"),
@@ -123,7 +123,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32, recov
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: keys.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
+            fence: fence.clone(), rank: 1, layer_first: k, layer_last: -1, is_final: true,
             receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: Some(VM_MODEL.to_string()), n_gpu_layers: 0, n_ctx,
             sampler_config: Some(greedy()), recovery_start, shard_manifest: None,
@@ -159,10 +159,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== hydra-wan: WAN run (Mac arm64 S1 [0,{k}) ↔ VM x86-64 S_P [{k},{n_layer})) over Tailscale ==");
     println!("   prompt {} tokens, greedy {n} steps; cross-arch → mixed-backend tier (NOT bit-exact, spec I8)", prompt.len());
 
-    let keys = SessionKeys::dev(0x7A);
+    let fence = SessionFence::dev(0x7A);
     let cluster = Cluster::new()?;
     let local_boot = std::env::temp_dir().join("hydra-wan-sp.boot");
-    sp_bootstrap(&cluster, &keys, k, n_ctx, false).write_to(local_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k, n_ctx, false).write_to(local_boot.to_str().unwrap())?;
     let vm_addr: std::net::SocketAddr = format!("{VM_IP}:{VM_PORT}").parse()?;
     let connector = cluster.coordinator_connector()?;
 
@@ -171,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fresh_s1 = || -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
         let id = cluster.issue("s1")?;
         let cfg = WorkerConfig {
-            keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
+            fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k, is_final: false,
             receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
             n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
         };
@@ -183,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_remote_sp(local_boot.to_str().unwrap())?;
     let ep = Endpoints::new(fresh_s1()?, "s1", vm_addr, "sp");
     let t = Instant::now();
-    let got = run_generation(&connector, &ep, &keys, &greedy(), &prompt, n).await.map_err(|e| format!("gen: {e}"))?;
+    let got = run_generation(&connector, &ep, &fence, &greedy(), &prompt, n).await.map_err(|e| format!("gen: {e}"))?;
     let wall = t.elapsed();
     let agree = got.iter().zip(&reference).filter(|(a, b)| a == b).count();
     println!("   tokens (cross-machine): {got:?}");
@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Determinism: fresh workers, same placement → same tokens.
     start_remote_sp(local_boot.to_str().unwrap())?;
     let ep2 = Endpoints::new(fresh_s1()?, "s1", vm_addr, "sp");
-    let got2 = run_generation(&connector, &ep2, &keys, &greedy(), &prompt, n).await.map_err(|e| format!("gen2: {e}"))?;
+    let got2 = run_generation(&connector, &ep2, &fence, &greedy(), &prompt, n).await.map_err(|e| format!("gen2: {e}"))?;
     println!("   deterministic replay (fresh workers): {}", if got2 == got { "IDENTICAL ✓" } else { "DIVERGED ✗" });
 
     // ---- Phase 2: real machine death over the WAN — kill a full-range S_P mid-generation, recover ----
@@ -203,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to the FWD slice, out of C-part-2 scope. Both S_P generations here are on the VM (x86-64), so
     // the recovered stream is byte-identical to the uninterrupted VM run (same-arch).
     println!("\n[phase 2] WAN kill-window: SIGKILL a full-range S_P mid-generation, recover through the real machinery");
-    let timing = wan_kill_window(&cluster, &keys, n_ctx, &prompt, n).await?;
+    let timing = wan_kill_window(&cluster, &fence, n_ctx, &prompt, n).await?;
     println!("   detection→resumed (over WAN): {:.2?}  [WAN/Tailscale — NOT the <15s LAN/M3 D1 target]", timing);
 
     kill_remote_sp();
@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ------------------------- phase 2: WAN kill-window (full-range S_P) -------------------------
 
-fn full_sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, recovery_start: bool) -> Bootstrap {
+fn full_sp_bootstrap(cluster: &Cluster, fence: &SessionFence, n_ctx: i32, recovery_start: bool) -> Bootstrap {
     let id = cluster.issue("sp").unwrap();
     Bootstrap {
         listen_addr: format!("{VM_IP}:{VM_PORT}"),
@@ -223,7 +223,7 @@ fn full_sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, recovery
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: keys.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
+            fence: fence.clone(), rank: 0, layer_first: 0, layer_last: -1, is_final: true,
             receives_tokens: true, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 },
             model_path: Some(VM_MODEL.to_string()), n_gpu_layers: 0, n_ctx,
             sampler_config: Some(greedy()), recovery_start, shard_manifest: None,
@@ -237,17 +237,17 @@ fn full_sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, recovery
     }
 }
 
-async fn apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, pos: i64, tok: u32, no_sample: bool) -> Result<(), String> {
-    c.send(0, &wire::encode_apply_token(keys, 0, pos, tok, no_sample)).await.map_err(|e| format!("apply send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("apply recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+async fn apply<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, pos: i64, tok: u32, no_sample: bool) -> Result<(), String> {
+    c.send(0, &wire::encode_apply_token(fence, 0, pos, tok, no_sample)).await.map_err(|e| format!("apply send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("apply recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::AppliedAck { cumulative_input_pos, .. } if cumulative_input_pos == pos => Ok(()),
         other => Err(format!("apply @ {pos}: expected APPLIED_ACK, got {other:?}")),
     }
 }
 
-async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
-    c.send(0, &wire::encode_sample_next(keys, 0, pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| format!("sample send: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| format!("sample recv: {e}"))?.payload, keys).map_err(|e| e.to_string())?.1 {
+async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, pos: i64, h: &[u8; 32]) -> Result<(u32, Vec<u8>), String> {
+    c.send(0, &wire::encode_sample_next(fence, 0, pos, h, INITIAL_CHECKPOINT_ID)).await.map_err(|e| format!("sample send: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| format!("sample recv: {e}"))?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::Sampled { token_id, post_sample_snapshot, .. } => Ok((token_id, post_sample_snapshot)),
         Msg::Err { code } => Err(format!("SAMPLE_NEXT @ {pos} errored: code {code}")),
         other => Err(format!("SAMPLE_NEXT @ {pos}: expected SAMPLED, got {other:?}")),
@@ -256,21 +256,21 @@ async fn sample<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &Sessi
 
 /// Full-range greedy generation against a connected S_P: prompt prefill + `n` sample steps. Returns
 /// `(tokens, last_snapshot, last_snapshot_pos)`.
-async fn gen_full<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, prompt: &[u32], n: usize) -> Result<(Vec<u32>, Vec<u8>, i64), String> {
+async fn gen_full<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, prompt: &[u32], n: usize) -> Result<(Vec<u32>, Vec<u8>, i64), String> {
     let h = greedy().hash();
     for (pos, &t) in prompt.iter().enumerate() {
-        apply(c, keys, pos as i64, t, true).await?;
+        apply(c, fence, pos as i64, t, true).await?;
     }
     let mut out = Vec::with_capacity(n);
     let (mut last_snap, mut last_pos) = (Vec::new(), -1i64);
     let mut input_pos = prompt.len() as i64;
     for pos in 0..n as i64 {
-        let (tok, snap) = sample(c, keys, pos, &h).await?;
+        let (tok, snap) = sample(c, fence, pos, &h).await?;
         out.push(tok);
         last_snap = snap;
         last_pos = pos;
         if (pos as usize + 1) < n {
-            apply(c, keys, input_pos, tok, false).await?;
+            apply(c, fence, input_pos, tok, false).await?;
             input_pos += 1;
         }
     }
@@ -279,33 +279,33 @@ async fn gen_full<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &Ses
 
 /// Drive the recovery flow on a connected fresh replacement S_P (through the real machinery), leaving
 /// it ready to resume `SAMPLE_NEXT` at `durable_pos + 1`. `replay` = prompt ++ committed tokens.
-async fn recover<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &SessionKeys, replay: &[u32], input_frontier: i64, snapshot: &[u8]) -> Result<(), String> {
-    c.send(0, &wire::encode_begin_recovery(keys, 0, 0, 1, 0)).await.map_err(|e| format!("begin: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 {
+async fn recover<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &SessionFence, replay: &[u32], input_frontier: i64, snapshot: &[u8]) -> Result<(), String> {
+    c.send(0, &wire::encode_begin_recovery(fence, 0, 0, 1, 0)).await.map_err(|e| format!("begin: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::RecoveryAck { .. } => {}
         o => return Err(format!("expected RECOVERY_ACK, got {o:?}")),
     }
     for (i, &tok) in replay.iter().enumerate() {
-        apply(c, keys, i as i64, tok, true).await?;
+        apply(c, fence, i as i64, tok, true).await?;
     }
-    c.send(0, &wire::encode_catch_up_context(keys, 0, 1, input_frontier)).await.map_err(|e| format!("catchup: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_catch_up_context(fence, 0, 1, input_frontier)).await.map_err(|e| format!("catchup: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::CatchUpReady { .. } => {}
         o => return Err(format!("expected CATCH_UP_READY, got {o:?}")),
     }
-    c.send(0, &wire::encode_install_sampler_checkpoint(keys, 0, INITIAL_CHECKPOINT_ID, snapshot)).await.map_err(|e| format!("install: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_install_sampler_checkpoint(fence, 0, INITIAL_CHECKPOINT_ID, snapshot)).await.map_err(|e| format!("install: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::SamplerCheckpointInstalled { .. } => {}
         o => return Err(format!("expected SAMPLER_CHECKPOINT_INSTALLED, got {o:?}")),
     }
     let tuple = ActivationTuple { kind: ActivationKind::Recovery, epoch: 0, recovery_id: 1, attempt: 0, sampler_checkpoint_id: INITIAL_CHECKPOINT_ID };
-    c.send(0, &wire::encode_commit_activation(keys, &tuple, 1)).await.map_err(|e| format!("commit: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_commit_activation(fence, &tuple, 1)).await.map_err(|e| format!("commit: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::ActivationCommitted(_) => {}
         o => return Err(format!("expected ACTIVATION_COMMITTED, got {o:?}")),
     }
-    c.send(0, &wire::encode_finalize_activation(keys, &tuple, 1)).await.map_err(|e| format!("finalize: {e}"))?;
-    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, keys).map_err(|e| e.to_string())?.1 {
+    c.send(0, &wire::encode_finalize_activation(fence, &tuple, 1)).await.map_err(|e| format!("finalize: {e}"))?;
+    match wire::decode(&c.recv().await.map_err(|e| e.to_string())?.payload, fence).map_err(|e| e.to_string())?.1 {
         Msg::ActivationFinalized => {}
         o => return Err(format!("expected ACTIVATION_FINALIZED, got {o:?}")),
     }
@@ -314,8 +314,8 @@ async fn recover<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, keys: &Sess
 
 /// Kill a full-range VM S_P mid-generation over the WAN and recover onto a replacement; assert the
 /// recovered stream is byte-identical to an uninterrupted VM run (same-arch). Returns detection→resumed.
-async fn wan_kill_window(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, prompt: &[u32], n: usize) -> Result<Duration, Box<dyn std::error::Error>> {
-    let boot = full_sp_bootstrap(cluster, keys, n_ctx, false);
+async fn wan_kill_window(cluster: &Cluster, fence: &SessionFence, n_ctx: i32, prompt: &[u32], n: usize) -> Result<Duration, Box<dyn std::error::Error>> {
+    let boot = full_sp_bootstrap(cluster, fence, n_ctx, false);
     let local = std::env::temp_dir().join("hydra-wan-full.boot");
     boot.write_to(local.to_str().unwrap())?;
     let connector = cluster.coordinator_connector()?;
@@ -325,7 +325,7 @@ async fn wan_kill_window(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, prom
     // Uninterrupted VM reference (same-arch, deterministic).
     start_remote_sp(local.to_str().unwrap())?;
     let mut c = connector.connect(vm_addr, "sp").await?;
-    let (vm_ref, _, _) = gen_full(&mut c, keys, prompt, n).await?;
+    let (vm_ref, _, _) = gen_full(&mut c, fence, prompt, n).await?;
     drop(c);
     println!("   uninterrupted VM S_P greedy (x86-64): {vm_ref:?}");
 
@@ -333,7 +333,7 @@ async fn wan_kill_window(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, prom
     let m = n / 2;
     start_remote_sp(local.to_str().unwrap())?;
     let mut c = connector.connect(vm_addr, "sp").await?;
-    let (pre, last_snap, last_pos) = gen_full(&mut c, keys, prompt, m).await?;
+    let (pre, last_snap, last_pos) = gen_full(&mut c, fence, prompt, m).await?;
     assert_eq!(last_pos, m as i64 - 1);
     drop(c);
 
@@ -343,26 +343,26 @@ async fn wan_kill_window(cluster: &Cluster, keys: &SessionKeys, n_ctx: i32, prom
     println!("   SIGKILL'd the VM S_P after {m} committed tokens; bringing up a replacement...");
 
     // Replacement full-range S_P (FROZEN) + drive recovery.
-    let rboot = full_sp_bootstrap(cluster, keys, n_ctx, true);
+    let rboot = full_sp_bootstrap(cluster, fence, n_ctx, true);
     rboot.write_to(local.to_str().unwrap())?;
     start_remote_sp(local.to_str().unwrap())?;
     let mut rc = connector.connect(vm_addr, "sp").await?;
     let replay: Vec<u32> = prompt.iter().copied().chain(pre.iter().copied()).collect();
     let input_frontier = replay.len() as i64;
-    recover(&mut rc, keys, &replay, input_frontier, &last_snap).await?;
+    recover(&mut rc, fence, &replay, input_frontier, &last_snap).await?;
 
     // Resume: SAMPLE_NEXT at m, feed back, to n.
     let mut resumed = Vec::new();
     let mut first_resumed = None;
     let mut input_pos = input_frontier;
     for pos in (m as i64)..n as i64 {
-        let (tok, _snap) = sample(&mut rc, keys, pos, &h).await?;
+        let (tok, _snap) = sample(&mut rc, fence, pos, &h).await?;
         if first_resumed.is_none() {
             first_resumed = Some(t_detect.elapsed());
         }
         resumed.push(tok);
         if (pos as usize + 1) < n {
-            apply(&mut rc, keys, input_pos, tok, false).await?;
+            apply(&mut rc, fence, input_pos, tok, false).await?;
             input_pos += 1;
         }
     }

@@ -28,7 +28,7 @@ use hydra_transport::{ClusterCa, DeviceIdentity};
 
 use crate::bootstrap::Bootstrap;
 use crate::sampler::SamplingConfig;
-use crate::wire::{self, Msg, SessionKeys};
+use crate::wire::{self, Msg, SessionFence};
 use crate::durable::DurableForwarder;
 use crate::worker::{
     serve_conn, serve_conn_forwarding, serve_conn_forwarding_relink, serve_multi_conn,
@@ -245,7 +245,7 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
     require_durable: bool,
     capacity: usize,
 ) -> SocketAddr {
-    let keys = cfg.keys.clone();
+    let fence = cfg.fence.clone();
     let epoch = cfg.epoch;
     let dur_name = dur_name.to_string();
     let (tx, rx) = mpsc::channel();
@@ -257,7 +257,7 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
             tx.send(listener.local_addr().unwrap()).unwrap();
             // Dial the durability target once; the down-link connects lazily (and re-links) per forward.
             let dur = dur_connector.connect(dur_addr, &dur_name).await.expect("connect durability");
-            let forwarder = DurableForwarder::new(keys.clone(), epoch, require_durable, capacity);
+            let forwarder = DurableForwarder::new(fence.clone(), epoch, require_durable, capacity);
             let down_state = shared_down(DownstreamState {
                 down: None,
                 down_connected_to: None,
@@ -268,7 +268,7 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
                 forwarder,
             });
             let worker = shared(Worker::new(cfg).expect("worker"));
-            let _ = serve_multi_conn_forwarding_durable(worker, down_state, keys, listener).await;
+            let _ = serve_multi_conn_forwarding_durable(worker, down_state, fence, listener).await;
         });
     });
     rx.recv().expect("stage addr")
@@ -277,13 +277,13 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
 /// Drive the teacher-forced NO_SAMPLE prefill with **worker→worker direct FWD**: the coordinator
 /// talks **only to S1**; S1 forwards each boundary straight to S2 and relays S2's `APPLIED_ACK` back.
 /// Returns the final position's logits digest (bit-exact anchor, now without the coordinator relay).
-pub async fn run_direct_fwd_pipeline(connector: &TcpMtls, s1_addr: SocketAddr, s1_name: &str, keys: &SessionKeys, tokens: &[u32]) -> Result<[u8; 32], String> {
+pub async fn run_direct_fwd_pipeline(connector: &TcpMtls, s1_addr: SocketAddr, s1_name: &str, fence: &SessionFence, tokens: &[u32]) -> Result<[u8; 32], String> {
     let mut c = connector.connect(s1_addr, s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
     let mut last_digest = [0u8; 32];
     for (pos, &tok) in tokens.iter().enumerate() {
-        c.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("send s1: {e}"))?;
+        c.send(0, &wire::encode_apply_token(fence, 0, pos as i64, tok, true)).await.map_err(|e| format!("send s1: {e}"))?;
         let r = c.recv().await.map_err(|e| format!("recv s1: {e}"))?;
-        match wire::decode(&r.payload, keys).map_err(|e| format!("decode: {e}"))?.1 {
+        match wire::decode(&r.payload, fence).map_err(|e| format!("decode: {e}"))?.1 {
             Msg::AppliedAck { cumulative_input_pos, output_checksum } => {
                 if cumulative_input_pos != pos as i64 {
                     return Err(format!("pos mismatch: {cumulative_input_pos} != {pos}"));
@@ -327,12 +327,12 @@ impl Endpoints {
 }
 
 /// Drive the teacher-forced NO_SAMPLE prefill through two connected workers and return the digest
-/// of the final position's logits (as reported by S2's `APPLIED_ACK`). `keys` must match the
+/// of the final position's logits (as reported by S2's `APPLIED_ACK`). `fence` must match the
 /// workers' session identity (F1).
 pub async fn run_teacher_forced_pipeline(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     tokens: &[u32],
 ) -> Result<[u8; 32], String> {
     let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
@@ -341,21 +341,21 @@ pub async fn run_teacher_forced_pipeline(
     let mut last_digest = [0u8; 32];
     for (pos, &tok) in tokens.iter().enumerate() {
         // C -> S1: APPLY_TOKEN (NO_SAMPLE, teacher-forced).
-        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true))
+        c1.send(0, &wire::encode_apply_token(fence, 0, pos as i64, tok, true))
             .await
             .map_err(|e| format!("send s1: {e}"))?;
         let f1 = c1.recv().await.map_err(|e| format!("recv s1: {e}"))?;
-        let boundary = match wire::decode(&f1.payload, keys).map_err(|e| format!("decode s1: {e}"))?.1 {
+        let boundary = match wire::decode(&f1.payload, fence).map_err(|e| format!("decode s1: {e}"))?.1 {
             Msg::Fwd { activations, .. } => activations,
             other => return Err(format!("s1 pos {pos}: expected FWD, got {other:?}")),
         };
 
         // C relays S1's boundary to S2 as FWD; S2 injects it and produces logits.
-        c2.send(0, &wire::encode_fwd(keys, 0, pos as i64, true, &boundary))
+        c2.send(0, &wire::encode_fwd(fence, 0, pos as i64, true, &boundary))
             .await
             .map_err(|e| format!("send s2: {e}"))?;
         let f2 = c2.recv().await.map_err(|e| format!("recv s2: {e}"))?;
-        match wire::decode(&f2.payload, keys).map_err(|e| format!("decode s2: {e}"))?.1 {
+        match wire::decode(&f2.payload, fence).map_err(|e| format!("decode s2: {e}"))?.1 {
             Msg::AppliedAck { cumulative_input_pos, output_checksum } => {
                 if cumulative_input_pos != pos as i64 {
                     return Err(format!("s2 pos mismatch: {cumulative_input_pos} != {pos}"));
@@ -382,7 +382,7 @@ pub async fn run_teacher_forced_pipeline(
 pub async fn time_teacher_forced_pipeline(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     tokens: &[u32],
 ) -> Result<Vec<std::time::Duration>, String> {
     let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
@@ -392,19 +392,19 @@ pub async fn time_teacher_forced_pipeline(
 
     for (pos, &tok) in tokens.iter().enumerate() {
         let t0 = std::time::Instant::now();
-        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true))
+        c1.send(0, &wire::encode_apply_token(fence, 0, pos as i64, tok, true))
             .await
             .map_err(|e| format!("send s1: {e}"))?;
         let f1 = c1.recv().await.map_err(|e| format!("recv s1: {e}"))?;
-        let boundary = match wire::decode(&f1.payload, keys).map_err(|e| format!("decode s1: {e}"))?.1 {
+        let boundary = match wire::decode(&f1.payload, fence).map_err(|e| format!("decode s1: {e}"))?.1 {
             Msg::Fwd { activations, .. } => activations,
             other => return Err(format!("s1 pos {pos}: expected FWD, got {other:?}")),
         };
-        c2.send(0, &wire::encode_fwd(keys, 0, pos as i64, true, &boundary))
+        c2.send(0, &wire::encode_fwd(fence, 0, pos as i64, true, &boundary))
             .await
             .map_err(|e| format!("send s2: {e}"))?;
         let f2 = c2.recv().await.map_err(|e| format!("recv s2: {e}"))?;
-        match wire::decode(&f2.payload, keys).map_err(|e| format!("decode s2: {e}"))?.1 {
+        match wire::decode(&f2.payload, fence).map_err(|e| format!("decode s2: {e}"))?.1 {
             Msg::AppliedAck { cumulative_input_pos, .. } => {
                 if cumulative_input_pos != pos as i64 {
                     return Err(format!("s2 pos mismatch: {cumulative_input_pos} != {pos}"));
@@ -439,7 +439,7 @@ pub async fn time_teacher_forced_pipeline(
 pub async fn time_generation_pipeline(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     config: &SamplingConfig,
     prompt_tokens: &[u32],
     n_steps: usize,
@@ -449,18 +449,18 @@ pub async fn time_generation_pipeline(
     let cfg_hash = config.hash();
 
     // Setup and prefill are excluded by construction — the timer below starts after both.
-    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+    prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
     let mut per_token = Vec::with_capacity(n_steps);
     let mut input_pos = prompt_tokens.len() as i64;
     for step in 0..n_steps {
         let t0 = std::time::Instant::now();
 
-        c2.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+        c2.send(0, &wire::encode_sample_next(fence, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
             .await
             .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
         let s = c2.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?;
-        let token = match wire::decode(&s.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+        let token = match wire::decode(&s.payload, fence).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
             Msg::Sampled { token_id, .. } => token_id,
             Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
             other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
@@ -468,10 +468,10 @@ pub async fn time_generation_pipeline(
 
         // Feed it back — every step is a COMPLETE token cycle, including the last, so no sample is
         // a partial one. `no_sample = false`: this is decode, and the ack carries no witness.
-        c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
-        let boundary = expect_fwd(&mut c1, keys, input_pos).await?;
-        c2.send(0, &wire::encode_fwd(keys, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
-        expect_applied_ack(&mut c2, keys).await?;
+        c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+        let boundary = expect_fwd(&mut c1, fence, input_pos).await?;
+        c2.send(0, &wire::encode_fwd(fence, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
+        expect_applied_ack(&mut c2, fence).await?;
         input_pos += 1;
 
         per_token.push(t0.elapsed());
@@ -499,36 +499,36 @@ pub fn golden_next_token(model: &Model, tokens: &[u32]) -> Result<u32, hydra_eng
     Ok(bi as u32)
 }
 
-async fn prefill<S>(c1: &mut hydra_transport::framed::Conn<S>, c2: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys, tokens: &[u32]) -> Result<(), String>
+async fn prefill<S>(c1: &mut hydra_transport::framed::Conn<S>, c2: &mut hydra_transport::framed::Conn<S>, fence: &SessionFence, tokens: &[u32]) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     for (pos, &tok) in tokens.iter().enumerate() {
-        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill s1 send: {e}"))?;
-        let boundary = expect_fwd(c1, keys, pos as i64).await?;
-        c2.send(0, &wire::encode_fwd(keys, 0, pos as i64, true, &boundary)).await.map_err(|e| format!("prefill s2 send: {e}"))?;
-        expect_applied_ack(c2, keys).await?;
+        c1.send(0, &wire::encode_apply_token(fence, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill s1 send: {e}"))?;
+        let boundary = expect_fwd(c1, fence, pos as i64).await?;
+        c2.send(0, &wire::encode_fwd(fence, 0, pos as i64, true, &boundary)).await.map_err(|e| format!("prefill s2 send: {e}"))?;
+        expect_applied_ack(c2, fence).await?;
     }
     Ok(())
 }
 
-async fn expect_fwd<S>(c: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys, pos: i64) -> Result<Vec<f32>, String>
+async fn expect_fwd<S>(c: &mut hydra_transport::framed::Conn<S>, fence: &SessionFence, pos: i64) -> Result<Vec<f32>, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let f = c.recv().await.map_err(|e| format!("recv fwd: {e}"))?;
-    match wire::decode(&f.payload, keys).map_err(|e| format!("decode fwd: {e}"))?.1 {
+    match wire::decode(&f.payload, fence).map_err(|e| format!("decode fwd: {e}"))?.1 {
         Msg::Fwd { activations, .. } => Ok(activations),
         other => Err(format!("pos {pos}: expected FWD, got {other:?}")),
     }
 }
 
-async fn expect_applied_ack<S>(c: &mut hydra_transport::framed::Conn<S>, keys: &SessionKeys) -> Result<(), String>
+async fn expect_applied_ack<S>(c: &mut hydra_transport::framed::Conn<S>, fence: &SessionFence) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let a = c.recv().await.map_err(|e| format!("recv ack: {e}"))?;
-    match wire::decode(&a.payload, keys).map_err(|e| format!("decode ack: {e}"))?.1 {
+    match wire::decode(&a.payload, fence).map_err(|e| format!("decode ack: {e}"))?.1 {
         Msg::AppliedAck { .. } => Ok(()),
         other => Err(format!("expected APPLIED_ACK, got {other:?}")),
     }
@@ -541,7 +541,7 @@ where
 pub async fn run_generation(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     config: &SamplingConfig,
     prompt_tokens: &[u32],
     n_steps: usize,
@@ -550,16 +550,16 @@ pub async fn run_generation(
     let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
     let cfg_hash = config.hash();
 
-    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+    prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
     let mut out = Vec::with_capacity(n_steps);
     let mut input_pos = prompt_tokens.len() as i64;
     for step in 0..n_steps {
-        c2.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+        c2.send(0, &wire::encode_sample_next(fence, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
             .await
             .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
         let s = c2.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?;
-        let token = match wire::decode(&s.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+        let token = match wire::decode(&s.payload, fence).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
             Msg::Sampled { token_id, .. } => token_id,
             Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
             other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
@@ -568,10 +568,10 @@ pub async fn run_generation(
 
         // Feed the sampled token back autoregressively (except after the final step).
         if step + 1 < n_steps {
-            c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
-            let boundary = expect_fwd(&mut c1, keys, input_pos).await?;
-            c2.send(0, &wire::encode_fwd(keys, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
-            expect_applied_ack(&mut c2, keys).await?;
+            c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+            let boundary = expect_fwd(&mut c1, fence, input_pos).await?;
+            c2.send(0, &wire::encode_fwd(fence, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
+            expect_applied_ack(&mut c2, fence).await?;
             input_pos += 1;
         }
     }
@@ -588,7 +588,7 @@ pub async fn run_generation(
 pub async fn run_direct_fwd_generation(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     config: &SamplingConfig,
     prompt_tokens: &[u32],
     n_steps: usize,
@@ -602,17 +602,17 @@ pub async fn run_direct_fwd_generation(
     // Prefill (teacher-forced NO_SAMPLE): C→S1 APPLY_TOKEN; S1 forwards the boundary direct to S_P;
     // S_P's APPLIED_ACK is relayed back up S1→C.
     for (pos, &tok) in prompt_tokens.iter().enumerate() {
-        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill send s1: {e}"))?;
-        expect_applied_ack(&mut c1, keys).await?;
+        c1.send(0, &wire::encode_apply_token(fence, 0, pos as i64, tok, true)).await.map_err(|e| format!("prefill send s1: {e}"))?;
+        expect_applied_ack(&mut c1, fence).await?;
     }
 
     let mut out = Vec::with_capacity(n_steps);
     let mut input_pos = prompt_tokens.len() as i64;
     for step in 0..n_steps {
-        cp.send(0, &wire::encode_sample_next(keys, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
+        cp.send(0, &wire::encode_sample_next(fence, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
             .await
             .map_err(|e| format!("send SAMPLE_NEXT: {e}"))?;
-        let token = match wire::decode(&cp.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?.payload, keys).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
+        let token = match wire::decode(&cp.recv().await.map_err(|e| format!("recv SAMPLED: {e}"))?.payload, fence).map_err(|e| format!("decode SAMPLED: {e}"))?.1 {
             Msg::Sampled { token_id, .. } => token_id,
             Msg::Err { code } => return Err(format!("sampler error code {code} at step {step}")),
             other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
@@ -620,8 +620,8 @@ pub async fn run_direct_fwd_generation(
         out.push(token);
 
         if step + 1 < n_steps {
-            c1.send(0, &wire::encode_apply_token(keys, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
-            expect_applied_ack(&mut c1, keys).await?;
+            c1.send(0, &wire::encode_apply_token(fence, 0, input_pos, token, false)).await.map_err(|e| format!("feedback s1: {e}"))?;
+            expect_applied_ack(&mut c1, fence).await?;
             input_pos += 1;
         }
     }
@@ -634,19 +634,19 @@ pub async fn run_direct_fwd_generation(
 pub async fn sample_next_twice(
     connector: &TcpMtls,
     ep: &Endpoints,
-    keys: &SessionKeys,
+    fence: &SessionFence,
     config: &SamplingConfig,
     prompt_tokens: &[u32],
 ) -> Result<(Msg, Msg), String> {
     let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
     let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
-    prefill(&mut c1, &mut c2, keys, prompt_tokens).await?;
+    prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
     let cfg_hash = config.hash();
-    let fire = || wire::encode_sample_next(keys, 0, 0, &cfg_hash, INITIAL_CHECKPOINT_ID);
+    let fire = || wire::encode_sample_next(fence, 0, 0, &cfg_hash, INITIAL_CHECKPOINT_ID);
     c2.send(0, &fire()).await.map_err(|e| format!("send SAMPLE_NEXT #1: {e}"))?;
-    let first = wire::decode(&c2.recv().await.map_err(|e| format!("recv #1: {e}"))?.payload, keys).map_err(|e| format!("decode #1: {e}"))?.1;
+    let first = wire::decode(&c2.recv().await.map_err(|e| format!("recv #1: {e}"))?.payload, fence).map_err(|e| format!("decode #1: {e}"))?.1;
     c2.send(0, &fire()).await.map_err(|e| format!("send SAMPLE_NEXT #2: {e}"))?;
-    let second = wire::decode(&c2.recv().await.map_err(|e| format!("recv #2: {e}"))?.payload, keys).map_err(|e| format!("decode #2: {e}"))?.1;
+    let second = wire::decode(&c2.recv().await.map_err(|e| format!("recv #2: {e}"))?.payload, fence).map_err(|e| format!("decode #2: {e}"))?.1;
     Ok((first, second))
 }
 

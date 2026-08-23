@@ -30,7 +30,7 @@ use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_worker::bootstrap::{Bootstrap, ForwardingBootstrap};
 use hydra_worker::pair::{run_direct_fwd_generation, spawn_multiconn_forwarding_durable_endpoint, Cluster, Endpoints};
 use hydra_worker::sampler::SamplingConfig;
-use hydra_worker::wire::{self, Msg, SessionKeys};
+use hydra_worker::wire::{self, Msg, SessionFence};
 use hydra_worker::worker::WorkerConfig;
 
 const MAC_TS_IP: &str = "100.93.110.78";
@@ -124,7 +124,7 @@ fn start_remote(ssh: &str, local_boot: &str, remote_boot: &str, log: &str) -> Re
 
 /// A durability target on the Mac: persist each `BOUNDARY_COPY` to a real `BoundaryStore`, ack the
 /// fdatasync'd frontier. Bound to the Mac's Tailscale IP so a VM stage can reach it.
-fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::path::PathBuf, keys: SessionKeys) -> Result<SocketAddr, String> {
+fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::path::PathBuf, fence: SessionFence) -> Result<SocketAddr, String> {
     let id = cluster.issue(name).map_err(|e| e.to_string())?;
     let server_cfg = cluster.ca.server_config(&id).map_err(|e| e.to_string())?;
     let bind: SocketAddr = format!("{MAC_TS_IP}:{port}").parse().map_err(|e| format!("{e}"))?;
@@ -147,9 +147,9 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
             let Ok(a) = listener.accept().await else { return };
             let mut conn = a.conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
                     let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).unwrap_or(-1);
-                    let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, durable_through, 0);
+                    let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                     if conn.send(0, &ack).await.is_err() {
                         break;
                     }
@@ -160,7 +160,7 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
     rx.recv().map_err(|e| e.to_string())?
 }
 
-fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32) -> Bootstrap {
+fn sp_bootstrap(cluster: &Cluster, fence: &SessionFence, k2: i32, n_ctx: i32) -> Bootstrap {
     let id = cluster.issue("sp").unwrap();
     Bootstrap {
         listen_addr: format!("{VM1_TS_IP}:{SP_PORT}"),
@@ -169,7 +169,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32) -> B
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true,
+            fence: fence.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true,
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()),
             n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None,
         },
@@ -183,7 +183,7 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32) -> B
     }
 }
 
-fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: i32, dur2: SocketAddr) -> Bootstrap {
+fn s2_bootstrap(cluster: &Cluster, fence: &SessionFence, k1: i32, k2: i32, n_ctx: i32, dur2: SocketAddr) -> Bootstrap {
     let id = cluster.issue("s2").unwrap();
     Bootstrap {
         listen_addr: format!("{VM2_TS_IP}:{S2_PORT}"),
@@ -192,7 +192,7 @@ fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: 
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig {
-            keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false,
+            fence: fence.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false,
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()),
             n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
         },
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== hydra-3node-wan: chained direct FWD, Mac S1 [0,{k1}) → myVm-2 S2 [{k1},{k2}) → myVm-1 S_P [{k2},{n_layer}) ==");
     println!("   cap-weighted split 4.0/2.1/1.0; every leg WAN/Tailscale (VNet fast-path available, not exercised); cross-arch → mixed tier (spec I8)");
 
-    let keys = SessionKeys::dev(0x3D);
+    let fence = SessionFence::dev(0x3D);
     let cluster = Cluster::new()?;
     let (vm1, vm2) = (vm1_ssh(), vm2_ssh());
 
@@ -242,8 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d2 = std::env::temp_dir().join("hydra-3node-s2.wal");
     let _ = std::fs::remove_file(&d1);
     let _ = std::fs::remove_file(&d2);
-    let dur1 = spawn_mac_durability(&cluster, "dur1", DUR1_PORT, d1.clone(), keys.clone())?;
-    let dur2 = spawn_mac_durability(&cluster, "dur2", DUR2_PORT, d2.clone(), keys.clone())?;
+    let dur1 = spawn_mac_durability(&cluster, "dur1", DUR1_PORT, d1.clone(), fence.clone())?;
+    let dur2 = spawn_mac_durability(&cluster, "dur2", DUR2_PORT, d2.clone(), fence.clone())?;
     println!("[mac] durability endpoints up: dur1={dur1} dur2={dur2}");
 
     // Start S_P (myVm-1) then S2 (myVm-2): S2 dials S_P + the Mac dur2 at startup, so both must be up.
@@ -251,11 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kill_remote(&vm2);
     std::thread::sleep(std::time::Duration::from_millis(600));
     let sp_boot = std::env::temp_dir().join("hydra-3node-sp.boot");
-    sp_bootstrap(&cluster, &keys, k2, n_ctx).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx).write_to(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3n.boot", "/home/azureuser/hydra/sp-3n.log")?;
     println!("[vm1] S_P up on {VM1_TS_IP}:{SP_PORT} (engine=true)");
     let s2_boot = std::env::temp_dir().join("hydra-3node-s2.boot");
-    s2_bootstrap(&cluster, &keys, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
+    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
     start_remote(&vm2, s2_boot.to_str().unwrap(), "/home/azureuser/hydra/s2-3n.boot", "/home/azureuser/hydra/s2-3n.log")?;
     println!("[vm2] S2 up on {VM2_TS_IP}:{S2_PORT} (engine=true, forwarding→S_P, durability→Mac)");
 
@@ -263,7 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s2_addr: SocketAddr = format!("{VM2_TS_IP}:{S2_PORT}").parse()?;
     let s1_id = cluster.issue("s1")?;
     let s1_cfg = WorkerConfig {
-        keys: keys.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false,
+        fence: fence.clone(), rank: 0, layer_first: 0, layer_last: k1, is_final: false,
         receives_tokens: true, epoch: 0, recovery_id: 0, model_path: Some(mac_model.clone()),
         n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
     };
@@ -281,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sp_addr: SocketAddr = format!("{VM1_TS_IP}:{SP_PORT}").parse()?;
     let ep = Endpoints::new(s1_addr, "s1", sp_addr, "sp");
     let t = Instant::now();
-    let got = run_direct_fwd_generation(&connector, &ep, &keys, &greedy(), &prompt, n).await.map_err(|e| format!("3-node gen: {e}"))?;
+    let got = run_direct_fwd_generation(&connector, &ep, &fence, &greedy(), &prompt, n).await.map_err(|e| format!("3-node gen: {e}"))?;
     let wall = t.elapsed();
 
     let agree = got.iter().zip(&reference).filter(|(a, b)| a == b).count();

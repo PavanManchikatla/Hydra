@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use hydra_coordinator::commit_stream::{CommitStream, Durability, WalFenceCtx};
 
-fn fence() -> WalFenceCtx {
+fn wal_fence() -> WalFenceCtx {
     WalFenceCtx {
         cluster_id: [7u8; 16],
         manifest_hash: [8u8; 32],
@@ -94,10 +94,10 @@ fn a_failed_fdatasync_never_advances_the_prefill_watermark() {
     let seen = Arc::new(AtomicUsize::new(0));
     let mut cs = CommitStream::with_durability(Box::new(FailAfter { ok_appends: 1, seen: seen.clone(), len: 0 }));
 
-    cs.append_input_chunk_commit(&fence(), 0, 0, 0, 31, &[31]).expect("chunk 0 lands");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).expect("chunk 0 lands");
     assert_eq!(cs.prefill_stable_pos(), 31);
 
-    let err = cs.append_input_chunk_commit(&fence(), 0, 1, 32, 63, &[63]);
+    let err = cs.append_input_chunk_commit(&wal_fence(), 0, 1, 32, 63, &[63]);
     assert!(err.is_err(), "a failed durable write must surface as an error");
     assert_eq!(
         cs.prefill_stable_pos(),
@@ -112,16 +112,16 @@ fn a_failed_fdatasync_never_advances_the_prefill_watermark() {
 fn a_stalled_fdatasync_never_advances_the_prefill_watermark() {
     // P2·7's OWED case, now covered: the chunk-boundary stall.
     let mut cs = CommitStream::with_durability(Box::new(StallAfter { ok_appends: 2, seen: 0, len: 0 }));
-    cs.append_input_chunk_commit(&fence(), 0, 0, 0, 31, &[31]).expect("chunk 0");
-    cs.append_input_chunk_commit(&fence(), 0, 1, 32, 63, &[63]).expect("chunk 1");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).expect("chunk 0");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 1, 32, 63, &[63]).expect("chunk 1");
     assert_eq!(cs.prefill_stable_pos(), 63);
 
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 2, 64, 95, &[95]).is_err(), "stall must surface");
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 2, 64, 95, &[95]).is_err(), "stall must surface");
     assert_eq!(cs.prefill_stable_pos(), 63, "a stalled barrier leaves the frontier untouched");
 
     // And the frontier stays put across repeated attempts — no accumulation of half-progress.
     for chunk in 3..8 {
-        let _ = cs.append_input_chunk_commit(&fence(), 0, chunk, 64, 95, &[95]);
+        let _ = cs.append_input_chunk_commit(&wal_fence(), 0, chunk, 64, 95, &[95]);
         assert_eq!(cs.prefill_stable_pos(), 63, "retry {chunk} must not creep the watermark forward");
     }
 }
@@ -134,7 +134,7 @@ fn a_failed_fdatasync_never_advances_the_generation_watermark() {
     let ckpt = cs.committed_sampler_checkpoint_id();
 
     // Any append fails from the outset — a session on a full disk.
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 0, 0, 31, &[31]).is_err());
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).is_err());
 
     assert_eq!(cs.generation_durable_pos(), before, "generation frontier must not move");
     assert_eq!(cs.committed_sampler_checkpoint_id(), ckpt, "committed checkpoint must not move");
@@ -153,7 +153,7 @@ fn an_unwritable_session_fails_explicitly_and_never_silently_degrades() {
 
     for chunk in 0..10u32 {
         let first = chunk as i64 * 32;
-        let r = cs.append_input_chunk_commit(&fence(), 0, chunk, first, first + 31, &[first + 31]);
+        let r = cs.append_input_chunk_commit(&wal_fence(), 0, chunk, first, first + 31, &[first + 31]);
         assert!(
             r.is_err(),
             "attempt {chunk} returned Ok on an unwritable disk — a silent success is the one \
@@ -173,13 +173,13 @@ fn recovery_after_a_disk_fault_resumes_from_the_last_position_that_actually_land
     let mut cs = CommitStream::with_durability(Box::new(FailAfter { ok_appends: 3, seen, len: 0 }));
     for chunk in 0..3u32 {
         let first = chunk as i64 * 32;
-        cs.append_input_chunk_commit(&fence(), 0, chunk, first, first + 31, &[first + 31]).expect("lands");
+        cs.append_input_chunk_commit(&wal_fence(), 0, chunk, first, first + 31, &[first + 31]).expect("lands");
     }
     let durable_frontier = cs.prefill_stable_pos();
     assert_eq!(durable_frontier, 95);
 
     // The fourth chunk dies on the barrier.
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 3, 96, 127, &[127]).is_err());
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 3, 96, 127, &[127]).is_err());
     assert_eq!(cs.prefill_stable_pos(), durable_frontier);
 
     // Recovery resumes at frontier+1 and covers the rest exactly once.

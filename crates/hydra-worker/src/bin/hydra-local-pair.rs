@@ -11,7 +11,7 @@
 use hydra_engine_sys::Model;
 use hydra_worker::bootstrap::Bootstrap;
 use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster, Endpoints, SubprocessWorker};
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::WorkerConfig;
 
 fn der_vec(c: &hydra_transport::CertificateDer<'static>) -> Vec<u8> {
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s1_id = cluster.issue("worker-s1")?;
     let s2_id = cluster.issue("worker-s2")?;
     let ca_der = der_vec(&cluster.ca.ca_cert_der());
-    let keys = SessionKeys::dev(0xB2);
+    let fence = SessionFence::dev(0xB2);
 
     let binary = std::env::current_exe()?
         .parent()
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forwarding: None,
     };
     let base = |rank, lf, ll, is_final, receives_tokens| WorkerConfig {
-        keys: keys.clone(),
+        fence: fence.clone(),
         rank,
         layer_first: lf,
         layer_last: ll,
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connector = cluster.coordinator_connector()?;
     let ep = Endpoints::new(s1.addr, "worker-s1", s2.addr, "worker-s2");
-    let digest = run_teacher_forced_pipeline(&connector, &ep, &keys, &tokens)
+    let digest = run_teacher_forced_pipeline(&connector, &ep, &fence, &tokens)
         .await
         .map_err(|e| format!("pipeline: {e}"))?;
     let exact = digest == golden;
@@ -108,10 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attempt: 0,
         sampler_checkpoint_id: 0,
     };
-    c.send(0, &hydra_worker::wire::encode_commit_activation(&keys, &tuple, 1)).await?;
+    c.send(0, &hydra_worker::wire::encode_commit_activation(&fence, &tuple, 1)).await?;
     let reply = c.recv().await?;
     let re_serves = matches!(
-        hydra_worker::wire::decode(&reply.payload, &keys).map(|(_, m)| m),
+        hydra_worker::wire::decode(&reply.payload, &fence).map(|(_, m)| m),
         Ok(hydra_worker::wire::Msg::ActivationCommitted(_))
     );
     println!("restarted S2 re-serves: {}", if re_serves { "✅" } else { "❌" });

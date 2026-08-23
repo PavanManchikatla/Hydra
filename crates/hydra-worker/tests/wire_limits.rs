@@ -22,16 +22,16 @@
 
 use hydra_proto::limits::{MAX_POSITIONS_PER_FRAME, MAX_SNAPSHOT_BYTES, MAX_TENSOR_BYTES};
 use hydra_proto::proto;
-use hydra_worker::wire::{self, SessionKeys, WireError};
+use hydra_worker::wire::{self, SessionFence, WireError};
 
 fn build_fence<'a>(
     fbb: &mut flatbuffers::FlatBufferBuilder<'a>,
-    keys: &SessionKeys,
+    fence: &SessionFence,
 ) -> flatbuffers::WIPOffset<proto::Fence<'a>> {
-    let cluster_id = fbb.create_vector::<u8>(&keys.cluster_id);
-    let manifest_hash = fbb.create_vector::<u8>(&keys.manifest_hash);
-    let model_instance_id = fbb.create_vector::<u8>(&keys.model_instance_id);
-    let session_id = fbb.create_vector::<u8>(&keys.session_id);
+    let cluster_id = fbb.create_vector::<u8>(&fence.cluster_id);
+    let manifest_hash = fbb.create_vector::<u8>(&fence.manifest_hash);
+    let model_instance_id = fbb.create_vector::<u8>(&fence.model_instance_id);
+    let session_id = fbb.create_vector::<u8>(&fence.session_id);
     proto::Fence::create(
         fbb,
         &proto::FenceArgs {
@@ -64,9 +64,9 @@ fn finish(
     fbb.finished_data().to_vec()
 }
 
-fn fwd(keys: &SessionKeys, tensor_bytes: usize, n_positions: u16) -> Vec<u8> {
+fn fwd(fence: &SessionFence, tensor_bytes: usize, n_positions: u16) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(tensor_bytes + 4096);
-    let fence = build_fence(&mut fbb, keys);
+    let wf = build_fence(&mut fbb, fence);
     let data = fbb.create_vector::<u8>(&vec![0u8; tensor_bytes]);
     let dims = fbb.create_vector::<u32>(&[1, (tensor_bytes / 4) as u32]);
     let t = proto::Tensor::create(
@@ -83,12 +83,12 @@ fn fwd(keys: &SessionKeys, tensor_bytes: usize, n_positions: u16) -> Vec<u8> {
             commit_up_to_output_pos: -1,
         },
     );
-    finish(fbb, fence, proto::Body::Fwd, body.as_union_value())
+    finish(fbb, wf, proto::Body::Fwd, body.as_union_value())
 }
 
-fn sampled(keys: &SessionKeys, snapshot_bytes: usize) -> Vec<u8> {
+fn sampled(fence: &SessionFence, snapshot_bytes: usize) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(snapshot_bytes + 4096);
-    let fence = build_fence(&mut fbb, keys);
+    let wf = build_fence(&mut fbb, fence);
     let snap = fbb.create_vector::<u8>(&vec![7u8; snapshot_bytes]);
     let digest = fbb.create_vector::<u8>(&[0u8; 32]);
     let body = proto::Sampled::create(
@@ -102,7 +102,7 @@ fn sampled(keys: &SessionKeys, snapshot_bytes: usize) -> Vec<u8> {
             topk_logprobs: None,
         },
     );
-    finish(fbb, fence, proto::Body::Sampled, body.as_union_value())
+    finish(fbb, wf, proto::Body::Sampled, body.as_union_value())
 }
 
 /// `MAX_TENSOR_BYTES` (48 MiB) is enforced on every boundary-carrying body, before the `Vec<f32>`
@@ -110,13 +110,13 @@ fn sampled(keys: &SessionKeys, snapshot_bytes: usize) -> Vec<u8> {
 /// the *tensor* cap and not the frame cap.
 #[test]
 fn an_oversized_tensor_is_refused_before_it_is_copied() {
-    let keys = SessionKeys::dev(0x51);
+    let fence = SessionFence::dev(0x51);
 
     // Control first: a normal boundary decodes, so a refusal below is caused by the size.
-    assert!(wire::decode(&fwd(&keys, 3584, 1), &keys).is_ok(), "control: an ordinary boundary decodes");
+    assert!(wire::decode(&fwd(&fence, 3584, 1), &fence).is_ok(), "control: an ordinary boundary decodes");
 
     let over = MAX_TENSOR_BYTES as usize + 4;
-    let err = wire::decode(&fwd(&keys, over, 1), &keys).unwrap_err();
+    let err = wire::decode(&fwd(&fence, over, 1), &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::LimitExceeded { what: "Fwd activations", value: over as u64, cap: MAX_TENSOR_BYTES as u64 },
@@ -125,7 +125,7 @@ fn an_oversized_tensor_is_refused_before_it_is_copied() {
 
     // Exactly at the cap is admitted: an off-by-one that refuses legal traffic is also a defect.
     assert!(
-        wire::decode(&fwd(&keys, MAX_TENSOR_BYTES as usize, 1), &keys).is_ok(),
+        wire::decode(&fwd(&fence, MAX_TENSOR_BYTES as usize, 1), &fence).is_ok(),
         "a tensor exactly at the cap is legal"
     );
 }
@@ -135,10 +135,10 @@ fn an_oversized_tensor_is_refused_before_it_is_copied() {
 /// frame cap gives no protection at all.
 #[test]
 fn an_oversized_position_count_is_refused() {
-    let keys = SessionKeys::dev(0x52);
-    assert!(wire::decode(&fwd(&keys, 3584, MAX_POSITIONS_PER_FRAME), &keys).is_ok(), "control: at the cap is legal");
+    let fence = SessionFence::dev(0x52);
+    assert!(wire::decode(&fwd(&fence, 3584, MAX_POSITIONS_PER_FRAME), &fence).is_ok(), "control: at the cap is legal");
 
-    let err = wire::decode(&fwd(&keys, 3584, MAX_POSITIONS_PER_FRAME + 1), &keys).unwrap_err();
+    let err = wire::decode(&fwd(&fence, 3584, MAX_POSITIONS_PER_FRAME + 1), &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::LimitExceeded {
@@ -154,11 +154,11 @@ fn an_oversized_position_count_is_refused() {
 /// broken or hostile, and either way it must not be copied first and judged after.
 #[test]
 fn an_oversized_sampler_snapshot_is_refused() {
-    let keys = SessionKeys::dev(0x53);
-    assert!(wire::decode(&sampled(&keys, 128), &keys).is_ok(), "control: a real-sized snapshot decodes");
+    let fence = SessionFence::dev(0x53);
+    assert!(wire::decode(&sampled(&fence, 128), &fence).is_ok(), "control: a real-sized snapshot decodes");
 
     let over = MAX_SNAPSHOT_BYTES as usize + 1;
-    let err = wire::decode(&sampled(&keys, over), &keys).unwrap_err();
+    let err = wire::decode(&sampled(&fence, over), &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::LimitExceeded { what: "post_sample_snapshot", value: over as u64, cap: MAX_SNAPSHOT_BYTES as u64 }
@@ -170,9 +170,9 @@ fn an_oversized_sampler_snapshot_is_refused() {
 /// becomes an unbounded one.
 #[test]
 fn a_fixed_width_digest_field_is_capped_at_its_width() {
-    let keys = SessionKeys::dev(0x54);
+    let fence = SessionFence::dev(0x54);
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
-    let fence = build_fence(&mut fbb, &keys);
+    let wf = build_fence(&mut fbb, &fence);
     let snap = fbb.create_vector::<u8>(&[7u8; 64]);
     let digest = fbb.create_vector::<u8>(&vec![0u8; 4096]); // 128× a BLAKE3 digest
     let body = proto::Sampled::create(
@@ -186,9 +186,9 @@ fn a_fixed_width_digest_field_is_capped_at_its_width() {
             topk_logprobs: None,
         },
     );
-    let payload = finish(fbb, fence, proto::Body::Sampled, body.as_union_value());
+    let payload = finish(fbb, wf, proto::Body::Sampled, body.as_union_value());
 
-    let err = wire::decode(&payload, &keys).unwrap_err();
+    let err = wire::decode(&payload, &fence).unwrap_err();
     assert_eq!(err, WireError::LimitExceeded { what: "sampler_state_digest", value: 4096, cap: 32 });
 }
 
@@ -237,7 +237,7 @@ fn the_frame_cap_is_enforced_at_the_header_before_any_payload_is_read() {
 /// above 1024 fails here on the very first run.
 #[test]
 fn wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches() {
-    let keys = SessionKeys::dev(0x55);
+    let fence = SessionFence::dev(0x55);
 
     // 896 = the dev model (Qwen2.5-0.5B) — the width every other engine test uses, and the one
     // that hid the defect. 1024 = exactly MAX_POSITIONS_PER_FRAME, the value an off-by-one lands
@@ -246,8 +246,8 @@ fn wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches() {
     for n_embd in [896usize, 1024, 1536, 2048, 4096, 8192] {
         let boundary = vec![0.25f32; n_embd];
 
-        let payload = wire::encode_fwd(&keys, 0, 0, true, &boundary);
-        let (_, msg) = wire::decode(&payload, &keys)
+        let payload = wire::encode_fwd(&fence, 0, 0, true, &boundary);
+        let (_, msg) = wire::decode(&payload, &fence)
             .unwrap_or_else(|e| panic!("a {n_embd}-wide FWD boundary must decode, got {e:?}"));
         match msg {
             hydra_worker::wire::Msg::Fwd { activations, .. } => {
@@ -266,9 +266,9 @@ fn wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches() {
         );
 
         // The same for the durability path, which carries the same boundary over a different body.
-        let bc = wire::encode_boundary_copy(&keys, 0, 0, 0, 0, &boundary);
+        let bc = wire::encode_boundary_copy(&fence, 0, 0, 0, 0, &boundary);
         assert!(
-            wire::decode(&bc, &keys).is_ok(),
+            wire::decode(&bc, &fence).is_ok(),
             "a {n_embd}-wide BOUNDARY_COPY must decode — D1 recovery replays exactly these"
         );
     }

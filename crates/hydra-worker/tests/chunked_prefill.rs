@@ -27,12 +27,12 @@
 
 use hydra_coordinator::commit_stream::CommitStream;
 use hydra_worker::pair::{dev_model_path, golden_digest, run_teacher_forced_pipeline, Cluster};
-use hydra_worker::wire::SessionKeys;
+use hydra_worker::wire::SessionFence;
 use hydra_worker::worker::WorkerConfig;
 use hydra_sched::prefill::{plan_chunks, ChunkPlanInput};
 
 /// A `WalFenceCtx` for the session under test.
-fn fence() -> hydra_coordinator::commit_stream::WalFenceCtx {
+fn wal_fence() -> hydra_coordinator::commit_stream::WalFenceCtx {
     hydra_coordinator::commit_stream::WalFenceCtx {
         cluster_id: [7u8; 16],
         manifest_hash: [8u8; 32],
@@ -56,9 +56,9 @@ fn prefill_stable_pos_advances_only_on_a_durable_chunk_commit() {
     // Nothing durable yet: the input frontier is empty, not zero.
     assert_eq!(cs.prefill_stable_pos(), -1, "no chunk committed ⇒ no stable prefill position");
 
-    cs.append_input_chunk_commit(&fence(), 0, 0, 0, 31, &[31]).expect("chunk 0");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).expect("chunk 0");
     assert_eq!(cs.prefill_stable_pos(), 31, "the watermark moves only after the fdatasync'd append");
-    cs.append_input_chunk_commit(&fence(), 0, 1, 32, 63, &[63]).expect("chunk 1");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 1, 32, 63, &[63]).expect("chunk 1");
     assert_eq!(cs.prefill_stable_pos(), 63);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -73,10 +73,10 @@ fn a_chunk_that_would_move_the_watermark_backwards_is_refused() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut cs = CommitStream::create(dir.join("commits.wal"), [7u8; 16], [1u8; 16]).expect("create");
 
-    cs.append_input_chunk_commit(&fence(), 0, 0, 0, 63, &[63]).expect("chunk 0");
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 1, 32, 63, &[63]).is_err(), "replay of the same frontier");
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 1, 0, 31, &[31]).is_err(), "an earlier chunk");
-    assert!(cs.append_input_chunk_commit(&fence(), 0, 1, 70, 65, &[65]).is_err(), "an inverted chunk");
+    cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 63, &[63]).expect("chunk 0");
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 1, 32, 63, &[63]).is_err(), "replay of the same frontier");
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 1, 0, 31, &[31]).is_err(), "an earlier chunk");
+    assert!(cs.append_input_chunk_commit(&wal_fence(), 0, 1, 70, 65, &[65]).is_err(), "an inverted chunk");
     assert_eq!(cs.prefill_stable_pos(), 63, "a refused chunk must not have moved the watermark");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -105,7 +105,7 @@ async fn chunked_prefill_is_bit_exact_with_unchunked_prefill() {
         (tokens, golden, model.n_layer())
     };
     let k = (n_layer / 2).max(1);
-    let keys = SessionKeys::dev(0xC7);
+    let fence = SessionFence::dev(0xC7);
     let n_ctx = tokens.len() as i32 + 8;
 
     // Size the chunks the way admission would. The budget is set at the planner's floor (8
@@ -124,7 +124,7 @@ async fn chunked_prefill_is_bit_exact_with_unchunked_prefill() {
     let s1_id = cluster.issue("worker-s1").unwrap();
     let s2_id = cluster.issue("worker-s2").unwrap();
     let cfg = |rank: u16, first: i32, last: i32, is_final: bool, recv: bool| WorkerConfig {
-        keys: keys.clone(), rank, layer_first: first, layer_last: last, is_final,
+        fence: fence.clone(), rank, layer_first: first, layer_last: last, is_final,
         receives_tokens: recv, epoch: 0, recovery_id: 0, model_path: Some(path.clone()),
         n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None,
     };
@@ -142,12 +142,12 @@ async fn chunked_prefill_is_bit_exact_with_unchunked_prefill() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut cs = CommitStream::create(dir.join("commits.wal"), [7u8; 16], [1u8; 16]).expect("create");
 
-    let digest = run_teacher_forced_pipeline(&connector, &ep, &keys, &tokens).await.expect("pipeline");
+    let digest = run_teacher_forced_pipeline(&connector, &ep, &fence, &tokens).await.expect("pipeline");
 
     // Record the chunk commits the run implies, in order, and check the watermark walks with them.
     for i in 0..plan.n_chunks {
         let (first, last) = plan.chunk_range(i, tokens.len() as u32).unwrap();
-        cs.append_input_chunk_commit(&fence(), 0, i, first, last, &[last]).expect("chunk commit");
+        cs.append_input_chunk_commit(&wal_fence(), 0, i, first, last, &[last]).expect("chunk commit");
         assert_eq!(cs.prefill_stable_pos(), last, "chunk {i} must leave the watermark at its last position");
     }
     assert_eq!(
@@ -193,7 +193,7 @@ fn an_interrupted_prefill_resumes_from_the_durable_chunk_boundary_and_applies_no
         let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
         for i in 0..3 {
             let (first, last) = plan.chunk_range(i, segment_positions as u32).unwrap();
-            cs.append_input_chunk_commit(&fence(), 0, i, first, last, &[last]).expect("chunk");
+            cs.append_input_chunk_commit(&wal_fence(), 0, i, first, last, &[last]).expect("chunk");
         }
         cs.prefill_stable_pos()
     };

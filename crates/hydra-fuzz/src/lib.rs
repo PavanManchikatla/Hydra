@@ -174,8 +174,8 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
             }
         }
         Target::WireBody => {
-            let keys = hydra_worker::wire::SessionKeys::dev(0x5E);
-            let _ = hydra_worker::wire::decode(&input, &keys);
+            let fence = hydra_worker::wire::SessionFence::dev(0x5E);
+            let _ = hydra_worker::wire::decode(&input, &fence);
             let _ = hydra_worker::wire::is_fwd_frame(&input);
         }
         Target::Manifest => {
