@@ -20,6 +20,44 @@ use crate::retain::R3Buffer;
 use crate::wire::{self, SessionKeys};
 use crate::worker::WorkerError;
 
+/// P2·8 — the durability mode, made explicit rather than carried as a bare bool.
+///
+/// **D1** copies every boundary to the durability target and gates R3′ release on
+/// `DURABILITY_ACK` as well as the downstream `APPLIED_ACK`. A replacement stage is then rebuilt
+/// from **durable boundaries**, which is fast.
+///
+/// **D0** does neither. There is **no `BOUNDARY_COPY` on the wire at all** — that is the entire
+/// point of the mode, and a D0 run that emits one is a defect, not an inefficiency. Release gates
+/// on the downstream ack alone. Recovery is therefore **Strategy-B only**: a replacement stage is
+/// rebuilt by **full teacher-forced replay from the durable token ledger** — the machinery C
+/// part 2 already proved.
+///
+/// **The trade, stated plainly (spec §7):** D0 buys **zero boundary overhead** — no copy traffic,
+/// no durability-target disk, no `DURABILITY_ACK` round-trip on the release path — and pays for it
+/// in **recovery cost**, because rebuilding from tokens re-runs the whole prefix instead of
+/// replaying boundaries. D0 is the right choice when the link is precious and recoveries are rare;
+/// D1 when a long context makes a full rebuild the expensive event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    /// No boundary copies; Strategy-B (full token replay) recovery.
+    D0,
+    /// Boundary copies + `DURABILITY_ACK`-gated release; boundary-replay recovery.
+    D1,
+}
+
+impl DurabilityMode {
+    pub fn from_require_durable(require_durable: bool) -> Self {
+        if require_durable {
+            DurabilityMode::D1
+        } else {
+            DurabilityMode::D0
+        }
+    }
+    pub fn copies_boundaries(&self) -> bool {
+        matches!(self, DurabilityMode::D1)
+    }
+}
+
 /// Forwarding-stage boundary durability: emit `BOUNDARY_COPY` + retain under R3′ until both acks clear.
 pub struct DurableForwarder {
     keys: SessionKeys,
@@ -34,6 +72,7 @@ pub struct DurableForwarder {
     /// rather than dropping a copy: a dropped copy is a future recovery hole, so slower is safe and
     /// lossy is not. See [`DurableForwarder::is_at_capacity`].
     capacity: usize,
+    mode: DurabilityMode,
 }
 
 impl DurableForwarder {
@@ -48,7 +87,13 @@ impl DurableForwarder {
             retain: R3Buffer::new(require_durable),
             next_boundary_id: 0,
             capacity: capacity.max(1),
+            mode: DurabilityMode::from_require_durable(require_durable),
         }
+    }
+
+    /// The configured durability mode.
+    pub fn mode(&self) -> DurabilityMode {
+        self.mode
     }
 
     /// Emit a `BOUNDARY_COPY` for `boundary` on the durability connection (the background-class copy,
@@ -59,7 +104,14 @@ impl DurableForwarder {
     {
         let bid = self.next_boundary_id;
         self.next_boundary_id += 1;
-        dur.send(0, &wire::encode_boundary_copy(&self.keys, self.epoch, bid, input_pos, 0, boundary)).await?;
+        // P2·8: in D0 there is NO copy on the wire. Skipping it is the mode's whole purpose —
+        // "zero boundary overhead" is not a description of a cheaper copy, it is the absence of
+        // one — and a D0 run that emitted a BOUNDARY_COPY would be a defect. Retention still
+        // happens: R3′ holds the boundary for the in-flight window and releases on the downstream
+        // ack alone (R3Buffer was already constructed with that rule).
+        if self.mode.copies_boundaries() {
+            dur.send(0, &wire::encode_boundary_copy(&self.keys, self.epoch, bid, input_pos, 0, boundary)).await?;
+        }
         self.retain.retain(input_pos, boundary.to_vec());
         Ok(bid)
     }
