@@ -121,6 +121,16 @@ pub enum WorkerError {
     Unauthorized { role: String, body: String },
     #[error("engine: {0}")]
     Engine(#[from] EngineError),
+    /// **Audit C3 / H7 / M5 / 1c.** The frame decoded cleanly, but a *value* in it cannot cross the
+    /// FFI on this stage: a declared `n_embd` that is not this engine's, a position count above
+    /// `n_batch`, a position outside `[0, n_ctx)` or that does not fit `i32`, a token id outside
+    /// `[0, n_vocab)`. Refused **before** the engine is touched — and distinct from
+    /// [`WorkerError::Engine`], which is what the engine says *after* being called. A bound that
+    /// only the engine enforces is a bound the engine must survive being asked about; the worker
+    /// holds the numbers (`n_embd`, `n_batch`, `n_ctx`, `n_vocab` are the engine's own facts) and
+    /// so the worker asks first.
+    #[error("REFUSED before the FFI: {what} = {value} (bound {bound})")]
+    PreFfi { what: &'static str, value: i64, bound: i64 },
     #[error("data-plane frame but no engine linked/loaded on this worker")]
     EngineUnavailable,
     #[error(transparent)]
@@ -137,6 +147,17 @@ struct Engine {
     n_embd: usize,
     /// True iff this stage extracts a boundary (i.e. it is not the final logits stage).
     emit_boundary: bool,
+}
+
+/// `i32::try_from` on a network-derived position, bounded to `[0, n_ctx)` (audit 1c). Every
+/// `as i32` on a wire `i64` was a silent truncation: `2^32 + 5` became `5`, and a negative became a
+/// position the engine would index with. The value is checked here, once, and the FFI only ever
+/// sees an `i32` that was a position.
+fn wire_pos(what: &'static str, pos: i64, n_ctx: i32) -> Result<i32, WorkerError> {
+    match i32::try_from(pos) {
+        Ok(p) if p >= 0 && p < n_ctx => Ok(p),
+        _ => Err(WorkerError::PreFfi { what, value: pos, bound: n_ctx as i64 }),
+    }
 }
 
 impl Engine {
@@ -178,7 +199,17 @@ impl Engine {
     }
 
     /// Apply one token at `pos`. Returns the extracted boundary (emit stages) or `None` (final).
-    fn apply_token(&mut self, token: i32, pos: i32) -> Result<Option<Vec<f32>>, EngineError> {
+    ///
+    /// **M5 (worker side):** `token_id < n_vocab` is checked here, before the FFI. The
+    /// coordinator's `Session::push_sampled` holds the same bound before a token becomes
+    /// *durable*; this is the bound before it becomes *compute*.
+    fn apply_token(&mut self, token_id: u32, input_pos: i64) -> Result<Option<Vec<f32>>, WorkerError> {
+        let n_vocab = self.ctx.n_vocab();
+        let token = match i32::try_from(token_id) {
+            Ok(t) if t < n_vocab => t,
+            _ => return Err(WorkerError::PreFfi { what: "APPLY_TOKEN token_id vs n_vocab", value: token_id as i64, bound: n_vocab as i64 }),
+        };
+        let pos = wire_pos("APPLY_TOKEN input_pos", input_pos, self.ctx.n_ctx())?;
         if self.emit_boundary {
             let mut b = vec![0f32; self.n_embd];
             self.ctx.apply_tokens(&[token], pos, Some(&mut b))?;
@@ -191,13 +222,31 @@ impl Engine {
 
     /// Inject one boundary position at `pos`. Returns the re-extracted boundary (middle stages) or
     /// `None` (final stage).
-    fn apply_boundary(&mut self, boundary: &[f32], pos: i32) -> Result<Option<Vec<f32>>, EngineError> {
+    ///
+    /// **Audit C3 (the external half) + H7.** `wire::decode` proved the frame is self-consistent
+    /// (`activations.len() == n_positions × n_embd`, `n_positions == 1`). This is where the
+    /// *declared* `n_embd` meets the **engine's** `n_embd`, and where `n_positions` meets
+    /// `n_batch` — both before `hydra_apply` is called. A frame can be perfectly internally
+    /// consistent and still describe a model this stage does not hold.
+    fn apply_boundary(&mut self, boundary: &[f32], n_positions: u16, n_embd: u32, first_input_pos: i64) -> Result<Option<Vec<f32>>, WorkerError> {
+        if n_embd as i64 != self.ctx.n_embd() as i64 {
+            return Err(WorkerError::PreFfi { what: "FWD n_embd vs engine n_embd", value: n_embd as i64, bound: self.ctx.n_embd() as i64 });
+        }
+        if n_positions as i64 > self.ctx.n_batch() as i64 {
+            return Err(WorkerError::PreFfi { what: "FWD n_positions vs n_batch (audit H7)", value: n_positions as i64, bound: self.ctx.n_batch() as i64 });
+        }
+        // Belt and braces: decode guarantees this, but the FFI must never rely on a guarantee made
+        // in another module. Cheap, and it keeps `apply_boundary`'s contract local.
+        if boundary.len() != n_positions as usize * n_embd as usize {
+            return Err(WorkerError::PreFfi { what: "FWD activations.len vs n_positions × n_embd", value: boundary.len() as i64, bound: (n_positions as usize * n_embd as usize) as i64 });
+        }
+        let pos = wire_pos("FWD first_input_pos", first_input_pos, self.ctx.n_ctx())?;
         if self.emit_boundary {
             let mut b = vec![0f32; self.n_embd];
-            self.ctx.apply_boundary(boundary, pos, Some(&mut b))?;
+            self.ctx.apply_boundary(boundary, n_positions as i32, pos, Some(&mut b))?;
             Ok(Some(b))
         } else {
-            self.ctx.apply_boundary(boundary, pos, None)?;
+            self.ctx.apply_boundary(boundary, n_positions as i32, pos, None)?;
             Ok(None)
         }
     }
@@ -271,14 +320,14 @@ impl Worker {
                     return Ok(vec![]);
                 }
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
-                match eng.apply_token(token_id as i32, input_pos as i32)? {
+                match eng.apply_token(token_id, input_pos)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, input_pos, no_sample, &boundary)]),
                     None => self.retain_and_ack(view.epoch, input_pos, no_sample),
                 }
             }
-            Msg::Fwd { first_input_pos, no_sample, activations } => {
+            Msg::Fwd { first_input_pos, no_sample, n_positions, n_embd, activations } => {
                 let eng = self.engine.as_mut().ok_or(WorkerError::EngineUnavailable)?;
-                match eng.apply_boundary(&activations, first_input_pos as i32)? {
+                match eng.apply_boundary(&activations, n_positions, n_embd, first_input_pos)? {
                     Some(boundary) => Ok(vec![wire::encode_fwd(&self.cfg.fence, view.epoch, first_input_pos, no_sample, &boundary)]),
                     None => self.retain_and_ack(view.epoch, first_input_pos, no_sample),
                 }
@@ -303,7 +352,12 @@ impl Worker {
                 // only for a survivor (e.g. the downstream S_P on a middle-stage kill).
                 if effects.iter().any(|e| matches!(e, StageEffect::RecoveryAck { .. })) {
                     if let Some(eng) = self.engine.as_mut() {
-                        eng.ctx.kv_truncate((truncate_to + 1).max(0) as i32)?;
+                        // `i32::try_from`, not `as i32` (audit 1c): a wire `i64` that does not fit is
+                        // refused, never truncated into some other position. The full H3 bound
+                        // (`0 ≤ truncate_to < n_ctx`, `target == base+1`) lands in Wave 1d.
+                        let keep = truncate_to.saturating_add(1).max(0);
+                        let keep = i32::try_from(keep).map_err(|_| WorkerError::PreFfi { what: "BEGIN_RECOVERY truncate_to", value: truncate_to, bound: i32::MAX as i64 })?;
+                        eng.ctx.kv_truncate(keep)?;
                     }
                     self.sampled_ring.clear();
                 }

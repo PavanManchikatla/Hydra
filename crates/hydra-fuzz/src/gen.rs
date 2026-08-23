@@ -216,10 +216,12 @@ pub fn wire_body_case(rng: &mut Rng) -> Vec<u8> {
         return noise(rng, 256);
     }
     let fence = hydra_worker::wire::SessionFence::dev(0x5E);
-    let mut buf = match rng.below(4) {
+    let mut buf = match rng.below(5) {
         0 => hydra_worker::wire::encode_apply_token(&fence, 0, 0, 1, true),
         1 => hydra_worker::wire::encode_fwd(&fence, 0, 0, true, &vec![0.5f32; 64]),
         2 => hydra_worker::wire::encode_applied_ack(&fence, 0, 0, &[0u8; 32]),
+        // Audit C3: the other boundary-carrying body, so bit-flips reach its shape cross-check too.
+        3 => hydra_worker::wire::encode_boundary_copy(&fence, 0, 0, 0, 0, &vec![0.5f32; 64]),
         _ => hydra_worker::wire::encode_sample_next(&fence, 0, 0, &[0u8; 32], 1),
     };
     // 1..=8 bit flips: enough to break invariants, few enough that the buffer stays FlatBuffers-ish.
@@ -437,4 +439,38 @@ pub fn wal_record_case(rng: &mut Rng) -> Vec<u8> {
         v.truncate(cut);
     }
     v
+}
+
+// ------------------------------------------------------------------------------------------
+// BOUNDARY_COPY record payload (the boundary store, read back from the DISK)
+// ------------------------------------------------------------------------------------------
+
+/// Audit C3 / rule 17. The same grow-then-flip shape as `wire_body_case`: a structurally valid
+/// record from the real encoder, then 1..=8 bit flips (and an occasional truncation), so the cases
+/// reach the `dims` / `n_positions` / byte-count arithmetic the C3 check exists for rather than
+/// dying at the FlatBuffers root offset.
+pub fn boundary_record_case(rng: &mut Rng) -> Vec<u8> {
+    if rng.below(4) == 0 {
+        return noise(rng, 256);
+    }
+    let n_embd = 1 + rng.below(96) as usize;
+    let mut buf = hydra_coordinator::boundary_store::encode_boundary_record(
+        rng.below(4) as u32,
+        rng.below(64) as i64,
+        rng.below(4) as u32,
+        &vec![0.25f32; n_embd],
+    );
+    let flips = 1 + rng.below(8);
+    for _ in 0..flips {
+        if buf.is_empty() {
+            break;
+        }
+        let i = rng.below(buf.len() as u64) as usize;
+        buf[i] ^= 1 << rng.below(8);
+    }
+    if rng.below(8) == 0 && !buf.is_empty() {
+        let cut = rng.below(buf.len() as u64) as usize;
+        buf.truncate(cut);
+    }
+    buf
 }

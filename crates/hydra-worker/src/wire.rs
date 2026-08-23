@@ -41,6 +41,13 @@ pub enum WireError {
     /// allocated. Maps to `ErrCode::ERR_LIMIT_EXCEEDED`.
     #[error("{what} length {value} exceeds cap {cap}")]
     LimitExceeded { what: &'static str, value: u64, cap: u64 },
+    /// **Audit C3 / M4.** A boundary tensor's *declared* shape and its *bytes* disagree, or the
+    /// shape is one v1 does not serve. Raised at decode, **before** the bytes are copied into a
+    /// `Vec<f32>` and long before they reach the FFI — the engine must never be the component that
+    /// discovers a frame lied about its own dimensions. `expected` is what the declaration implies,
+    /// `got` is what the frame actually carried.
+    #[error("{what}: expected {expected}, got {got}")]
+    Shape { what: &'static str, expected: u64, got: u64 },
 }
 
 /// The stable part of the F1 fence tuple — one session's identity. Constant in v1 (spec §1.4).
@@ -110,12 +117,18 @@ pub enum Msg {
     /// `APPLY_TOKEN` (C -> S1). `no_sample` teacher-forces (NO_SAMPLE) per spec §3.
     ApplyToken { input_pos: i64, token_id: u32, no_sample: bool },
     /// `FWD` (Si -> Si+1): the boundary residual for `n_positions` positions, f32 across the FFI.
-    Fwd { first_input_pos: i64, no_sample: bool, activations: Vec<f32> },
+    ///
+    /// **Audit C3:** the declared shape travels with the data. `decode` has already proven
+    /// `activations.len() == n_positions × n_embd` (and `n_positions == 1`, M4); the worker still
+    /// cross-checks `n_embd` against the **engine's** width before the FFI, because the codec has no
+    /// engine and a self-consistent frame can still describe a model this stage does not hold.
+    Fwd { first_input_pos: i64, no_sample: bool, n_positions: u16, n_embd: u32, activations: Vec<f32> },
     /// `APPLIED_ACK` — `output_checksum` carries the final-stage logits digest for the anchor.
     AppliedAck { cumulative_input_pos: i64, output_checksum: Vec<u8> },
     /// `BOUNDARY_COPY` (Si -> durability target): a boundary residual chunk copied for durable D1
     /// recovery. `boundary_id` is the edge index i (between Si and Si+1); `chunk_id` sequences chunks.
-    BoundaryCopy { boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: Vec<f32> },
+    /// Carries its declared shape like `Fwd` (audit C3; same parser class, rule 17).
+    BoundaryCopy { boundary_id: u32, first_input_pos: i64, chunk_id: u32, n_positions: u16, n_embd: u32, activations: Vec<f32> },
     /// `DURABILITY_ACK` — the durability target has made boundary `boundary_id` durable through
     /// `durable_through_input_pos` (the R3′ release condition, spec §5).
     DurabilityAck { boundary_id: u32, durable_through_input_pos: i64, storage_generation: u64 },
@@ -248,7 +261,26 @@ fn capped_bytes(v: flatbuffers::Vector<'_, u8>, what: &'static str, cap: u32) ->
 ///   `I8_BLOCKQ` is refused, a frame carrying `block_scales` is *by definition* malformed — and
 ///   accepting-and-ignoring it would leave a field a future peer could use to smuggle state past a
 ///   build that does not understand it.
-fn check_boundary_tensor(t: proto::Tensor<'_>, what: &'static str) -> Result<(), WireError> {
+///
+/// # Audit C3 — the length/shape cross-check, and where it sits
+///
+/// **The finding:** A `Tensor` declares `dims`
+/// (row-major) and a body declares `n_positions`; the bytes are a third, independent claim. Before
+/// this check, `decode` dropped both declarations on the floor and let the *byte count* define the
+/// shape — the engine derived `n = len / n_embd`, so a frame carrying two positions' worth of
+/// bytes under `n_positions = 1` was applied as two positions, and a trailing byte count that was
+/// not a multiple of four was silently truncated by `chunks_exact`. The FFI was the first and only
+/// component that ever compared a declaration to a length, and it compared the wrong two things.
+///
+/// The check here is engine-free (the codec owns no `n_embd`), so it proves **internal**
+/// consistency: `dims == [n_positions, n_embd]`, `n_embd ≥ 1`, `data.len() == n_positions × 4 ×
+/// n_embd`. The worker then proves the **external** half — declared `n_embd` equals the engine's,
+/// `n_positions ≤ n_batch` (H7) — before the tensor crosses the FFI. Caps run first (a cap is about
+/// allocation; a shape is about meaning, and an oversized frame should be refused as oversized).
+///
+/// **M4:** `n_positions == 1`. v1's pipeline is position-at-a-time by construction (every encoder
+/// in this crate writes `1`); a peer declaring more is speaking a protocol this build does not run.
+fn check_boundary_tensor(t: proto::Tensor<'_>, n_positions: u16, what: &'static str) -> Result<u32, WireError> {
     if t.dtype() == proto::DType::I8_BLOCKQ {
         return Err(WireError::ReservedInUse("DType::I8_BLOCKQ"));
     }
@@ -270,7 +302,36 @@ fn check_boundary_tensor(t: proto::Tensor<'_>, what: &'static str) -> Result<(),
             cap: hydra_proto::limits::MAX_TENSOR_BYTES as u64,
         });
     }
-    Ok(())
+    if !hydra_proto::limits::check_positions(n_positions as u32).is_ok() {
+        return Err(WireError::LimitExceeded {
+            what: "n_positions",
+            value: n_positions as u64,
+            cap: hydra_proto::limits::MAX_POSITIONS_PER_FRAME as u64,
+        });
+    }
+    // M4: exactly one position per boundary frame in v1.
+    if n_positions != 1 {
+        return Err(WireError::Shape { what: "n_positions (v1 carries exactly one position per boundary)", expected: 1, got: n_positions as u64 });
+    }
+    // C3: dims must be the two-dimensional `[n_positions, n_embd]` and agree with both the body's
+    // declaration and the byte count. A one-dimensional `[len]` (what `encode_fwd` wrote before
+    // C3) is refused too: a shape that cannot be cross-checked is not a shape.
+    let dims = t.dims();
+    if dims.len() != 2 {
+        return Err(WireError::Shape { what: "tensor dims rank", expected: 2, got: dims.len() as u64 });
+    }
+    let (d0, d1) = (dims.get(0) as u64, dims.get(1) as u64);
+    if d0 != n_positions as u64 {
+        return Err(WireError::Shape { what: "tensor dims[0] vs n_positions", expected: n_positions as u64, got: d0 });
+    }
+    if d1 == 0 {
+        return Err(WireError::Shape { what: "tensor dims[1] (n_embd)", expected: 1, got: 0 });
+    }
+    let expected_bytes = d0 * 4 * d1; // fits: d0 ≤ 1024, d1 < 2^32
+    if n != expected_bytes {
+        return Err(WireError::Shape { what: "tensor bytes vs declared n_positions × 4 × n_embd", expected: expected_bytes, got: n });
+    }
+    Ok(d1 as u32)
 }
 
 fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireError> {
@@ -286,18 +347,13 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         }
         Body::Fwd => {
             let f = frame.body_as_fwd().ok_or(WireError::Malformed("Fwd".into()))?;
-            check_boundary_tensor(f.activations(), "Fwd activations")?;
-            if !hydra_proto::limits::check_positions(f.n_positions() as u32).is_ok() {
-                return Err(WireError::LimitExceeded {
-                    what: "Fwd n_positions",
-                    value: f.n_positions() as u64,
-                    cap: hydra_proto::limits::MAX_POSITIONS_PER_FRAME as u64,
-                });
-            }
+            let n_embd = check_boundary_tensor(f.activations(), f.n_positions(), "Fwd activations")?;
             let t = f.activations();
             Ok(Msg::Fwd {
                 first_input_pos: f.first_input_pos(),
                 no_sample: f.policy() == proto::SamplePolicy::NO_SAMPLE,
+                n_positions: f.n_positions(),
+                n_embd,
                 activations: bytes_to_f32_le(t.data().bytes()),
             })
         }
@@ -313,12 +369,14 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         }
         Body::BoundaryCopy => {
             let b = frame.body_as_boundary_copy().ok_or(WireError::Malformed("BoundaryCopy".into()))?;
-            check_boundary_tensor(b.activations(), "BoundaryCopy activations")?;
+            let n_embd = check_boundary_tensor(b.activations(), b.n_positions(), "BoundaryCopy activations")?;
             let t = b.activations();
             Ok(Msg::BoundaryCopy {
                 boundary_id: b.boundary_id(),
                 first_input_pos: b.first_input_pos(),
                 chunk_id: b.chunk_id(),
+                n_positions: b.n_positions(),
+                n_embd,
                 activations: bytes_to_f32_le(t.data().bytes()),
             })
         }
@@ -509,7 +567,8 @@ pub fn encode_fwd(fence: &SessionFence, epoch: Epoch, first_input_pos: i64, no_s
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let data = fbb.create_vector(&f32_to_bytes_le(activations));
-    let dims = fbb.create_vector(&[activations.len() as u32]);
+    // C3: the declared shape is `[n_positions, n_embd]`, cross-checked against the bytes on decode.
+    let dims = fbb.create_vector(&[1u32, activations.len() as u32]);
     let tensor = proto::Tensor::create(
         &mut fbb,
         &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
@@ -549,7 +608,8 @@ pub fn encode_boundary_copy(fence: &SessionFence, epoch: Epoch, boundary_id: u32
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: 0, stage_generation: 0 });
     let data = fbb.create_vector(&f32_to_bytes_le(activations));
-    let dims = fbb.create_vector(&[activations.len() as u32]);
+    // C3: the declared shape is `[n_positions, n_embd]`, cross-checked against the bytes on decode.
+    let dims = fbb.create_vector(&[1u32, activations.len() as u32]);
     let tensor = proto::Tensor::create(
         &mut fbb,
         &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },

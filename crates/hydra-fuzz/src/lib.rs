@@ -102,16 +102,22 @@ pub enum Target {
     /// slicing), but "clean by construction" is a claim, and rule 17 asks for a fuzz target rather
     /// than a claim.
     WalRecord,
+    /// `hydra_coordinator::boundary_store::decode_boundary_record` — a `BOUNDARY_COPY` record read
+    /// back from the boundary store for a D1 recovery replay. Added by audit C3 under rule 17: the
+    /// boundary-tensor shape cross-check was fixed on the wire, and the same tensor is parsed from
+    /// the **disk** by this function — a class fixed in one parser and left in another is not fixed.
+    BoundaryRecord,
 }
 
 impl Target {
-    pub const ALL: [Target; 6] = [
+    pub const ALL: [Target; 7] = [
         Target::Gguf,
         Target::FrameHeader,
         Target::WireBody,
         Target::Manifest,
         Target::Bootstrap,
         Target::WalRecord,
+        Target::BoundaryRecord,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -121,6 +127,7 @@ impl Target {
             Target::Manifest => "manifest",
             Target::Bootstrap => "bootstrap",
             Target::WalRecord => "wal-record",
+            Target::BoundaryRecord => "boundary-record",
         }
     }
     pub fn parse(name: &str) -> Option<Target> {
@@ -151,6 +158,7 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
         Target::Manifest => gen::manifest_case(&mut rng),
         Target::Bootstrap => gen::bootstrap_case(&mut rng),
         Target::WalRecord => gen::wal_record_case(&mut rng),
+        Target::BoundaryRecord => gen::boundary_record_case(&mut rng),
     };
     let input_len = input.len();
 
@@ -216,6 +224,15 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
                 assert_eq!(payload.len(), header.payload_len as usize, "payload/header disagree");
             }
         }
+        Target::BoundaryRecord => {
+            // A record that parses must be shape-consistent by C3's rule: one position, and a
+            // float count equal to the declared n_embd. A parser that returns a boundary whose
+            // length disagrees with what it claimed to check has moved the defect, not fixed it.
+            if let Ok(b) = hydra_coordinator::boundary_store::decode_boundary_record(&input) {
+                let bc = flatbuffers_root_n_embd(&input);
+                assert_eq!(Some(b.activations.len() as u64), bc, "decoded length disagrees with declared n_embd");
+            }
+        }
     }));
 
     result.err().map(|payload| Crash {
@@ -225,6 +242,13 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
         input_len,
         message: panic_message(payload),
     })
+}
+
+/// The declared `dims[1]` of an accepted boundary record (re-read independently of the decoder).
+fn flatbuffers_root_n_embd(input: &[u8]) -> Option<u64> {
+    let bc = flatbuffers::root::<hydra_proto::proto::BoundaryCopy>(input).ok()?;
+    let dims = bc.activations().dims();
+    (dims.len() == 2).then(|| dims.get(1) as u64)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {

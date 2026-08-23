@@ -9,7 +9,10 @@ rust-version.workspace = true
 #   * `hydra-modelsvc` — GGUF, i.e. a downloaded community model file (report Addendum 2 §D1);
 #   * `hydra-proto`    — the transport frame header, before any payload is allocated;
 #   * `hydra-worker`   — the FlatBuffers frame body + the F1 fence, and the bootstrap blob;
-#   * `hydra-wal`      — the on-disk record framing.
+#   * `hydra-wal`      — the on-disk record framing;
+#   * `hydra-coordinator` — the BOUNDARY_COPY record payload read back from the boundary store
+#                        (audit C3, rule 17: a boundary tensor parsed from the DISK is the same
+#                        parser class as one parsed from the wire).
 # Standing rule 17: when a defect class is found in one parser, EVERY parser of untrusted input is
 # audited for it in the same wave and each becomes a target here. The dependency list is therefore
 # the enumeration — if a parser is missing from it, that is the finding.
@@ -19,3 +22,5 @@ hydra-modelsvc = { path = "../hydra-modelsvc" }
 hydra-proto = { path = "../hydra-proto" }
 hydra-worker = { path = "../hydra-worker" }
 hydra-wal = { path = "../hydra-wal" }
+hydra-coordinator = { path = "../hydra-coordinator" }
+flatbuffers.workspace = true

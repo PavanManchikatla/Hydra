@@ -117,6 +117,17 @@ fn the_bootstrap_parser_survives_a_seeded_hostile_corpus() {
 /// construction — but "clean by construction" is a claim, and rule 17 asks for a target rather than
 /// a claim. The oracle is the arithmetic and the self-consistency of any record it hands back.
 #[test]
+fn the_boundary_record_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::BoundaryRecord));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
+#[test]
 fn the_wal_record_parser_survives_a_seeded_hostile_corpus() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -144,6 +155,7 @@ fn the_generator_produces_varied_nonempty_inputs() {
                 Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
                 Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
                 Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
+                Target::BoundaryRecord => hydra_fuzz::gen::boundary_record_case(&mut rng),
             };
             total += input.len();
             lens.insert(input.len());
@@ -169,6 +181,7 @@ fn a_case_is_reproducible_from_seed_and_iteration_alone() {
                     Target::Manifest => hydra_fuzz::gen::manifest_case(&mut rng),
                     Target::Bootstrap => hydra_fuzz::gen::bootstrap_case(&mut rng),
                     Target::WalRecord => hydra_fuzz::gen::wal_record_case(&mut rng),
+                    Target::BoundaryRecord => hydra_fuzz::gen::boundary_record_case(&mut rng),
                 }
             };
             assert_eq!(build(iteration), build(iteration), "{} case {iteration} is not reproducible", target.name());

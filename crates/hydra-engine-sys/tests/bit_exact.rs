@@ -70,7 +70,7 @@ fn split_vs_unsplit_f32_bit_exact_through_crate_api() {
     // ---- shard B: layers [k, end), consume the boundary -> logits at the last position ----
     let split_logits = {
         let mut b = model.context(k, -1, false, n_ctx, n).expect("shard B ctx");
-        b.apply_boundary(&boundary, 0, None).expect("apply B");
+        b.apply_boundary(&boundary, toks.len() as i32, 0, None).expect("apply B");
         b.logits(n - 1).expect("split logits")
     };
 

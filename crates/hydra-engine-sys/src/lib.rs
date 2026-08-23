@@ -242,7 +242,7 @@ mod imp {
             if raw.is_null() {
                 return Err(EngineError { code: 3, what: "context init failed" });
             }
-            Ok(Context { raw, n_embd: self.n_embd, n_vocab: self.n_vocab, _model: std::marker::PhantomData })
+            Ok(Context { raw, n_embd: self.n_embd, n_vocab: self.n_vocab, n_ctx, n_batch, _model: std::marker::PhantomData })
         }
     }
 
@@ -257,6 +257,8 @@ mod imp {
         raw: *mut ffi::HydraContext,
         n_embd: i32,
         n_vocab: i32,
+        n_ctx: i32,
+        n_batch: i32,
         _model: std::marker::PhantomData<&'m Model>,
     }
 
@@ -269,20 +271,37 @@ mod imp {
             pos0: i32,
             boundary_out: Option<&mut [f32]>,
         ) -> Result<(), EngineError> {
-            self.apply(Some(tokens), None, pos0, tokens.len() as i32, boundary_out)
+            let n = i32::try_from(tokens.len()).map_err(|_| EngineError { code: 8, what: "token count does not fit i32" })?;
+            // M5 (engine side): a token id outside the vocabulary never crosses the FFI.
+            if let Some(&bad) = tokens.iter().find(|&&t| t < 0 || t >= self.n_vocab) {
+                let _ = bad;
+                return Err(EngineError { code: 8, what: "token id outside [0, n_vocab)" });
+            }
+            self.apply(Some(tokens), None, pos0, n, boundary_out)
         }
 
-        /// Apply an injected boundary residual (`n = boundary_in.len() / n_embd` positions).
+        /// Apply an injected boundary residual of **exactly** `n_positions` positions.
+        ///
+        /// **Audit C3:** `n_positions` is an explicit argument, never derived from
+        /// `boundary_in.len()`. Before C3 this computed `n = len / n_embd`, so the byte count
+        /// *defined* the position count and a frame that lied about its shape was applied as
+        /// whatever its length happened to divide into. The caller now states the shape it was
+        /// told, and the engine refuses the call if the data does not match it.
         pub fn apply_boundary(
             &mut self,
             boundary_in: &[f32],
+            n_positions: i32,
             pos0: i32,
             boundary_out: Option<&mut [f32]>,
         ) -> Result<(), EngineError> {
-            let n = boundary_in.len() / self.n_embd as usize;
-            self.apply(None, Some(boundary_in), pos0, n as i32, boundary_out)
+            self.apply(None, Some(boundary_in), pos0, n_positions, boundary_out)
         }
 
+        /// The bounds every apply is held to **before** the FFI (audit C3/H7): a position count in
+        /// `[1, n_batch]`, a position range inside `[0, n_ctx)`, and buffers of exactly
+        /// `n × n_embd`. These are the engine's own facts (`n_batch`, `n_ctx`, `n_embd` came from
+        /// the context/model), so this is where a network-declared shape finally meets ground
+        /// truth — the shim is never the first thing to find out.
         fn apply(
             &mut self,
             tokens: Option<&[i32]>,
@@ -291,9 +310,23 @@ mod imp {
             n: i32,
             boundary_out: Option<&mut [f32]>,
         ) -> Result<(), EngineError> {
+            if n < 1 {
+                return Err(EngineError { code: 8, what: "n_positions must be >= 1" });
+            }
+            if n > self.n_batch {
+                return Err(EngineError { code: 8, what: "n_positions exceeds n_batch (audit H7)" });
+            }
+            if pos0 < 0 || pos0.checked_add(n).map_or(true, |end| end > self.n_ctx) {
+                return Err(EngineError { code: 8, what: "position range escapes [0, n_ctx)" });
+            }
+            if let Some(t) = tokens {
+                if t.len() != n as usize {
+                    return Err(EngineError { code: 6, what: "tokens length != n_positions" });
+                }
+            }
             if let Some(b) = boundary_in {
                 if b.len() != (n as usize) * self.n_embd as usize {
-                    return Err(EngineError { code: 6, what: "boundary_in shape mismatch" });
+                    return Err(EngineError { code: 6, what: "boundary_in shape mismatch (len != n_positions × n_embd)" });
                 }
             }
             let out_ptr = match &boundary_out {
@@ -316,6 +349,19 @@ mod imp {
                 )
             };
             check(code)
+        }
+
+        pub fn n_embd(&self) -> i32 {
+            self.n_embd
+        }
+        pub fn n_vocab(&self) -> i32 {
+            self.n_vocab
+        }
+        pub fn n_ctx(&self) -> i32 {
+            self.n_ctx
+        }
+        pub fn n_batch(&self) -> i32 {
+            self.n_batch
         }
 
         /// Retained (unsampled) logits at `at_pos`. Sampling is the caller's job (I14).
@@ -394,7 +440,19 @@ mod imp {
         pub fn apply_tokens(&mut self, _t: &[i32], _p: i32, _o: Option<&mut [f32]>) -> Result<(), EngineError> {
             Err(EngineError::unavailable())
         }
-        pub fn apply_boundary(&mut self, _b: &[f32], _p: i32, _o: Option<&mut [f32]>) -> Result<(), EngineError> {
+        pub fn n_embd(&self) -> i32 {
+            0
+        }
+        pub fn n_vocab(&self) -> i32 {
+            0
+        }
+        pub fn n_ctx(&self) -> i32 {
+            0
+        }
+        pub fn n_batch(&self) -> i32 {
+            0
+        }
+        pub fn apply_boundary(&mut self, _b: &[f32], _n: i32, _p: i32, _o: Option<&mut [f32]>) -> Result<(), EngineError> {
             Err(EngineError::unavailable())
         }
         pub fn logits(&mut self, _at: i32) -> Result<Vec<f32>, EngineError> {

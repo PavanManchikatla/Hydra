@@ -288,7 +288,14 @@ async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<M
         tokio::select! {
             maybe = rx.recv() => match maybe {
                 Some(tok) => {
-                    sess.push_sampled(tok);
+                    // Audit M5: an out-of-vocabulary token from S_P is an accident under the
+                    // honest-worker assumption, and an accident must not become durable. The
+                    // generation ends here — loudly, with nothing committed for this token.
+                    if let Err(e) = sess.push_sampled(tok) {
+                        eprintln!("hydra-coordinator: generation aborted: {e}");
+                        st.lock().unwrap().done = true;
+                        break;
+                    }
                     if let Ok(CommitOutcome::Committed(evs)) = sess.try_commit_by_count() {
                         publish(&st, evs);
                     }

@@ -47,7 +47,7 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
             let mut store = BoundaryStore::create(&path, [1; 16], [2; 16]).expect("store");
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations, .. })) = wire::decode(&frame.payload, &fence) {
                     let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).expect("persist");
                     let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                     if conn.send(0, &ack).await.is_err() {

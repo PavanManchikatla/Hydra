@@ -66,12 +66,11 @@ jobs:
       - name: Build the fuzz driver (release)
         run: cargo build --release -p hydra-fuzz --bin hydra-fuzz
 
-      # `--target all` now covers SIX parsers — every parser of untrusted input in the tree, per
-      # standing rule 17 (a defect class fixed in one parser and left in another is not fixed). The
-      # classify step requires ALL SIX to report, so a silently-dropped target is INCONCLUSIVE.
-      # `--target all` now covers six parsers (manifest/bootstrap/wal-record added by audit), so a fixed
-      # --seconds buys proportionally less time per target. The classify step below requires ALL
-      # FOUR to report, so a silently-dropped target is INCONCLUSIVE rather than a pass.
+      # `--target all` now covers SEVEN parsers — every parser of untrusted input in the tree, per
+      # standing rule 17 (a defect class fixed in one parser and left in another is not fixed):
+      # manifest/bootstrap/wal-record added by audit Wave 1a, boundary-record by Wave 1c (C3). A
+      # fixed --seconds buys proportionally less time per target. The classify step below requires
+      # ALL SEVEN to report, so a silently-dropped target is INCONCLUSIVE rather than a pass.
       - name: Fuzz (shard ${{ matrix.shard }}, distinct seed)
         env:
           SECONDS_PER_SHARD: ${{ github.event.inputs.seconds || '900' }}
@@ -98,7 +97,7 @@ jobs:
             exit 1
           fi
           # Every target must have reported, or the run covered less than it claims.
-          for t in gguf frame-header wire-body manifest bootstrap wal-record; do
+          for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
           done
           if grep -qE '^CRASH ' "$LOG"; then

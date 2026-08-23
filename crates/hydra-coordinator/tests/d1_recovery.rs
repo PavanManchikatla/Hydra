@@ -139,6 +139,9 @@ impl PieceSource for StubPieces {
     fn piece(&self, token: u32) -> Vec<u8> {
         format!("<{token}>").into_bytes()
     }
+    fn n_vocab(&self) -> u32 {
+        1 << 20
+    }
 }
 
 /// Drive a session over a fresh commit-stream file: commit `tokens` (as output positions
@@ -149,7 +152,7 @@ fn run_session(path: &std::path::Path, prompt: &[u32], tokens: &[u32], k: usize)
     let mut s = Session::new(cs, wal_fence(), Box::new(StubPieces), k, 1_000_000);
     let mut events = Vec::new();
     for (pos, &tok) in tokens.iter().enumerate() {
-        s.push_sampled(SampledToken { output_pos: pos as i64, token_id: tok, snapshot: snapshot(1, pos as i64) });
+        s.push_sampled(SampledToken { output_pos: pos as i64, token_id: tok, snapshot: snapshot(1, pos as i64) }).unwrap();
         if let hydra_coordinator::CommitOutcome::Committed(evs) = s.try_commit_by_count().unwrap() {
             events.extend(evs.into_iter().map(|e| (e.id, e.data)));
         }
@@ -180,7 +183,7 @@ fn sse_ids_are_continuous_and_bytes_identical_across_a_reconstruction() {
         cs.append_initial_commit(&wal_fence(), &admission(&prompt), &snapshot(1, -1), 1).unwrap();
         let mut s = Session::new(cs, wal_fence(), Box::new(StubPieces), k, 1_000_000);
         for pos in 0..6i64 {
-            s.push_sampled(SampledToken { output_pos: pos, token_id: tokens[pos as usize], snapshot: snapshot(1, pos) });
+            s.push_sampled(SampledToken { output_pos: pos, token_id: tokens[pos as usize], snapshot: snapshot(1, pos) }).unwrap();
             let _ = s.try_commit_by_count().unwrap();
         }
         s.finish().unwrap();
@@ -201,14 +204,14 @@ fn sse_ids_are_continuous_and_bytes_identical_across_a_reconstruction() {
     let mut events_rec = Vec::new();
     // Replay the durable prefix (reconstruct the pre-kill events identically).
     for (pos, tok) in state.generated_tokens.iter().copied() {
-        s.push_sampled(SampledToken { output_pos: pos, token_id: tok, snapshot: snapshot(1, pos) });
+        s.push_sampled(SampledToken { output_pos: pos, token_id: tok, snapshot: snapshot(1, pos) }).unwrap();
         if let hydra_coordinator::CommitOutcome::Committed(evs) = s.try_commit_by_count().unwrap() {
             events_rec.extend(evs.into_iter().map(|e| (e.id, e.data)));
         }
     }
     // Continue past the kill with the remaining tokens.
     for pos in 6..tokens.len() as i64 {
-        s.push_sampled(SampledToken { output_pos: pos, token_id: tokens[pos as usize], snapshot: snapshot(1, pos) });
+        s.push_sampled(SampledToken { output_pos: pos, token_id: tokens[pos as usize], snapshot: snapshot(1, pos) }).unwrap();
         if let hydra_coordinator::CommitOutcome::Committed(evs) = s.try_commit_by_count().unwrap() {
             events_rec.extend(evs.into_iter().map(|e| (e.id, e.data)));
         }

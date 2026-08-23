@@ -31,7 +31,8 @@ class were reached from the *disk*, which is exactly why the narrower reading wo
 | **Bootstrap blob** — `hydra-worker::bootstrap` | whatever provisioned the worker | ✅ `Reader::reserve_for` (**4th instance — audit L2**) | ✅ `bootstrap` |
 | **WAL record** — `hydra-wal::record::read_record` | the coordinator's own disk | ✅ **by construction** — borrows, never allocates; length-checked before every slice | ✅ `wal-record` |
 | **Frame header** — `hydra-proto::framing` | the network, pre-allocation | ✅ `check_frame_len` before the payload buffer exists | ✅ `frame-header` |
-| **Wire body** — `hydra-worker::wire` | the network, post-header | ✅ `capped_bytes` + `check_tensor_len` / `check_positions` (M4·1) | ✅ `wire-body` |
+| **Wire body** — `hydra-worker::wire` | the network, post-header | ✅ `capped_bytes` + `check_tensor_len` / `check_positions` (M4·1); **boundary shape cross-check** (audit C3, 1c) | ✅ `wire-body` (a `BOUNDARY_COPY` seed added by C3) |
+| **Boundary-store record** — `hydra-coordinator::boundary_store::decode_boundary_record` | the coordinator's own disk (a D1 recovery replay) | ✅ borrows the WAL payload; FlatBuffers-verified; **the same C3 shape check as the wire** | ✅ `boundary-record` (**added 2026-08-23, audit C3** — a boundary tensor parsed from the disk is the same parser class as one parsed from the wire, and this sweep had not listed it) |
 | **HTTP request** — `hydra-coordinator::server` | a LAN client / a browser | ⚠️ **see below** | ⏳ **justified for now — Wave 4** |
 
 All three `reserve_for` implementations are **deliberately spelled the same way** in three different

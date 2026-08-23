@@ -111,7 +111,7 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
             let Ok(a) = listener.accept().await else { return };
             let mut conn = a.conn;
             while let Ok(frame) = conn.recv().await {
-                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &fence) {
+                if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations, .. })) = wire::decode(&frame.payload, &fence) {
                     let d = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).unwrap_or(-1);
                     if conn.send(0, &wire::encode_durability_ack(&fence, view.epoch, boundary_id, d, 0)).await.is_err() { break; }
                 }

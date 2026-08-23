@@ -50,11 +50,12 @@ fn snapshot(pos: i64) -> Vec<u8> {
 
 /// A durability sink that succeeds (tracks length) — a working `fdatasync`.
 #[derive(Default)]
-struct OkDisk { len: u64 }
+struct OkDisk { len: u64, appends: Arc<AtomicUsize> }
 impl Durability for OkDisk {
     fn append(&mut self, _rt: u16, _fl: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError> {
         let off = self.len;
         self.len += payload.len() as u64;
+        self.appends.fetch_add(1, Ordering::SeqCst);
         Ok(off)
     }
     fn durable_len(&self) -> u64 { self.len }
@@ -75,6 +76,9 @@ impl PieceSource for MapPieces {
     fn piece(&self, token: u32) -> Vec<u8> {
         self.0.get(&token).cloned().unwrap_or_else(|| vec![token as u8])
     }
+    fn n_vocab(&self) -> u32 {
+        1 << 20
+    }
 }
 
 fn session(disk: Box<dyn Durability>, pieces: Box<dyn PieceSource>, k: usize, cap: usize) -> Session {
@@ -87,7 +91,7 @@ fn session(disk: Box<dyn Durability>, pieces: Box<dyn PieceSource>, k: usize, ca
 fn emit_after_commit_gate_holds_by_absence() {
     let mut s = session(Box::new(FailingDisk), Box::new(MapPieces(HashMap::new())), 4, 100);
     for pos in 0..4 {
-        s.push_sampled(SampledToken { output_pos: pos, token_id: b'x' as u32, snapshot: snapshot(pos) });
+        s.push_sampled(SampledToken { output_pos: pos, token_id: b'x' as u32, snapshot: snapshot(pos) }).unwrap();
     }
     // The durable append fails → the commit errors → NOTHING is emitted.
     let r = s.try_commit_by_count();
@@ -105,13 +109,13 @@ fn multibyte_glyph_straddling_a_commit_boundary_emits_whole() {
     map.insert(2u32, vec![0x98, 0x80]);
     let mut s = session(Box::new(OkDisk::default()), Box::new(MapPieces(map)), 1, 100);
 
-    s.push_sampled(SampledToken { output_pos: 0, token_id: 1, snapshot: snapshot(0) });
+    s.push_sampled(SampledToken { output_pos: 0, token_id: 1, snapshot: snapshot(0) }).unwrap();
     let out = s.try_commit_by_count().unwrap();
     assert!(matches!(out, CommitOutcome::Committed(ref e) if e.is_empty()), "commit A durable but emits no bytes (mid-glyph)");
     assert_eq!(s.durable_pos(), 0, "the token IS durable");
     assert_eq!(s.last_event_id(), 0, "…but nothing emitted yet — the glyph is incomplete");
 
-    s.push_sampled(SampledToken { output_pos: 1, token_id: 2, snapshot: snapshot(1) });
+    s.push_sampled(SampledToken { output_pos: 1, token_id: 2, snapshot: snapshot(1) }).unwrap();
     let out = s.try_commit_by_count().unwrap();
     match out {
         CommitOutcome::Committed(evs) => {
@@ -127,7 +131,7 @@ fn multibyte_glyph_straddling_a_commit_boundary_emits_whole() {
 fn deadline_path_commits_a_sub_k_group() {
     let mut s = session(Box::new(OkDisk::default()), Box::new(MapPieces(HashMap::new())), 8, 100);
     for (pos, tok) in [(0i64, b'h'), (1, b'i')] {
-        s.push_sampled(SampledToken { output_pos: pos, token_id: tok as u32, snapshot: snapshot(pos) });
+        s.push_sampled(SampledToken { output_pos: pos, token_id: tok as u32, snapshot: snapshot(pos) }).unwrap();
     }
     assert!(matches!(s.try_commit_by_count().unwrap(), CommitOutcome::Nothing), "below k, count trigger does not fire");
     match s.commit_on_deadline().unwrap() {
@@ -141,11 +145,11 @@ fn deadline_path_commits_a_sub_k_group() {
 fn backpressure_pauses_at_the_commit_stage() {
     let mut s = session(Box::new(OkDisk::default()), Box::new(MapPieces(HashMap::new())), 1, 2); // cap = 2
     for (pos, tok) in [(0i64, b'a'), (1, b'b')] {
-        s.push_sampled(SampledToken { output_pos: pos, token_id: tok as u32, snapshot: snapshot(pos) });
+        s.push_sampled(SampledToken { output_pos: pos, token_id: tok as u32, snapshot: snapshot(pos) }).unwrap();
         assert!(matches!(s.try_commit_by_count().unwrap(), CommitOutcome::Committed(_)));
     }
     // Buffer now full (2 emitted, undrained). The next commit PAUSES rather than emitting ahead.
-    s.push_sampled(SampledToken { output_pos: 2, token_id: b'c' as u32, snapshot: snapshot(2) });
+    s.push_sampled(SampledToken { output_pos: 2, token_id: b'c' as u32, snapshot: snapshot(2) }).unwrap();
     assert!(matches!(s.try_commit_by_count().unwrap(), CommitOutcome::Paused), "full buffer pauses the commit stage");
     assert_eq!(s.durable_pos(), 1, "the paused token is not committed");
 
@@ -432,4 +436,38 @@ async fn a_refused_request_starts_no_session_and_no_generation() {
     let (ok, _) = post_raw(&app, &with_auth(&[]), "{}").await;
     assert_eq!(ok, StatusCode::OK);
     assert_eq!(calls.load(Ordering::SeqCst), 1, "control: an admitted request does start one");
+}
+
+/// **Audit M5 — `token_id < n_vocab` is validated BEFORE the token becomes durable.**
+///
+/// A `SAMPLED` frame is network input. Before M5 an out-of-vocabulary id went straight into the
+/// group buffer, then into a `GENERATION_COMMIT` record, then through `fdatasync` — and the first
+/// component to notice was whichever later read it. The assertion here is about *absence*, the
+/// same way the emit-after-commit gate is proven: after the refusal, the group buffer is empty,
+/// the disk has seen **zero** appends, `durable_pos` has not moved, and no event exists. And the
+/// control afterwards shows the session is still usable — a refusal is not a poisoning.
+#[test]
+fn an_out_of_vocabulary_token_is_refused_before_anything_is_written() {
+    let disk = OkDisk::default();
+    let appends = disk.appends.clone();
+    let n_vocab = MapPieces(HashMap::new()).n_vocab();
+    let mut s = session(Box::new(disk), Box::new(MapPieces(HashMap::new())), 1, 100);
+
+    let err = s.push_sampled(SampledToken { output_pos: 0, token_id: n_vocab, snapshot: snapshot(0) }).unwrap_err();
+    assert!(
+        matches!(err, hydra_coordinator::CommitError::TokenOutOfVocab { output_pos: 0, token_id, n_vocab: nv } if token_id == n_vocab && nv == n_vocab),
+        "got {err:?}"
+    );
+    assert_eq!(s.buffered(), 0, "a refused token leaves no trace in the group buffer");
+    assert_eq!(appends.load(Ordering::SeqCst), 0, "nothing reached the disk");
+    assert_eq!(s.durable_pos(), -1, "durability did not advance");
+    assert_eq!(s.last_event_id(), 0, "no event exists");
+    // `u32::MAX` — the value a `SAMPLED` forger (or a bit-flip) most plausibly produces.
+    assert!(s.push_sampled(SampledToken { output_pos: 0, token_id: u32::MAX, snapshot: snapshot(0) }).is_err());
+
+    // Control: the last legal id commits normally, so the bound is `< n_vocab` and not `< n_vocab - 1`.
+    s.push_sampled(SampledToken { output_pos: 0, token_id: n_vocab - 1, snapshot: snapshot(0) }).unwrap();
+    assert!(matches!(s.try_commit_by_count().unwrap(), CommitOutcome::Committed(_)));
+    assert_eq!(s.durable_pos(), 0);
+    assert_eq!(appends.load(Ordering::SeqCst), 1);
 }

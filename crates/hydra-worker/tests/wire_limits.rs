@@ -64,11 +64,25 @@ fn finish(
     fbb.finished_data().to_vec()
 }
 
-fn fwd(fence: &SessionFence, tensor_bytes: usize, n_positions: u16) -> Vec<u8> {
+/// The dev model's boundary width, the one every engine-gated test uses.
+const N_EMBD: usize = 896;
+
+/// A **self-consistent** FWD: `n_positions` positions of `n_embd` floats, `dims = [n_positions,
+/// n_embd]`, `data = n_positions × 4 × n_embd` bytes. The helper builds the only shape C3 admits
+/// so each test below changes exactly one thing; the raw builder [`fwd_raw`] exists for the
+/// tests whose *point* is an inconsistent frame.
+fn fwd(fence: &SessionFence, n_positions: u16, n_embd: usize) -> Vec<u8> {
+    let bytes = n_positions as usize * 4 * n_embd;
+    fwd_raw(fence, bytes, &[n_positions as u32, n_embd as u32], n_positions)
+}
+
+/// A FWD with caller-chosen byte count, `dims`, and `n_positions` — the three independent claims a
+/// frame makes about its own shape, each settable on its own.
+fn fwd_raw(fence: &SessionFence, tensor_bytes: usize, dims: &[u32], n_positions: u16) -> Vec<u8> {
     let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(tensor_bytes + 4096);
     let wf = build_fence(&mut fbb, fence);
     let data = fbb.create_vector::<u8>(&vec![0u8; tensor_bytes]);
-    let dims = fbb.create_vector::<u32>(&[1, (tensor_bytes / 4) as u32]);
+    let dims = fbb.create_vector::<u32>(dims);
     let t = proto::Tensor::create(
         &mut fbb,
         &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
@@ -113,10 +127,13 @@ fn an_oversized_tensor_is_refused_before_it_is_copied() {
     let fence = SessionFence::dev(0x51);
 
     // Control first: a normal boundary decodes, so a refusal below is caused by the size.
-    assert!(wire::decode(&fwd(&fence, 3584, 1), &fence).is_ok(), "control: an ordinary boundary decodes");
+    assert!(wire::decode(&fwd(&fence, 1, N_EMBD), &fence).is_ok(), "control: an ordinary boundary decodes");
 
-    let over = MAX_TENSOR_BYTES as usize + 4;
-    let err = wire::decode(&fwd(&fence, over, 1), &fence).unwrap_err();
+    // One position, one float over the cap — the frame is shape-consistent (dims agree with the
+    // bytes), so the ONLY thing wrong with it is its size, and the cap must be what refuses it.
+    let over_floats = MAX_TENSOR_BYTES as usize / 4 + 1;
+    let over = over_floats * 4;
+    let err = wire::decode(&fwd(&fence, 1, over_floats), &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::LimitExceeded { what: "Fwd activations", value: over as u64, cap: MAX_TENSOR_BYTES as u64 },
@@ -125,7 +142,7 @@ fn an_oversized_tensor_is_refused_before_it_is_copied() {
 
     // Exactly at the cap is admitted: an off-by-one that refuses legal traffic is also a defect.
     assert!(
-        wire::decode(&fwd(&fence, MAX_TENSOR_BYTES as usize, 1), &fence).is_ok(),
+        wire::decode(&fwd(&fence, 1, MAX_TENSOR_BYTES as usize / 4), &fence).is_ok(),
         "a tensor exactly at the cap is legal"
     );
 }
@@ -133,20 +150,137 @@ fn an_oversized_tensor_is_refused_before_it_is_copied() {
 /// `MAX_POSITIONS_PER_FRAME` (1024). `n_positions` is a `uint16`, so a peer can legally declare up
 /// to 65 535 — 64× the cap — in a frame whose *bytes* are unremarkable. This is the case where the
 /// frame cap gives no protection at all.
+///
+/// # ⚑ THE BLIND ORACLE THIS TEST USED TO BE (audit C3, fixed 2026-08-23)
+///
+/// Until C3 this test's **control** asserted that a frame with **3 584 tensor bytes** (one
+/// position of the dev model's 896 floats) declaring **`n_positions = 1024`** decodes OK —
+/// "at the cap is legal". It *enshrined* the exact length/shape inconsistency C3 forbids: the
+/// bytes said one position, the declaration said a thousand and twenty-four, and the codec was
+/// asserted correct for accepting both at once. The control did not merely fail to catch the
+/// defect; it would have **failed the fix** — any codec that cross-checked length against shape
+/// would have turned this test red, and the natural reading of a red control is "the fix broke
+/// decoding", not "the control was wrong".
+///
+/// **Which oracle was blind, and why:** the oracle here was "the cap check" and it was asked one
+/// question — *is `n_positions` ≤ 1024?* — with a fixture whose other two shape claims (bytes,
+/// `dims`) were chosen for convenience rather than consistency. An oracle that checks one of three
+/// mutually-constraining claims in isolation cannot express a violation of their *relationship*,
+/// so it cannot guard it, so its green meant nothing about it. This is the same shape as the
+/// checklist rows (§7.31) and M6's hard-coded simulator fsync: **a harness that cannot produce
+/// the failure it nominally guards.** The control now builds a consistent 1024-position frame
+/// (which M4 then refuses for being more than one position — see the next test — so the cap is
+/// asserted through the *order* of checks: caps before shape), and the inconsistency itself has
+/// its own tests below.
 #[test]
 fn an_oversized_position_count_is_refused() {
     let fence = SessionFence::dev(0x52);
-    assert!(wire::decode(&fwd(&fence, 3584, MAX_POSITIONS_PER_FRAME), &fence).is_ok(), "control: at the cap is legal");
 
-    let err = wire::decode(&fwd(&fence, 3584, MAX_POSITIONS_PER_FRAME + 1), &fence).unwrap_err();
+    // The over-cap frame is self-consistent in every respect but the cap — 1025 positions of
+    // 896 floats, dims and bytes agreeing — so the cap, and only the cap, is what refuses it.
+    let err = wire::decode(&fwd(&fence, MAX_POSITIONS_PER_FRAME + 1, N_EMBD), &fence).unwrap_err();
     assert_eq!(
         err,
         WireError::LimitExceeded {
-            what: "Fwd n_positions",
+            what: "n_positions",
             value: MAX_POSITIONS_PER_FRAME as u64 + 1,
             cap: MAX_POSITIONS_PER_FRAME as u64,
         }
     );
+
+    // At the cap the cap is satisfied, and the refusal that remains is M4's (one position in v1),
+    // NOT a cap refusal. This pins the check ORDER: a frame is refused as oversized before it is
+    // refused as mis-shaped, so an attacker learns the cheaper fact first and the codec never
+    // reasons about the shape of something it should not have admitted.
+    let err = wire::decode(&fwd(&fence, MAX_POSITIONS_PER_FRAME, N_EMBD), &fence).unwrap_err();
+    assert!(matches!(err, WireError::Shape { expected: 1, got: 1024, .. }), "got {err:?}");
+}
+
+/// **M4 — `n_positions == 1` in v1.** The pipeline is position-at-a-time by construction; every
+/// encoder in `hydra-worker` writes `1`. A peer declaring two positions — even with perfectly
+/// consistent bytes — is speaking a protocol this build does not run.
+#[test]
+fn more_than_one_position_per_boundary_is_refused_in_v1() {
+    let fence = SessionFence::dev(0x56);
+    assert!(wire::decode(&fwd(&fence, 1, N_EMBD), &fence).is_ok(), "control: one position decodes");
+    let err = wire::decode(&fwd(&fence, 2, N_EMBD), &fence).unwrap_err();
+    assert_eq!(err, WireError::Shape { what: "n_positions (v1 carries exactly one position per boundary)", expected: 1, got: 2 });
+    let err = wire::decode(&fwd(&fence, 0, N_EMBD), &fence).unwrap_err();
+    assert_eq!(err, WireError::Shape { what: "n_positions (v1 carries exactly one position per boundary)", expected: 1, got: 0 });
+}
+
+/// **C3 — `data.len() == n_positions × 4 × n_embd`, cross-checked at decode.** Each case changes
+/// exactly one of the three shape claims (bytes, `dims`, `n_positions`) against the control, so
+/// the refusal is attributable. Before C3 every one of these decoded, and the byte count alone
+/// decided how many positions the engine applied.
+#[test]
+fn a_boundary_whose_bytes_disagree_with_its_declared_shape_is_refused() {
+    let fence = SessionFence::dev(0x57);
+    let one = 4 * N_EMBD;
+    assert!(wire::decode(&fwd_raw(&fence, one, &[1, N_EMBD as u32], 1), &fence).is_ok(), "control");
+
+    // Two positions' worth of bytes under a one-position declaration: the pre-C3 silent
+    // "apply as two positions" case.
+    let err = wire::decode(&fwd_raw(&fence, 2 * one, &[1, N_EMBD as u32], 1), &fence).unwrap_err();
+    assert_eq!(
+        err,
+        WireError::Shape { what: "tensor bytes vs declared n_positions × 4 × n_embd", expected: one as u64, got: 2 * one as u64 }
+    );
+
+    // One byte short: the pre-C3 `chunks_exact` silent-truncation case.
+    let err = wire::decode(&fwd_raw(&fence, one - 1, &[1, N_EMBD as u32], 1), &fence).unwrap_err();
+    assert_eq!(
+        err,
+        WireError::Shape { what: "tensor bytes vs declared n_positions × 4 × n_embd", expected: one as u64, got: one as u64 - 1 }
+    );
+
+    // One byte over (not a multiple of four).
+    let err = wire::decode(&fwd_raw(&fence, one + 1, &[1, N_EMBD as u32], 1), &fence).unwrap_err();
+    assert!(matches!(err, WireError::Shape { .. }), "got {err:?}");
+
+    // `dims` disagrees with `n_positions`.
+    let err = wire::decode(&fwd_raw(&fence, one, &[2, N_EMBD as u32], 1), &fence).unwrap_err();
+    assert_eq!(err, WireError::Shape { what: "tensor dims[0] vs n_positions", expected: 1, got: 2 });
+
+    // A one-dimensional `[len]` — what `encode_fwd` itself wrote before C3 — is refused: a shape
+    // that cannot be cross-checked against a position count is not a shape.
+    let err = wire::decode(&fwd_raw(&fence, one, &[N_EMBD as u32], 1), &fence).unwrap_err();
+    assert_eq!(err, WireError::Shape { what: "tensor dims rank", expected: 2, got: 1 });
+
+    // A zero-width boundary.
+    let err = wire::decode(&fwd_raw(&fence, 0, &[1, 0], 1), &fence).unwrap_err();
+    assert_eq!(err, WireError::Shape { what: "tensor dims[1] (n_embd)", expected: 1, got: 0 });
+}
+
+/// The same class on the durability body (rule 17: a class is fixed in every parser in the same
+/// wave). `BOUNDARY_COPY` is what D1 recovery replays, so a lying shape here is a lying KV.
+#[test]
+fn a_boundary_copy_whose_bytes_disagree_with_its_declared_shape_is_refused() {
+    let fence = SessionFence::dev(0x58);
+    let build = |tensor_bytes: usize, dims: &[u32], n_positions: u16| -> Vec<u8> {
+        let mut fbb = flatbuffers::FlatBufferBuilder::with_capacity(tensor_bytes + 4096);
+        let wf = build_fence(&mut fbb, &fence);
+        let data = fbb.create_vector::<u8>(&vec![0u8; tensor_bytes]);
+        let dims = fbb.create_vector::<u32>(dims);
+        let t = proto::Tensor::create(
+            &mut fbb,
+            &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
+        );
+        let body = proto::BoundaryCopy::create(
+            &mut fbb,
+            &proto::BoundaryCopyArgs { boundary_id: 0, first_input_pos: 0, n_positions, chunk_id: 0, activations: Some(t) },
+        );
+        finish(fbb, wf, proto::Body::BoundaryCopy, body.as_union_value())
+    };
+    let one = 4 * N_EMBD;
+    assert!(wire::decode(&build(one, &[1, N_EMBD as u32], 1), &fence).is_ok(), "control");
+    assert!(matches!(wire::decode(&build(2 * one, &[1, N_EMBD as u32], 1), &fence).unwrap_err(), WireError::Shape { .. }));
+    assert!(matches!(wire::decode(&build(one, &[1, N_EMBD as u32], 2), &fence).unwrap_err(), WireError::Shape { .. }));
+    assert!(matches!(wire::decode(&build(one, &[N_EMBD as u32], 1), &fence).unwrap_err(), WireError::Shape { .. }));
+    assert!(matches!(
+        wire::decode(&build(one, &[1, N_EMBD as u32], MAX_POSITIONS_PER_FRAME + 1), &fence).unwrap_err(),
+        WireError::LimitExceeded { what: "n_positions", .. }
+    ));
 }
 
 /// `MAX_SNAPSHOT_BYTES` (1 MiB). Sampler snapshots are small by design (Philox key + counter +
@@ -250,8 +384,10 @@ fn wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches() {
         let (_, msg) = wire::decode(&payload, &fence)
             .unwrap_or_else(|e| panic!("a {n_embd}-wide FWD boundary must decode, got {e:?}"));
         match msg {
-            hydra_worker::wire::Msg::Fwd { activations, .. } => {
-                assert_eq!(activations.len(), n_embd, "the boundary must survive the round trip intact")
+            hydra_worker::wire::Msg::Fwd { activations, n_positions, n_embd: declared, .. } => {
+                assert_eq!(activations.len(), n_embd, "the boundary must survive the round trip intact");
+                // C3: the declared shape rides along, already proven against the bytes.
+                assert_eq!((n_positions, declared as usize), (1, n_embd));
             }
             other => panic!("expected Fwd for n_embd={n_embd}, got {other:?}"),
         }

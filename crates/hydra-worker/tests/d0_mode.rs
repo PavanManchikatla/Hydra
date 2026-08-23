@@ -41,7 +41,7 @@ fn spawn_counting_endpoint(server_cfg: rustls::ServerConfig, fence: SessionFence
             let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
                 match wire::decode(&frame.payload, &fence) {
-                    Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) => {
+                    Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations, .. })) => {
                         counter.fetch_add(1, Ordering::SeqCst);
                         let _ = (first_input_pos, chunk_id, activations);
                         let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, first_input_pos, 0);

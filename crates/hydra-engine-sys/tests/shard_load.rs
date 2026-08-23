@@ -94,7 +94,7 @@ fn shard_loaded_weights_are_bit_exact_with_the_unsplit_model() {
         let m1 = Model::load_shard(&s1, k, n_layer, 0).expect("load stage-1 shard");
         assert_eq!(m1.load_window(), Some((k, n_layer)));
         let mut b = m1.context(k, -1, false, n_ctx, n).expect("stage-1 ctx");
-        b.apply_boundary(&boundary, 0, None).expect("apply stage 1");
+        b.apply_boundary(&boundary, toks.len() as i32, 0, None).expect("apply stage 1");
         b.logits(n - 1).expect("stage-1 logits")
     };
 

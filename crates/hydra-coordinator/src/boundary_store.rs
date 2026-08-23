@@ -57,19 +57,8 @@ impl BoundaryStore {
     /// frontier advances **only after** the `fdatasync`'d append returns (structural emit-after-commit
     /// for the durability plane).
     pub fn append_boundary(&mut self, boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Result<i64, BoundaryError> {
-        let mut fbb = FlatBufferBuilder::new();
-        let data = fbb.create_vector(&f32_to_le(activations));
-        let dims = fbb.create_vector(&[activations.len() as u32]);
-        let tensor = proto::Tensor::create(
-            &mut fbb,
-            &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
-        );
-        let bc = proto::BoundaryCopy::create(
-            &mut fbb,
-            &proto::BoundaryCopyArgs { boundary_id, first_input_pos, n_positions: 1, chunk_id, activations: Some(tensor) },
-        );
-        fbb.finish(bc, None);
-        self.writer.append(rec_type::BOUNDARY_COPY, 0, fbb.finished_data())?;
+        let payload = encode_boundary_record(boundary_id, first_input_pos, chunk_id, activations);
+        self.writer.append(rec_type::BOUNDARY_COPY, 0, &payload)?;
         // Durable now — advance the frontier (boundaries are appended in input-position order).
         self.durable_through_input_pos = self.durable_through_input_pos.max(first_input_pos);
         Ok(self.durable_through_input_pos)
@@ -80,18 +69,73 @@ impl BoundaryStore {
         let scan = WalScan::open(path)?;
         let mut out = Vec::new();
         for r in scan.records.iter().filter(|r| r.record_type == rec_type::BOUNDARY_COPY) {
-            let bc = flatbuffers::root::<proto::BoundaryCopy>(&r.payload).map_err(|e| BoundaryError::Malformed(e.to_string()))?;
-            let t = bc.activations();
-            out.push(DurableBoundary {
-                boundary_id: bc.boundary_id(),
-                first_input_pos: bc.first_input_pos(),
-                chunk_id: bc.chunk_id(),
-                activations: le_to_f32(t.data().bytes()),
-            });
+            out.push(decode_boundary_record(&r.payload)?);
         }
         out.sort_by_key(|b| b.first_input_pos);
         Ok(out)
     }
+}
+
+/// The `BOUNDARY_COPY` record payload: the same `proto::BoundaryCopy` FlatBuffer a `BOUNDARY_COPY`
+/// frame carries, with the C3 shape `dims = [1, n_embd]`.
+pub fn encode_boundary_record(boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let data = fbb.create_vector(&f32_to_le(activations));
+    // C3: the declared shape is `[n_positions, n_embd]` — the same record a `BOUNDARY_COPY`
+    // frame carries, so a replayed boundary decodes through the same cross-check on the wire.
+    let dims = fbb.create_vector(&[1u32, activations.len() as u32]);
+    let tensor = proto::Tensor::create(
+        &mut fbb,
+        &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
+    );
+    let bc = proto::BoundaryCopy::create(
+        &mut fbb,
+        &proto::BoundaryCopyArgs { boundary_id, first_input_pos, n_positions: 1, chunk_id, activations: Some(tensor) },
+    );
+    fbb.finish(bc, None);
+    fbb.finished_data().to_vec()
+}
+
+/// Parse one `BOUNDARY_COPY` record payload read back from the **disk** — untrusted input under
+/// rule 17 ("anything the process did not compute itself"; a boundary store is a file).
+///
+/// **Audit C3 on the disk side.** A stored record whose declared shape disagrees with its bytes is
+/// refused, not replayed: `dtype == F32`, `dims == [n_positions, n_embd]`, `n_positions == 1`
+/// (M4), `n_embd ≥ 1`, `bytes == n_positions × 4 × n_embd`. The wire-side
+/// `hydra_worker::wire::check_boundary_tensor` carries the authoritative write-up; this is the
+/// same check, spelled the same way on purpose so the class is recognisable at a glance.
+///
+/// This is the `boundary-record` fuzz target (`hydra-fuzz`). Note what it does **not** prove: that
+/// the `n_embd` matches the engine a recovery will replay into — that is the worker's pre-FFI
+/// cross-check, which every replayed boundary still passes through as a `BOUNDARY_COPY`/`FWD`.
+pub fn decode_boundary_record(payload: &[u8]) -> Result<DurableBoundary, BoundaryError> {
+    let bc = flatbuffers::root::<proto::BoundaryCopy>(payload).map_err(|e| BoundaryError::Malformed(e.to_string()))?;
+    let t = bc.activations();
+    let dims = t.dims();
+    let bytes = t.data().bytes().len() as u64;
+    let shape_ok = t.dtype() == proto::DType::F32
+        && t.block_scales().is_none()
+        && dims.len() == 2
+        && dims.get(0) as u64 == bc.n_positions() as u64
+        && bc.n_positions() == 1
+        && dims.get(1) > 0
+        && bytes == dims.get(0) as u64 * 4 * dims.get(1) as u64;
+    if !shape_ok {
+        return Err(BoundaryError::Malformed(format!(
+            "BOUNDARY_COPY record at input_pos {}: declared shape/bytes disagree (dtype={:?}, n_positions={}, dims={:?}, bytes={})",
+            bc.first_input_pos(),
+            t.dtype(),
+            bc.n_positions(),
+            dims.iter().collect::<Vec<_>>(),
+            bytes
+        )));
+    }
+    Ok(DurableBoundary {
+        boundary_id: bc.boundary_id(),
+        first_input_pos: bc.first_input_pos(),
+        chunk_id: bc.chunk_id(),
+        activations: le_to_f32(t.data().bytes()),
+    })
 }
 
 fn f32_to_le(v: &[f32]) -> Vec<u8> {

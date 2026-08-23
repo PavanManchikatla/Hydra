@@ -325,6 +325,8 @@ dependencies = [
 name = "hydra-fuzz"
 version = "0.10.2"
 dependencies = [
+ "flatbuffers",
+ "hydra-coordinator",
  "hydra-modelsvc",
  "hydra-proto",
  "hydra-wal",

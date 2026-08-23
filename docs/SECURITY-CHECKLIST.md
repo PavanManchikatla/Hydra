@@ -84,7 +84,7 @@ ever called**; the other four existed in `limits.rs` and were invoked from nowhe
 |---|---|---|---|
 | `MAX_FRAME_BYTES` | 64 MiB | `FrameHeader::parse`, from the 12-byte header alone | `wire_limits.rs::the_frame_cap_is_enforced_at_the_header_before_any_payload_is_read` |
 | `MAX_TENSOR_BYTES` | 48 MiB | `wire::check_boundary_tensor`, before `bytes_to_f32_le` copies | `wire_limits.rs::an_oversized_tensor_is_refused_before_it_is_copied` |
-| `MAX_POSITIONS_PER_FRAME` | 1024 | `wire::decode`, on `Fwd` | `wire_limits.rs::an_oversized_position_count_is_refused` |
+| `MAX_POSITIONS_PER_FRAME` | 1024 | `wire::check_boundary_tensor`, on `Fwd` **and** `BoundaryCopy` | `wire_limits.rs::an_oversized_position_count_is_refused` (its control was rewritten by audit C3 — see below) |
 | `MAX_SNAPSHOT_BYTES` | 1 MiB | `wire::capped_bytes`, on sampler snapshots | `wire_limits.rs::an_oversized_sampler_snapshot_is_refused` |
 | Fixed-width digests | 32 B | `wire::capped_bytes` | `wire_limits.rs::a_fixed_width_digest_field_is_capped_at_its_width` |
 
@@ -95,8 +95,39 @@ cap became real. The dev model's `n_embd` is **896**, under the 1024 cap, so eve
 stayed green — while **every larger model would have had its boundaries refused** (a 7 B has
 `n_embd = 4096`). A correct-looking security fix would have shipped and broken the product on the
 first real model. Fixed, and pinned by
-`wire_limits.rs::a_real_boundary_wider_than_the_position_cap_still_decodes`, which drives a
-4096-float boundary so the dev model's narrowness cannot hide it again.
+`wire_limits.rs::wire_caps_hold_for_boundary_widths_the_dev_fixture_never_reaches`, which drives
+896/1024/1536/2048/4096/8192-float boundaries so the dev model's narrowness cannot hide it again.
+*(Row corrected 2026-08-23: it previously named `a_real_boundary_wider_than_the_position_cap_still_decodes`,
+a test that had been renamed — a row pointing at a test that does not run is the §7.31 class.)*
+
+### Boundary-tensor shape — cross-checked **before the FFI** (audit Wave 1c, 2026-08-23)
+
+The caps above bound *how much*; they said nothing about *whether the parts agree*. A `Fwd` /
+`BoundaryCopy` frame makes three independent claims about its own shape — `n_positions`,
+`Tensor.dims`, and the byte count — and before C3 the codec discarded the first two and let the
+third define the shape: the engine derived `n = len / n_embd`, so two positions' worth of bytes
+under `n_positions = 1` were applied as two positions, and a byte count that was not a multiple of
+four was silently truncated by `chunks_exact`. The only component that ever compared a declaration
+to a length was the FFI shim, and it compared the wrong two things.
+
+| Check | Where | Proof |
+|---|---|---|
+| **C3** `dims == [n_positions, n_embd]`, `n_embd ≥ 1`, `data.len() == n_positions × 4 × n_embd` | `wire::check_boundary_tensor` (engine-free: internal consistency), before `bytes_to_f32_le` copies; on **both** boundary bodies | `wire_limits.rs::a_boundary_whose_bytes_disagree_with_its_declared_shape_is_refused`, `…::a_boundary_copy_whose_bytes_disagree_with_its_declared_shape_is_refused` |
+| **C3** declared `n_embd == engine.n_embd` | `worker::Engine::apply_boundary`, before `hydra_apply` | `pre_ffi.rs::a_self_consistent_boundary_of_the_wrong_width_is_refused_before_the_ffi` |
+| **C3 (disk)** the same shape check on a `BOUNDARY_COPY` record read back from the boundary store | `hydra_coordinator::boundary_store::decode_boundary_record` + the `boundary-record` fuzz target | `fuzz_smoke.rs::the_boundary_record_parser_survives_a_seeded_hostile_corpus` |
+| **M4** `n_positions == 1` in v1 | `wire::check_boundary_tensor` | `wire_limits.rs::more_than_one_position_per_boundary_is_refused_in_v1` |
+| **H7** `n_positions ≤ n_batch` | `worker::Engine::apply_boundary` (unreachable from the wire once M4 holds) **and** `hydra_engine_sys::Context::apply` (a public API with multi-position callers) **and** the shim | `pre_ffi.rs::a_position_count_above_n_batch_is_refused_by_the_wrapper_before_the_shim` |
+| **`i32::try_from`** on every network-derived position, bounded to `[0, n_ctx)` | `worker::wire_pos` (`APPLY_TOKEN.input_pos`, `FWD.first_input_pos`, `BEGIN_RECOVERY.truncate_to`) | `pre_ffi.rs::a_position_outside_the_context_or_i32_is_refused_before_the_ffi` |
+| **M5** `token_id < n_vocab` **before it becomes durable** (coordinator) and before it becomes compute (worker) | `Session::push_sampled` (refused token leaves no trace in buffer, disk or event log); `worker::Engine::apply_token`; the shim | `session_http.rs::an_out_of_vocabulary_token_is_refused_before_anything_is_written`, `pre_ffi.rs::an_out_of_vocabulary_token_is_refused_before_the_ffi` |
+| **`try/catch(...)`** on all 14 shim entry points — a C++ exception can never cross the C ABI into Rust | `csrc/hydra_engine.cpp` (`HYDRA_GUARD_BEGIN/END`) | by inspection: 14 entry points, 14 guards (`grep -c HYDRA_GUARD_BEGIN` = 15 incl. the define) — **no test can provoke a throw on demand without a hostile GGUF; recorded as an inspection row, not a proof row** |
+
+**The blind oracle, named.** `wire_limits.rs::an_oversized_position_count_is_refused` used as its
+*control* a frame with one position's bytes declaring `n_positions = 1024` — it asserted the exact
+inconsistency C3 forbids was legal, and would have gone red on the fix. The oracle was "the cap
+check", asked one question about one of three mutually-constraining claims, with a fixture chosen
+for convenience; an oracle that checks one claim in isolation cannot express a violation of the
+claims' *relationship*. Same shape as the checklist rows and M6's hard-coded simulator fsync: a
+harness that cannot produce the failure it nominally guards.
 
 > **Turning a documented-but-unenforced constraint into an enforced one is not a free change.** It is
 > a behaviour change against every producer that was quietly violating it — and a small dev model is

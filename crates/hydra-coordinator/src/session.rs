@@ -21,6 +21,9 @@ use crate::event_log::{Event, EventLog};
 /// generation pump's), like a worker.
 pub trait PieceSource {
     fn piece(&self, token: u32) -> Vec<u8>;
+    /// The vocabulary size — the bound every network-derived `token_id` is held to **before it
+    /// becomes durable** (audit M5). The tokenizer knows it; a stub states it.
+    fn n_vocab(&self) -> u32;
 }
 
 /// [`PieceSource`] over the real llama.cpp-delegated tokenizer.
@@ -29,6 +32,9 @@ pub struct TokenizerPieces(pub Tokenizer);
 impl PieceSource for TokenizerPieces {
     fn piece(&self, token: u32) -> Vec<u8> {
         self.0.piece(token).unwrap_or_default()
+    }
+    fn n_vocab(&self) -> u32 {
+        u32::try_from(self.0.n_vocab()).unwrap_or(0)
     }
 }
 
@@ -95,8 +101,22 @@ impl Session {
     }
 
     /// Buffer a sampled token — **not** durable and **not** emitted yet.
-    pub fn push_sampled(&mut self, s: SampledToken) {
+    ///
+    /// **Audit M5 — `token_id < n_vocab`, validated BEFORE it becomes durable.** A `SAMPLED` frame
+    /// is network input; before this check a token id above the vocabulary would have been written
+    /// into a `GENERATION_COMMIT` record, fdatasync'd, and only *then* discovered — by the
+    /// tokenizer rendering it as nothing, or by a recovery replaying it into an engine that would
+    /// refuse it (or not). A durable record is a promise the ledger makes to every future reader;
+    /// a promise about a token that does not exist is a corrupt ledger with a valid checksum. So
+    /// the bound is checked here, at the last point before the group committer owns the token —
+    /// a refused token leaves no trace in the buffer, the commit stream, or the event log.
+    pub fn push_sampled(&mut self, s: SampledToken) -> Result<(), CommitError> {
+        let n_vocab = self.pieces.n_vocab();
+        if s.token_id >= n_vocab {
+            return Err(CommitError::TokenOutOfVocab { output_pos: s.output_pos, token_id: s.token_id, n_vocab });
+        }
         self.group.push(s.output_pos, s.token_id, s.snapshot);
+        Ok(())
     }
 
     fn buffer_full(&self) -> bool {

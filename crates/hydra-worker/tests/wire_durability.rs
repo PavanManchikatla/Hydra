@@ -13,7 +13,7 @@ fn durability_bodies_round_trip_under_the_fence() {
     let acts = vec![0.5f32, -1.25, 3.0, 42.0];
     let bc = wire::encode_boundary_copy(&fence, 0, 2, 100, 7, &acts);
     match wire::decode(&bc, &fence).unwrap().1 {
-        Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations } => {
+        Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations, .. } => {
             assert_eq!((boundary_id, first_input_pos, chunk_id), (2, 100, 7));
             assert_eq!(activations, acts);
         }

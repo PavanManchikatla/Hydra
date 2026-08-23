@@ -24,6 +24,10 @@ pub enum CommitError {
     I19(String),
     #[error("malformed sampler checkpoint snapshot: {0}")]
     BadCheckpoint(String),
+    /// **Audit M5.** A sampled `token_id` outside `[0, n_vocab)` was refused before it could be
+    /// buffered for a durable `GENERATION_COMMIT`. Nothing was written.
+    #[error("token_id {token_id} at output_pos {output_pos} is outside the vocabulary (n_vocab {n_vocab}); refused before durability (audit M5)")]
+    TokenOutOfVocab { output_pos: i64, token_id: u32, n_vocab: u32 },
 }
 
 /// The durability sink behind the commit stream — one `append` = one record made durable
