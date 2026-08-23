@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 
+use hydra_transport::roles::{PeerRole, RoleTable};
 use hydra_transport::tcp_mtls::TcpMtlsListener;
 use hydra_transport::{ClusterCa, TcpMtls};
 
@@ -13,12 +14,15 @@ async fn two_peers_exchange_authenticated_frames() {
     let client_id = ca.issue("hydra-client").unwrap();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = TcpMtlsListener::bind(addr, &ca, &server_id).await.unwrap();
+    let listener = TcpMtlsListener::bind(addr, &ca, &server_id, RoleTable::new().with("hydra-client", PeerRole::Coordinator)).await.unwrap();
     let bound = listener.local_addr().unwrap();
 
     // Server: accept one mTLS conn, echo a control frame back with a flag set.
     let server = tokio::spawn(async move {
-        let mut conn = listener.accept().await.unwrap();
+        // Audit C2: `accept()` yields the connection AND its bound role.
+        let accepted = listener.accept().await.unwrap();
+        assert_eq!(accepted.peer.role, PeerRole::Coordinator, "the peer bound to its configured role");
+        let mut conn = accepted.conn;
         let frame = conn.recv().await.unwrap();
         assert_eq!(frame.payload, b"BEGIN_RECOVERY tuple bytes");
         conn.send(0x0001, b"RECOVERY_ACK").await.unwrap();
@@ -44,7 +48,7 @@ async fn client_cert_not_signed_by_cluster_ca_is_rejected() {
     let rogue_id = rogue_ca.issue("hydra-client").unwrap();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = TcpMtlsListener::bind(addr, &ca, &server_id).await.unwrap();
+    let listener = TcpMtlsListener::bind(addr, &ca, &server_id, RoleTable::new().with("hydra-client", PeerRole::Coordinator)).await.unwrap();
     let bound = listener.local_addr().unwrap();
 
     let server = tokio::spawn(async move {

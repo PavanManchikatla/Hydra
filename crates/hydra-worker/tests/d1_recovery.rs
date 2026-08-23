@@ -94,6 +94,13 @@ fn boot(cluster: &Cluster, name: &str, cfg: WorkerConfig) -> Bootstrap {
         device_name: name.to_string(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
+        // Audit C2: a bootstrap names the peers this worker will accept; `role_table()` refuses an
+        // empty list, so subprocess workers get a real (small) table rather than a permissive one.
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("worker-s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+        ],
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg,
         forwarding: None,

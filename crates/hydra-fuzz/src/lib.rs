@@ -208,14 +208,12 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
         Target::WalRecord => {
             // The on-disk record framing. `read_record` borrows rather than allocating, so the
             // oracle here is the arithmetic — `record_size`, `pad_len`, and the tag slice bounds.
-            match hydra_wal::record::read_record(&input) {
-                hydra_wal::record::ReadStep::Record { header, payload, total_len } => {
-                    // A returned record must be self-consistent with the buffer it came from: if
-                    // it is not, the parser has handed out a slice it did not prove.
-                    assert!(total_len <= input.len(), "read_record returned total_len past the buffer");
-                    assert_eq!(payload.len(), header.payload_len as usize, "payload/header disagree");
-                }
-                _ => {}
+            let step: hydra_wal::record::ReadStep<'_> = hydra_wal::record::read_record(&input);
+            if let hydra_wal::record::ReadStep::Record { header, payload, total_len } = step {
+                // A returned record must be self-consistent with the buffer it came from: if it is
+                // not, the parser has handed out a slice it did not prove.
+                assert!(total_len <= input.len(), "read_record returned total_len past the buffer");
+                assert_eq!(payload.len(), header.payload_len as usize, "payload/header disagree");
             }
         }
     }));

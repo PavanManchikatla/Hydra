@@ -130,6 +130,13 @@ async fn subprocess_worker_survives_kill_9_and_restart() {
         device_name: "worker-1".to_string(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: worker_id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
+        // Audit C2: a bootstrap names the peers this worker will accept; `role_table()` refuses an
+        // empty list, so subprocess workers get a real (small) table rather than a permissive one.
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("worker-s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+        ],
         key_pkcs8_der: worker_id.key_pkcs8_der(),
         // Control-plane only (no model) → the kill-switch is exercised everywhere, incl. CI.
         cfg: WorkerConfig {

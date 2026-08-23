@@ -426,9 +426,7 @@ pub fn wal_record_case(rng: &mut Rng) -> Vec<u8> {
     // never correct in value unless the record happens to be self-consistent.
     let unpadded = 12 + real;
     let pad = (8 - (unpadded % 8)) % 8;
-    for _ in 0..pad {
-        v.push(0);
-    }
+    v.resize(v.len() + pad, 0u8);
     if rng.below(8) != 0 {
         for _ in 0..32 {
             v.push(rng.byte());

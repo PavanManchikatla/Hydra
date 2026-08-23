@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use hydra_engine_sys::{Model, ENGINE_AVAILABLE};
+use hydra_transport::roles::{PeerRole, RoleTable};
 use hydra_transport::tcp_mtls::{TcpMtls, TcpMtlsListener};
 use hydra_transport::{ClusterCa, DeviceIdentity};
 
@@ -61,6 +62,58 @@ impl Cluster {
 /// Spawn an **in-process** worker endpoint on its own thread; return the bound loopback address.
 /// The endpoint accepts connections in a loop (so a coordinator may reconnect) until the process
 /// exits. The worker owns its (non-`Send`) engine context on this thread.
+/// **The in-process dev/test role table (audit C2).**
+///
+/// Every device name the in-process harnesses issue, mapped to the role it plays. This is a **test
+/// fixture, not a permissive default** — a name absent from it is still refused at `accept()`, which
+/// is the property the fail-closed binding exists for. It is a fixture in exactly one sense: it
+/// spares ~20 in-process harness call sites from restating the same table.
+///
+/// **The production path does NOT use this.** A real worker builds its table from its `Bootstrap`
+/// (`bootstrap::Bootstrap::role_table`), and the fail-closed regressions in
+/// `hydra-transport/tests/role_binding.rs` drive a **real listener with a real table**, never this
+/// one — otherwise the fixture's convenience would become a claim the tests do not make.
+///
+/// # ⚑ This list is explicit because the gate caught us first
+///
+/// When the role binding first ran, the rule-14 anchor `direct_worker_to_worker_fwd_is_bit_exact`
+/// went **red**: the harness dials S2 using a separate client identity (`worker-s1-client`), and
+/// that name was not in this table, so S2 refused the connection at `accept()`. **The gate's first
+/// refusal was the project's own traffic** — which is the fail-closed property demonstrating itself
+/// rather than a bug in it, and is the reason every dialling identity below is named individually
+/// instead of the table being made permissive.
+///
+/// A `*-client` / `*-down` / `*-dur` name is a **stage's outbound identity** (the certificate a
+/// stage presents when it dials its downstream or the durability target), so it binds as a stage.
+pub fn dev_role_table() -> RoleTable {
+    RoleTable::new()
+        // the coordinator
+        .with("coordinator", PeerRole::Coordinator)
+        // stage listeners
+        .with("worker-s1", PeerRole::Stage { rank: 0 })
+        .with("worker-s2", PeerRole::Stage { rank: 1 })
+        .with("worker-s3", PeerRole::Stage { rank: 2 })
+        .with("s1", PeerRole::Stage { rank: 0 })
+        .with("s2", PeerRole::Stage { rank: 1 })
+        .with("sp", PeerRole::Stage { rank: 2 })
+        .with("sp-ref", PeerRole::Stage { rank: 2 })
+        .with("down", PeerRole::Stage { rank: 3 })
+        .with("worker", PeerRole::Stage { rank: 0 })
+        .with("worker-1", PeerRole::Stage { rank: 1 })
+        // a stage's OUTBOUND identities — the certs it presents when dialling a peer. These are the
+        // names the gate refused first; they are stages, not a separate kind of principal.
+        .with("worker-s1-client", PeerRole::Stage { rank: 0 })
+        .with("worker-client", PeerRole::Stage { rank: 0 })
+        .with("s1-client", PeerRole::Stage { rank: 0 })
+        .with("s1-down", PeerRole::Stage { rank: 0 })
+        .with("s1-dur", PeerRole::Stage { rank: 0 })
+        .with("s2-down", PeerRole::Stage { rank: 1 })
+        .with("s2-dur", PeerRole::Stage { rank: 1 })
+        // the durability target
+        .with("dur", PeerRole::DurabilityTarget)
+        .with("durability", PeerRole::DurabilityTarget)
+}
+
 pub fn spawn_endpoint(
     cfg: WorkerConfig,
     server_cfg: rustls::ServerConfig,
@@ -69,13 +122,14 @@ pub fn spawn_endpoint(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg)
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, dev_role_table())
                 .await
                 .expect("bind endpoint");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut worker = Worker::new(cfg).expect("worker");
-            while let Ok(mut conn) = listener.accept().await {
-                let _ = serve_conn(&mut worker, &mut conn).await;
+            while let Ok(a) = listener.accept().await {
+                let mut conn = a.conn;
+                let _ = serve_conn(&mut worker, &mut conn, a.peer.role).await;
             }
         });
     });
@@ -93,7 +147,7 @@ pub fn spawn_multiconn_endpoint(cfg: WorkerConfig, server_cfg: rustls::ServerCon
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg)
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, dev_role_table())
                 .await
                 .expect("bind endpoint");
             tx.send(listener.local_addr().unwrap()).unwrap();
@@ -118,10 +172,11 @@ pub fn spawn_forwarding_endpoint(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind s1");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, dev_role_table()).await.expect("bind s1");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut worker = Worker::new(cfg).expect("worker");
-            while let Ok(mut up) = listener.accept().await {
+            while let Ok(a) = listener.accept().await {
+                let mut up = a.conn;
                 // (Re)connect the downstream S1→S2 link to the CURRENT target — so a coordinator
                 // reconnect after a downstream replacement re-links the survivor to the new peer.
                 let (addr, name) = down.lock().unwrap().clone();
@@ -129,7 +184,7 @@ pub fn spawn_forwarding_endpoint(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                let _ = serve_conn_forwarding(&mut worker, &mut up, &mut dc).await;
+                let _ = serve_conn_forwarding(&mut worker, &mut up, &mut dc, a.peer.role).await;
             }
         });
     });
@@ -153,11 +208,12 @@ pub fn spawn_forwarding_endpoint_relink(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind s1");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, dev_role_table()).await.expect("bind s1");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut worker = Worker::new(cfg).expect("worker");
-            while let Ok(mut up) = listener.accept().await {
-                let _ = serve_conn_forwarding_relink(&mut worker, &mut up, &down_connector, &down, relink_retries).await;
+            while let Ok(a) = listener.accept().await {
+                let mut up = a.conn;
+                let _ = serve_conn_forwarding_relink(&mut worker, &mut up, &down_connector, &down, relink_retries, a.peer.role).await;
             }
         });
     });
@@ -197,7 +253,7 @@ pub fn spawn_multiconn_forwarding_durable_endpoint(
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind stage");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, dev_role_table()).await.expect("bind stage");
             tx.send(listener.local_addr().unwrap()).unwrap();
             // Dial the durability target once; the down-link connects lazily (and re-links) per forward.
             let dur = dur_connector.connect(dur_addr, &dur_name).await.expect("connect durability");

@@ -28,7 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = boot.listen_addr.parse()?;
     let cfg = server_config_with_ca(&boot.ca_cert(), &boot.identity())?;
-    let listener = TcpMtlsListener::bind_with_config(addr, cfg).await?;
+    // Audit C2: the role table is CONFIGURATION, from the bootstrap — not a default this binary
+    // could invent. `role_table()` refuses an empty one, so a worker that would deny every peer
+    // fails at startup instead of failing confusingly on the first connection.
+    let roles = boot.role_table()?;
+    let listener = TcpMtlsListener::bind_with_config(addr, cfg, roles).await?;
     let bound = listener.local_addr()?;
     // Advertise the actually-bound address (port may have been 0) on stdout for the runner.
     println!("HYDRA_WORKER_LISTENING {bound}");

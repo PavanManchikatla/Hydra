@@ -41,11 +41,11 @@ fn spawn_echo_peer(server_cfg: rustls::ServerConfig, keys: SessionKeys, n_embd: 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg)
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table())
                 .await
                 .expect("bind");
             tx.send(listener.local_addr().unwrap()).unwrap();
-            let mut conn = listener.accept().await.expect("accept");
+            let mut conn = listener.accept().await.expect("accept").conn;
             let boundary = vec![0.5f32; n_embd];
             while let Ok(frame) = conn.recv().await {
                 match wire::decode(&frame.payload, &keys) {

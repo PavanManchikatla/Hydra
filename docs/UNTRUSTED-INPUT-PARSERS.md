@@ -3,6 +3,14 @@
 **Swept 2026-08-23** (audit Wave 1a·2), after the **fourth** instance of the
 `Vec::with_capacity(declared)` allocation class.
 
+> **The near-miss worth knowing before you read the table.** "Untrusted input" was originally read
+> as *the network*. Three of the four instances arrive from the **disk**. Under that reading this
+> sweep would have inspected exactly one parser, found it clamped, and closed the class — a green
+> sweep with three live instances behind it. The rule is only as good as the noun it quantifies
+> over, and *the network* is the intuitive noun precisely because network bytes **feel** adversarial
+> while a file on one's own disk does not. That intuition is what the 2024 llama.cpp GGUF CVEs exist
+> to correct.
+
 > **Standing rule 17.** When a defect class is found in one parser, **every** parser of untrusted
 > input is audited for it in the same wave, and each becomes a fuzz target — or carries a written
 > justification for why it needs none. *A class fixed in one instance and left in another is not
@@ -51,10 +59,14 @@ of `MAX_FRAME_BYTES`), but it is worth stating plainly rather than counting as c
 * **The peer must hold a cluster certificate.** Under the **honest-worker assumption** (BLUEPRINT
   §1.9, ruled 2026-08-23) this is **accepted-with-assumption**: a certificate holder able to stall
   connections can exhaust memory, and v1 does not defend against a compromised stage.
-* **What would change it**: streaming the payload into a bounded buffer rather than reserving the
-  declared size up front, and/or a per-connection in-flight budget. Neither is v1 scope, and
-  pretending otherwise by writing ✅ here would be exactly the §7.31 failure — a row claiming more
-  than the code does.
+* **⚑ This is audit finding M1, and it lands in WAVE 3** (ruled 2026-08-23) — **not** as a caveat
+  carried forward. Wave 3's M1 work is a **read timeout + a per-peer and global connection
+  semaphore**. The timeout is the part that matters: it converts *"held while a peer stalls"* from
+  **unbounded** to **bounded**, and it is cheap enough to land in v1 *even under* the honest-worker
+  assumption — because a stalled read is as easily an accident (a wedged peer, a black-holed route)
+  as an attack. **The honest-worker assumption excuses the malice case; it does not excuse leaving
+  an unbounded hold in the accident case.**
+* Writing ✅ here would have been exactly the §7.31 failure — a row claiming more than the code does.
 
 ### The HTTP surface — justified for now, revisited in Wave 4
 

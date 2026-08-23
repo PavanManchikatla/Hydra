@@ -342,3 +342,115 @@ fn an_unimplemented_but_in_spec_body_is_refused_never_silently_dropped() {
         "an unimplemented body must produce a structured refusal, not Ok(()) and not a drop"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit C2 — the message-family gate (the second half of the role binding).
+// ---------------------------------------------------------------------------------------------
+
+/// **The role table is an ALLOW-list, so a message family nobody has authorised has no sender.**
+///
+/// This is the property that makes the gate survive the protocol growing. With a deny-list, adding
+/// a message family silently grants it to everyone; with an allow-list, forgetting to state a sender
+/// makes it unsendable. The failure mode of forgetting is a refusal, not a grant.
+#[test]
+fn the_role_gate_is_an_allow_list_so_an_unstated_family_has_no_sender() {
+    use hydra_proto::proto::Body;
+    use hydra_transport::roles::PeerRole;
+    use hydra_worker::worker::role_may_send;
+
+    let roles = [
+        PeerRole::Coordinator,
+        PeerRole::Stage { rank: 0 },
+        PeerRole::Stage { rank: 1 },
+        PeerRole::DurabilityTarget,
+    ];
+
+    // Families v1 deliberately gives NO sender: the placement quartet, the shard-lifecycle sextet,
+    // REJOIN/CLEANED, HEARTBEAT and the sampler/segment replies are either unimplemented or are
+    // things a worker SENDS rather than RECEIVES. None of them may arrive at a worker from anyone.
+    for body in [
+        Body::PreparePlacement,
+        Body::PlacementReady,
+        Body::InstallPlacement,
+        Body::PlacementInstalled,
+        Body::AttachContextShard,
+        Body::DestroyContext,
+        Body::DetachShard,
+        Body::Rejoin,
+        Body::Cleaned,
+        Body::Sampled,
+        Body::SamplerCheckpointInstalled,
+        Body::ActivationCommitted,
+        Body::ActivationFinalized,
+        Body::RecoveryAck,
+    ] {
+        for role in roles {
+            assert!(
+                !role_may_send(role, body),
+                "{body:?} has no stated sender in v1, so NO role may send it — a {} was allowed to. \
+                 An allow-list's whole value is that forgetting produces a refusal, not a grant.",
+                role.label()
+            );
+        }
+    }
+}
+
+/// **THE FINDING, as a table.** Before the gate, a stage could send a coordinator's frames and the
+/// durability target could send a stage's. Each row below is a privilege that used to exist.
+#[test]
+fn a_stage_may_not_speak_as_the_coordinator_and_a_durability_target_may_not_speak_as_a_stage() {
+    use hydra_proto::proto::Body;
+    use hydra_transport::roles::PeerRole;
+    use hydra_worker::worker::role_may_send;
+
+    let stage = PeerRole::Stage { rank: 0 };
+    let dur = PeerRole::DurabilityTarget;
+    let coord = PeerRole::Coordinator;
+
+    // The activation transaction is the coordinator's alone (spec §6.6).
+    for body in [Body::CommitActivation, Body::FinalizeActivation, Body::ActivationCommitAbort] {
+        assert!(role_may_send(coord, body), "control: the coordinator may send {body:?}");
+        assert!(!role_may_send(stage, body), "a STAGE must not be able to drive the activation transaction ({body:?})");
+        assert!(!role_may_send(dur, body), "a DURABILITY TARGET must not drive activation ({body:?})");
+    }
+
+    // Sampling is the coordinator's to request (spec §1.4's ownership boundary).
+    assert!(role_may_send(coord, Body::SampleNext));
+    assert!(!role_may_send(stage, Body::SampleNext), "a stage must not request a sample");
+    assert!(!role_may_send(dur, Body::SampleNext), "a durability target must not request a sample");
+
+    // Recovery is the coordinator's to open.
+    for body in [Body::BeginRecovery, Body::ResetRecoveryAttempt, Body::CatchUpContext] {
+        assert!(role_may_send(coord, body), "control: the coordinator opens recovery ({body:?})");
+        assert!(!role_may_send(dur, body), "a durability target must not open recovery ({body:?})");
+    }
+
+    // And the durability target's own lane is exactly one frame wide.
+    assert!(role_may_send(dur, Body::DurabilityAck));
+    assert!(!role_may_send(dur, Body::Fwd), "a durability target must not forward boundaries");
+    assert!(!role_may_send(dur, Body::ApplyToken), "a durability target must not drive the data plane");
+}
+
+/// The gate runs on a **peek**, before the body is decoded — an authorisation check that runs after
+/// decoding has already let an unauthorised peer direct work (buffer allocation, tensor copies,
+/// engine calls). A frame whose body does not even parse is refused too, since an unidentifiable
+/// family cannot be shown to be permitted.
+#[test]
+fn an_unparseable_frame_is_refused_by_the_gate_rather_than_passed_to_the_decoder() {
+    use hydra_transport::roles::PeerRole;
+    use hydra_worker::worker::check_role;
+
+    let err = check_role(PeerRole::Coordinator, b"not a flatbuffer at all").unwrap_err();
+    assert!(
+        err.to_string().contains("unparseable"),
+        "an unidentifiable body must be refused by the gate, got: {err}"
+    );
+
+    // Control: a real coordinator frame passes the gate.
+    let keys = SessionKeys::dev(0x71);
+    let frame = wire::encode_apply_token(&keys, 0, 0, 1, true);
+    check_role(PeerRole::Coordinator, &frame).expect("control: a coordinator may send APPLY_TOKEN");
+    // …and the same frame from a durability target does not.
+    check_role(PeerRole::DurabilityTarget, &frame)
+        .expect_err("a durability target may not send APPLY_TOKEN");
+}

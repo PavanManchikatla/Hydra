@@ -16,7 +16,16 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use hydra_transport::roles::{PeerRole, RoleTable};
 use hydra_transport::{check_bind_addr, ClusterCa, TransportError, ALLOW_WILDCARD_BIND_ENV};
+
+/// A minimal role table for the checklist's own listeners (audit C2 makes one mandatory). These
+/// tests are about binds and handshakes, not authorisation, so the table names only what they dial.
+fn checklist_roles() -> RoleTable {
+    RoleTable::new()
+        .with("worker-client", PeerRole::Coordinator)
+        .with("checklist-node", PeerRole::Stage { rank: 0 })
+}
 
 fn repo_root() -> PathBuf {
     // crates/hydra-transport/ -> ../..
@@ -89,14 +98,14 @@ async fn the_real_listener_refuses_a_wildcard_bind() {
     let ca = ClusterCa::new().unwrap();
     let id = ca.issue("checklist-node").unwrap();
 
-    match hydra_transport::tcp_mtls::TcpMtlsListener::bind("0.0.0.0:0".parse().unwrap(), &ca, &id).await {
+    match hydra_transport::tcp_mtls::TcpMtlsListener::bind("0.0.0.0:0".parse().unwrap(), &ca, &id, checklist_roles()).await {
         Err(TransportError::WildcardBind(_)) => {}
         Err(other) => panic!("wrong refusal for a wildcard bind: {other:?}"),
         Ok(_) => panic!("a wildcard bind must not produce a listener"),
     }
 
     // Control: loopback binds fine with the same CA and identity.
-    let l = hydra_transport::tcp_mtls::TcpMtlsListener::bind("127.0.0.1:0".parse().unwrap(), &ca, &id)
+    let l = hydra_transport::tcp_mtls::TcpMtlsListener::bind("127.0.0.1:0".parse().unwrap(), &ca, &id, checklist_roles())
         .await
         .expect("loopback must bind");
     assert!(l.local_addr().unwrap().ip().is_loopback());
@@ -209,7 +218,7 @@ async fn a_peer_from_a_foreign_ca_is_rejected_at_the_handshake() {
     let rogue_id = theirs.issue("worker-client").unwrap();
 
     let listener =
-        hydra_transport::tcp_mtls::TcpMtlsListener::bind("127.0.0.1:0".parse().unwrap(), &ours, &server_id)
+        hydra_transport::tcp_mtls::TcpMtlsListener::bind("127.0.0.1:0".parse().unwrap(), &ours, &server_id, checklist_roles())
             .await
             .unwrap();
     let addr = listener.local_addr().unwrap();

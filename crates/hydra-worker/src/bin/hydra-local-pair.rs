@@ -57,6 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cert_chain_der: id.cert_chain.iter().map(der_vec).collect(),
         key_pkcs8_der: id.key_pkcs8_der(),
         cfg,
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("worker-s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+        ],
         forwarding: None,
     };
     let base = |rank, lf, ll, is_final, receives_tokens| WorkerConfig {

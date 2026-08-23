@@ -119,6 +119,11 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k: i32, n_ctx: i32) -> Bo
             receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.to_string()),
             n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start: false, shard_manifest: None,
         },
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("worker-s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+        ],
         forwarding: None,
     }
 }

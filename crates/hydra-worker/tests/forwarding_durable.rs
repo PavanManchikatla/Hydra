@@ -42,10 +42,10 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind dur");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table()).await.expect("bind dur");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut store = BoundaryStore::create(&path, [1; 16], [2; 16]).expect("store");
-            let mut conn = listener.accept().await.expect("accept");
+            let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
                 if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
                     let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).expect("persist");
@@ -68,9 +68,9 @@ fn spawn_slow_downstream(server_cfg: rustls::ServerConfig, keys: SessionKeys, de
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind down");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table()).await.expect("bind down");
             tx.send(listener.local_addr().unwrap()).unwrap();
-            let mut conn = listener.accept().await.expect("accept");
+            let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
                 if let Ok((view, Msg::Fwd { first_input_pos, .. })) = wire::decode(&frame.payload, &keys) {
                     tokio::time::sleep(delay).await;
@@ -92,9 +92,9 @@ fn spawn_absorbing_durability(server_cfg: rustls::ServerConfig, keys: SessionKey
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind dur");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table()).await.expect("bind dur");
             tx.send(listener.local_addr().unwrap()).unwrap();
-            let mut conn = listener.accept().await.expect("accept");
+            let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
                 if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, .. })) = wire::decode(&frame.payload, &keys) {
                     let ack = wire::encode_durability_ack(&keys, view.epoch, boundary_id, first_input_pos, 0);

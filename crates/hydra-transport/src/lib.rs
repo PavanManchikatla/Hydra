@@ -11,6 +11,7 @@
 
 pub mod framed;
 pub mod tcp_mtls;
+pub mod roles;
 pub mod tls;
 
 pub use framed::Conn;
@@ -36,6 +37,12 @@ pub enum TransportError {
     Cert(String),
     #[error("invalid dns name: {0}")]
     Dns(String),
+    /// **Audit C2.** The peer completed the mTLS handshake but its certificate could not be bound
+    /// to a configured role. **Fail-closed**: an unparseable certificate, a certificate matching no
+    /// configured name, or one matching more than one are all this error — never "unknown but
+    /// allowed".
+    #[error("peer REFUSED at accept: {0}")]
+    UnboundPeer(String),
     /// A wildcard bind (`0.0.0.0` / `[::]`) was attempted without the explicit opt-in.
     /// See [`check_bind_addr`].
     #[error("refusing wildcard bind {0}: v1's trust boundary is one household LAN; bind an explicit \

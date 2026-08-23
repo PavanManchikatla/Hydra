@@ -29,6 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::durable::DurableForwarder;
 use crate::sampler::{Sampler, SamplerError, SamplingConfig};
 use crate::wire::{self, Msg, SessionKeys, WireError};
+use hydra_transport::roles::PeerRole;
 
 /// `ERR_FENCED` on the wire (`proto::ErrCode::ERR_FENCED`).
 const ERR_FENCED: u16 = 1;
@@ -113,6 +114,11 @@ pub struct WorkerConfig {
 pub enum WorkerError {
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// **Audit C2.** The peer is authentic and bound to a role, but that role may not send this
+    /// message family. Distinct from a fence mismatch: F1 asks *"is this frame for this session?"*,
+    /// this asks *"may THIS peer send THIS?"* — and before the gate existed, nothing asked it.
+    #[error("REFUSED: a {role} may not send {body:?} (audit C2 role gate)")]
+    Unauthorized { role: String, body: String },
     #[error("engine: {0}")]
     Engine(#[from] EngineError),
     #[error("data-plane frame but no engine linked/loaded on this worker")]
@@ -456,10 +462,80 @@ impl Worker {
     }
 }
 
+/// **Audit C2 — the message-family gate: may `role` send `body` to a worker?**
+///
+/// The finding was that mTLS answers *"is this peer in the cluster?"* and nothing answered *"which
+/// stage is it?"*, so **any certificate holder could send any message family** — a stage worker
+/// could issue `COMMIT_ACTIVATION`, the durability target could send `SAMPLED`, and the F1 fence
+/// passed all of it because it checks *session* identity, not *sender* role.
+///
+/// # Why the table is written as an allow-list of (role, family) pairs
+///
+/// A deny-list is wrong for the same reason a first-match SAN lookup is: the default for anything
+/// unlisted must be **refuse**. Written this way, a message family added to the protocol has **no
+/// sender** until someone states one, so the failure mode of forgetting is a refusal rather than a
+/// silent grant.
+///
+/// # The v1 topology this encodes (BLUEPRINT §1.5, spec §4)
+///
+/// * the **coordinator** owns the control plane and the token/sample data plane it drives;
+/// * an **upstream stage** sends `FWD` (a boundary) and, on the durability edge, `BOUNDARY_COPY`;
+/// * a **downstream stage** answers with `APPLIED_ACK` / `COMMIT_ACK`;
+/// * the **durability target** answers with `DURABILITY_ACK`.
+///
+/// Note that a stage is *not* permitted to send `SAMPLE_NEXT` or any activation frame: sampling is
+/// S_P's to answer and the coordinator's to request (spec §1.4's ownership boundary), and the
+/// activation transaction is the coordinator's alone.
+pub fn role_may_send(role: PeerRole, body: hydra_proto::proto::Body) -> bool {
+    use hydra_proto::proto::Body as B;
+    match role {
+        PeerRole::Coordinator => matches!(
+            body,
+            // data plane the coordinator drives
+            B::ApplyToken | B::Fwd | B::SampleNext | B::CommitSync
+                // recovery / reset control plane
+                | B::BeginRecovery | B::ResetRecoveryAttempt | B::CatchUpContext
+                // sampler + segment checkpoint planes
+                | B::InstallSamplerCheckpoint | B::PrepareSegmentCheckpoint
+                // the activation transaction
+                | B::CommitActivation | B::FinalizeActivation | B::ActivationCommitAbort
+                // lifecycle + errors
+                | B::Cancel | B::Error
+        ),
+        // An upstream stage forwards boundaries; a downstream stage acknowledges them. One worker's
+        // peer may be either, and the two sets are disjoint, so a single arm covers both without
+        // widening what any one connection can do beyond stage-to-stage traffic.
+        PeerRole::Stage { .. } => matches!(
+            body,
+            B::Fwd | B::AppliedAck | B::CommitAck | B::BoundaryCopy | B::DurabilityAck | B::Error
+        ),
+        PeerRole::DurabilityTarget => matches!(body, B::DurabilityAck | B::Error),
+    }
+}
+
+/// The role gate, applied to a raw frame before its body is interpreted.
+///
+/// **Order matters and is the point:** this runs on a `peek_body` (which roots the FlatBuffer and
+/// reads one enum) *before* `on_frame` decodes anything. An authorisation check that runs after
+/// decoding has already let an unauthorised peer direct work — buffer allocation, tensor copies,
+/// engine calls. A frame whose body does not even parse is also refused here, since an
+/// unidentifiable message family cannot be shown to be permitted.
+pub fn check_role(role: PeerRole, payload: &[u8]) -> Result<(), WorkerError> {
+    let body = wire::peek_body(payload).ok_or_else(|| WorkerError::Unauthorized {
+        role: role.label(),
+        body: "<unparseable body>".to_string(),
+    })?;
+    if role_may_send(role, body) {
+        Ok(())
+    } else {
+        Err(WorkerError::Unauthorized { role: role.label(), body: format!("{body:?}") })
+    }
+}
+
 /// Serve one connection: recv → `on_frame` → send each reply, until the peer closes. A wire/engine
 /// error on a single frame is surfaced (the caller decides whether to drop the connection); a clean
 /// EOF returns `Ok(())`.
-pub async fn serve_conn<S>(worker: &mut Worker, conn: &mut Conn<S>) -> Result<(), WorkerError>
+pub async fn serve_conn<S>(worker: &mut Worker, conn: &mut Conn<S>, role: PeerRole) -> Result<(), WorkerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -470,6 +546,7 @@ where
             Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        check_role(role, &frame.payload)?;
         for reply in worker.on_frame(&frame.payload)? {
             conn.send(0, &reply).await?;
         }
@@ -482,7 +559,7 @@ where
 /// `FWD` for a 3-stage pipeline) is relayed back upstream. Non-`FWD` replies (control-plane acks) go
 /// straight back upstream. This replaces the coordinator-relay interim: the expensive boundary
 /// tensor travels S1→S2 directly; only the small ack traverses the coordinator edge.
-pub async fn serve_conn_forwarding<U, D>(worker: &mut Worker, up: &mut Conn<U>, down: &mut Conn<D>) -> Result<(), WorkerError>
+pub async fn serve_conn_forwarding<U, D>(worker: &mut Worker, up: &mut Conn<U>, down: &mut Conn<D>, role: PeerRole) -> Result<(), WorkerError>
 where
     U: AsyncRead + AsyncWrite + Unpin,
     D: AsyncRead + AsyncWrite + Unpin,
@@ -493,6 +570,7 @@ where
             Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        check_role(role, &frame.payload)?;
         for reply in worker.on_frame(&frame.payload)? {
             if wire::is_fwd_frame(&reply) {
                 // Direct S1→S2: the boundary tensor never traverses the coordinator on the compute path.
@@ -537,7 +615,7 @@ pub fn shared(worker: Worker) -> SharedWorker {
 /// Serve one inbound connection against a **shared** worker: recv → `on_frame` (borrow scoped to the
 /// synchronous call, released before any send) → send each reply, until the peer closes. This is the
 /// concurrent-safe analogue of [`serve_conn`]; several of these run at once against one `Worker`.
-pub async fn serve_conn_shared<S>(worker: &SharedWorker, conn: &mut Conn<S>) -> Result<(), WorkerError>
+pub async fn serve_conn_shared<S>(worker: &SharedWorker, conn: &mut Conn<S>, role: PeerRole) -> Result<(), WorkerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -549,6 +627,7 @@ where
         };
         // Borrow scoped to the synchronous `on_frame` — the replies are owned bytes, so the borrow
         // is dropped before we `.await` a send (the invariant that keeps the `RefCell` sound).
+        check_role(role, &frame.payload)?;
         let replies = worker.borrow_mut().on_frame(&frame.payload)?;
         for reply in replies {
             conn.send(0, &reply).await?;
@@ -563,13 +642,15 @@ where
 /// ends the loop.
 pub async fn serve_multi_conn(worker: SharedWorker, listener: TcpMtlsListener) -> Result<(), WorkerError> {
     loop {
-        let mut conn = match listener.accept().await {
-            Ok(c) => c,
+        // Audit C2: `accept()` yields the connection AND the role its certificate bound to. There
+        // is no path here that produces a connection without one.
+        let (mut conn, role) = match listener.accept().await {
+            Ok(a) => (a.conn, a.peer.role),
             Err(e) => return Err(e.into()),
         };
         let w = worker.clone();
         tokio::task::spawn_local(async move {
-            if let Err(e) = serve_conn_shared(&w, &mut conn).await {
+            if let Err(e) = serve_conn_shared(&w, &mut conn, role).await {
                 eprintln!("hydra-worker: connection ended with error: {e}");
             }
         });
@@ -776,7 +857,7 @@ async fn forward_and_copy(d: &mut DownstreamState, reply: &[u8], keys: &SessionK
 /// e.g. `SAMPLE_NEXT`→`SAMPLED` on a coordinator connection) goes straight back upstream. Several of
 /// these run at once against one `Worker`/one `DownstreamState`; only FWD-carrying connections contend
 /// the downstream lock. See the module contract on the two locks' opposite await disciplines.
-pub async fn serve_conn_forwarding_durable_shared<S>(worker: &SharedWorker, down: &SharedDown, conn: &mut Conn<S>, keys: &SessionKeys) -> Result<(), WorkerError>
+pub async fn serve_conn_forwarding_durable_shared<S>(worker: &SharedWorker, down: &SharedDown, conn: &mut Conn<S>, keys: &SessionKeys, role: PeerRole) -> Result<(), WorkerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -788,6 +869,7 @@ where
         };
         // Synchronous worker step: the `RefCell` borrow begins and ends INSIDE this call (unnamed
         // temporary), so it is provably not held across the awaits below.
+        check_role(role, &frame.payload)?;
         let replies = worker.borrow_mut().on_frame(&frame.payload)?;
         for reply in replies {
             if wire::is_fwd_frame(&reply) {
@@ -808,15 +890,15 @@ where
 /// per-connection error drops only that connection; a listener error ends the loop.
 pub async fn serve_multi_conn_forwarding_durable(worker: SharedWorker, down: SharedDown, keys: SessionKeys, listener: TcpMtlsListener) -> Result<(), WorkerError> {
     loop {
-        let mut conn = match listener.accept().await {
-            Ok(c) => c,
+        let (mut conn, role) = match listener.accept().await {
+            Ok(a) => (a.conn, a.peer.role),
             Err(e) => return Err(e.into()),
         };
         let w = worker.clone();
         let d = down.clone();
         let k = keys.clone();
         tokio::task::spawn_local(async move {
-            if let Err(e) = serve_conn_forwarding_durable_shared(&w, &d, &mut conn, &k).await {
+            if let Err(e) = serve_conn_forwarding_durable_shared(&w, &d, &mut conn, &k, role).await {
                 eprintln!("hydra-worker: durable forwarding connection ended with error: {e}");
             }
         });
@@ -840,6 +922,7 @@ pub async fn serve_conn_forwarding_relink<U>(
     connector: &TcpMtls,
     down: &DownTarget,
     relink_retries: usize,
+    role: PeerRole,
 ) -> Result<(), WorkerError>
 where
     U: AsyncRead + AsyncWrite + Unpin,
@@ -851,6 +934,7 @@ where
             Err(hydra_transport::TransportError::Io(e)) if is_eof(&e) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        check_role(role, &frame.payload)?;
         for reply in worker.on_frame(&frame.payload)? {
             if wire::is_fwd_frame(&reply) {
                 let resp = forward_with_relink(&mut dc, connector, down, &reply, relink_retries).await?;

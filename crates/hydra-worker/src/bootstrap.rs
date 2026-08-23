@@ -45,9 +45,50 @@ pub struct Bootstrap {
     /// Present ⇒ this is a forwarding stage (durable worker→worker FWD); absent ⇒ a final stage.
     /// Appended to the wire format (append-only), so an older bootstrap without it decodes to `None`.
     pub forwarding: Option<ForwardingBootstrap>,
+    /// **Audit C2 — the peers this worker will accept, and the role each may speak as.**
+    ///
+    /// A worker cannot invent this: which stage its upstream is, and whether the thing dialling it
+    /// is the coordinator or a peer stage, are facts the *provisioner* knows. Carrying them here
+    /// means the listener's role table is configuration rather than a default — and a bootstrap
+    /// that names none is **refused at startup**, not started with an empty (deny-all) table that
+    /// would fail confusingly on the first connection.
+    pub expected_peers: Vec<(String, u8)>,
 }
 
+/// Wire tags for [`hydra_transport::roles::PeerRole`]. Stable by value — a bootstrap written by one
+/// build is read by another, so these are append-only like every other wire enum in the project.
+pub const ROLE_COORDINATOR: u8 = 0;
+pub const ROLE_DURABILITY_TARGET: u8 = 1;
+/// Stage ranks are `2 + rank`, so a stage's tag carries its rank without a second field.
+pub const ROLE_STAGE_BASE: u8 = 2;
+
 impl Bootstrap {
+    /// The listener's role table (audit C2), built from `expected_peers`.
+    ///
+    /// **Refuses an empty table** rather than returning one. An empty table denies every peer, which
+    /// is fail-closed and therefore *safe* — but it is also almost certainly a provisioning mistake,
+    /// and a worker that starts and then rejects every connection is harder to diagnose than one
+    /// that does not start. Fail closed **and** fail loudly.
+    pub fn role_table(&self) -> Result<hydra_transport::roles::RoleTable, String> {
+        use hydra_transport::roles::{PeerRole, RoleTable};
+        if self.expected_peers.is_empty() {
+            return Err("bootstrap names no expected peers: this worker would refuse every \
+                        connection (audit C2). Provision the name->role table."
+                .to_string());
+        }
+        let mut t = RoleTable::new();
+        for (name, tag) in &self.expected_peers {
+            let role = match *tag {
+                ROLE_COORDINATOR => PeerRole::Coordinator,
+                ROLE_DURABILITY_TARGET => PeerRole::DurabilityTarget,
+                t if t >= ROLE_STAGE_BASE => PeerRole::Stage { rank: (t - ROLE_STAGE_BASE) as u16 },
+                other => return Err(format!("unknown role tag {other} for peer {name:?}")),
+            };
+            t = t.with(name, role);
+        }
+        Ok(t)
+    }
+
     pub fn identity(&self) -> DeviceIdentity {
         let chain: Vec<CertificateDer<'static>> =
             self.cert_chain_der.iter().map(|d| CertificateDer::from(d.clone())).collect();
@@ -132,6 +173,13 @@ impl Bootstrap {
             }
             None => w.str(""),
         }
+        // Audit C2 (append-only, after the shard block): the name->role table. An older bootstrap
+        // simply ends before this and is refused at startup by `role_table()`.
+        w.u32(self.expected_peers.len() as u32);
+        for (name, role) in &self.expected_peers {
+            w.str(name);
+            w.u32(*role as u32);
+        }
         w.0
     }
 
@@ -215,6 +263,19 @@ impl Bootstrap {
         } else {
             None
         };
+        // Audit C2: the expected-peer table (append-only). Absent ⇒ empty ⇒ `role_table()` refuses.
+        let expected_peers = if r.remaining() {
+            let n = r.u32()?;
+            let mut v = Vec::with_capacity(r.reserve_for(n as u64, 5));
+            for _ in 0..n {
+                let name = r.str()?;
+                let role = r.u32()?;
+                v.push((name, u8::try_from(role).map_err(|_| "role tag out of range".to_string())?));
+            }
+            v
+        } else {
+            Vec::new()
+        };
         Ok(Bootstrap {
             listen_addr,
             device_name,
@@ -222,6 +283,7 @@ impl Bootstrap {
             cert_chain_der,
             key_pkcs8_der,
             forwarding,
+            expected_peers,
             cfg: WorkerConfig {
                 keys,
                 rank,
@@ -331,6 +393,38 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
+    /// A minimal, valid bootstrap for the role-table tests.
+    fn sample_bootstrap() -> Bootstrap {
+        Bootstrap {
+            listen_addr: "127.0.0.1:0".into(),
+            device_name: "s1".into(),
+            ca_cert_der: vec![1],
+            cert_chain_der: vec![vec![2]],
+            key_pkcs8_der: vec![3],
+            expected_peers: vec![
+                ("coordinator".into(), ROLE_COORDINATOR),
+                ("s2".into(), ROLE_STAGE_BASE + 1),
+            ],
+            forwarding: None,
+            cfg: WorkerConfig {
+                keys: SessionKeys::dev(9),
+                rank: 0,
+                layer_first: 0,
+                layer_last: 12,
+                is_final: false,
+                receives_tokens: true,
+                epoch: 0,
+                recovery_id: 0,
+                model_path: None,
+                n_gpu_layers: 0,
+                n_ctx: 64,
+                sampler_config: None,
+                recovery_start: false,
+                shard_manifest: None,
+            },
+        }
+    }
+
     #[test]
     fn bootstrap_round_trips() {
         let boot = Bootstrap {
@@ -338,6 +432,7 @@ mod tests {
             device_name: "worker-1".into(),
             ca_cert_der: vec![1, 2, 3],
             cert_chain_der: vec![vec![4, 5], vec![6]],
+            expected_peers: vec![("coordinator".into(), ROLE_COORDINATOR), ("s1".into(), ROLE_STAGE_BASE)],
             key_pkcs8_der: vec![9, 9, 9],
             cfg: WorkerConfig {
                 keys: SessionKeys::dev(7),
@@ -369,6 +464,36 @@ mod tests {
         assert!(back.forwarding.is_none());
     }
 
+    /// **Audit C2.** The role table is provisioning, and a bootstrap that names no peers is
+    /// **refused at startup** rather than starting a worker that will deny every connection.
+    /// Fail closed *and* fail loudly: an empty table is safe but undiagnosable.
+    #[test]
+    fn a_bootstrap_naming_no_peers_is_refused_rather_than_starting_a_deny_all_worker() {
+        let mut boot = sample_bootstrap();
+        boot.expected_peers.clear();
+        let err = boot.role_table().expect_err("an empty peer table must be refused");
+        assert!(err.contains("names no expected peers"), "the error should say why: {err}");
+
+        // Control: the provisioned table builds, and the roles round-trip by value.
+        let boot = sample_bootstrap();
+        let t = boot.role_table().expect("a provisioned table builds");
+        assert_eq!(t.len(), 2);
+    }
+
+    /// The role tags are a wire enum, so their VALUES are the contract — a bootstrap written by one
+    /// build is read by another. Pinned here rather than trusted to stay put.
+    #[test]
+    fn role_wire_tags_are_stable_by_value() {
+        assert_eq!((ROLE_COORDINATOR, ROLE_DURABILITY_TARGET, ROLE_STAGE_BASE), (0, 1, 2));
+        let boot = Bootstrap {
+            expected_peers: vec![("sp".into(), ROLE_STAGE_BASE + 5)],
+            ..sample_bootstrap()
+        };
+        let t = boot.role_table().unwrap();
+        // A stage's tag carries its rank, so rank 5 must survive the round trip.
+        assert!(format!("{t:?}").contains("rank: 5"), "stage rank must survive the tag encoding: {t:?}");
+    }
+
     #[test]
     fn bootstrap_round_trips_with_forwarding() {
         let boot = Bootstrap {
@@ -377,6 +502,7 @@ mod tests {
             ca_cert_der: vec![1],
             cert_chain_der: vec![vec![2]],
             key_pkcs8_der: vec![3],
+            expected_peers: vec![("coordinator".into(), ROLE_COORDINATOR), ("s1".into(), ROLE_STAGE_BASE)],
             cfg: WorkerConfig {
                 keys: SessionKeys::dev(8),
                 rank: 1,

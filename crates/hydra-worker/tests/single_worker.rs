@@ -30,13 +30,14 @@ fn spawn_worker(cfg: WorkerConfig, server_cfg: rustls::ServerConfig) -> SocketAd
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg)
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table())
                 .await
                 .expect("bind worker");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut worker = Worker::new(cfg).expect("worker");
-            let mut conn = listener.accept().await.expect("accept");
-            let _ = serve_conn(&mut worker, &mut conn).await;
+            let a = listener.accept().await.expect("accept");
+            let (mut conn, role) = (a.conn, a.peer.role);
+            let _ = serve_conn(&mut worker, &mut conn, role).await;
         });
     });
     rx.recv().expect("worker addr")

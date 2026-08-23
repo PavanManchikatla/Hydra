@@ -105,10 +105,11 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = match TcpMtlsListener::bind_with_config(bind, server_cfg).await { Ok(l) => l, Err(e) => { let _ = tx.send(Err(format!("bind {bind}: {e}"))); return; } };
+            let listener = match TcpMtlsListener::bind_with_config(bind, server_cfg, hydra_worker::pair::dev_role_table()).await { Ok(l) => l, Err(e) => { let _ = tx.send(Err(format!("bind {bind}: {e}"))); return; } };
             let _ = tx.send(Ok(listener.local_addr().unwrap()));
             let mut store = BoundaryStore::create(&path, CLUSTER_ID, SESSION_ID).expect("store");
-            let Ok(mut conn) = listener.accept().await else { return };
+            let Ok(a) = listener.accept().await else { return };
+            let mut conn = a.conn;
             while let Ok(frame) = conn.recv().await {
                 if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) = wire::decode(&frame.payload, &keys) {
                     let d = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).unwrap_or(-1);
@@ -127,6 +128,12 @@ fn sp_bootstrap(cluster: &Cluster, keys: &SessionKeys, k2: i32, n_ctx: i32, reco
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig { keys: keys.clone(), rank: 2, layer_first: k2, layer_last: -1, is_final: true, receives_tokens: false, epoch: 0, recovery_id: if recovery_start { 1 } else { 0 }, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: Some(greedy()), recovery_start, shard_manifest: None },
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+            ("sp".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 2),
+        ],
         forwarding: None,
     }
 }
@@ -137,6 +144,12 @@ fn s2_bootstrap(cluster: &Cluster, keys: &SessionKeys, k1: i32, k2: i32, n_ctx: 
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(), key_pkcs8_der: id.key_pkcs8_der(),
         cfg: WorkerConfig { keys: keys.clone(), rank: 1, layer_first: k1, layer_last: k2, is_final: false, receives_tokens: false, epoch: 0, recovery_id: 0, model_path: Some(VM_MODEL.into()), n_gpu_layers: 0, n_ctx, sampler_config: None, recovery_start: false, shard_manifest: None },
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+            ("s2".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 1),
+            ("sp".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE + 2),
+        ],
         forwarding: Some(ForwardingBootstrap { down_addr: format!("{VM1_TS_IP}:{SP_PORT}"), down_name: "sp".into(), dur_addr: format!("{MAC_TS_IP}:{}", dur2.port()), dur_name: "dur2".into(), require_durable: true, capacity: 8 }),
     }
 }

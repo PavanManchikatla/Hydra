@@ -166,6 +166,14 @@ pub fn decode(payload: &[u8], keys: &SessionKeys) -> Result<(FenceView, Msg), Wi
     Ok((view, msg))
 }
 
+/// Cheap peek at a frame's body type — roots the FlatBuffer and reads `body_type` only, touching no
+/// payload. Used by the **audit-C2 role gate**, which must decide whether a peer may send a message
+/// family *before* the body is interpreted: an authorisation check that runs after decoding has
+/// already let the unauthorised peer direct work.
+pub fn peek_body(payload: &[u8]) -> Option<proto::Body> {
+    flatbuffers::root::<proto::Frame>(payload).ok().map(|f| f.body_type())
+}
+
 /// Cheap peek: is this frame a `FWD`? (roots the flatbuffer, reads `body_type`, touches no tensor).
 /// Used by the forwarding serve loop to route a boundary directly to the downstream peer.
 pub fn is_fwd_frame(payload: &[u8]) -> bool {

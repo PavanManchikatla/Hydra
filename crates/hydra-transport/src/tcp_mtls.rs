@@ -9,11 +9,22 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 
 use crate::framed::Conn;
+use crate::roles::{BoundPeer, RoleTable};
 use crate::tls::{ClusterCa, DeviceIdentity};
 use crate::{Transport, TransportError};
 
 /// A connection accepted by [`TcpMtlsListener`].
 pub type ServerConn = Conn<server::TlsStream<TcpStream>>;
+
+/// An accepted connection **together with the role its certificate bound to** (audit C2).
+///
+/// `accept()` returns this rather than a bare `ServerConn` so a caller cannot serve a connection
+/// without having been handed its role. The role is a property of the connection, established once
+/// at the handshake, rather than a check each message handler must remember to perform.
+pub struct AcceptedConn {
+    pub conn: ServerConn,
+    pub peer: BoundPeer,
+}
 /// A connection produced by [`TcpMtls::connect`].
 pub type ClientConn = Conn<client::TlsStream<TcpStream>>;
 
@@ -21,6 +32,10 @@ pub type ClientConn = Conn<client::TlsStream<TcpStream>>;
 pub struct TcpMtlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    /// **Audit C2.** Not an `Option`: a listener cannot exist without a role table, so there is no
+    /// "roles not configured" state for a caller to fall into. An empty table is itself refused at
+    /// bind, with a message saying it is a configuration error rather than a policy.
+    roles: Arc<RoleTable>,
 }
 
 impl TcpMtlsListener {
@@ -28,8 +43,9 @@ impl TcpMtlsListener {
         addr: SocketAddr,
         ca: &ClusterCa,
         id: &DeviceIdentity,
+        roles: RoleTable,
     ) -> Result<Self, TransportError> {
-        Self::bind_with_config(addr, ca.server_config(id)?).await
+        Self::bind_with_config(addr, ca.server_config(id)?, roles).await
     }
 
     /// Bind from a prebuilt server config (e.g. a provisioned worker via
@@ -37,26 +53,54 @@ impl TcpMtlsListener {
     pub async fn bind_with_config(
         addr: SocketAddr,
         cfg: rustls::ServerConfig,
+        roles: RoleTable,
     ) -> Result<Self, TransportError> {
+        // An empty role table would refuse every peer — fail-closed, but almost certainly a
+        // misconfiguration rather than an intent. Catching it at BIND rather than at the first
+        // rejected connection turns a puzzling runtime refusal into a startup error.
+        if roles.is_empty() {
+            return Err(TransportError::UnboundPeer(
+                "refusing to bind a listener with an EMPTY role table: every peer would be refused. \
+                 Name the peers this endpoint expects (audit C2)"
+                    .into(),
+            ));
+        }
         // Addendum 2 §E1: refuse a wildcard bind unless it was explicitly opted into. Checked
         // BEFORE the socket exists, so there is no window in which the port is open on every
         // interface while we decide whether it should be.
         crate::check_bind_addr(addr)?;
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
         let listener = TcpListener::bind(addr).await?;
-        Ok(Self { listener, acceptor })
+        Ok(Self { listener, acceptor, roles: Arc::new(roles) })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Accept one connection and complete the mTLS handshake. Errors (incl. a client whose cert
-    /// is not signed by the cluster CA) surface here as an `Io` error.
-    pub async fn accept(&self) -> Result<ServerConn, TransportError> {
-        let (tcp, _peer) = self.listener.accept().await?;
+    /// Accept one connection, complete the mTLS handshake, and **bind the peer's certificate to a
+    /// configured role** (audit C2). Errors — a client whose cert is not signed by the cluster CA,
+    /// or one that binds to no role or to more than one — surface here, and the connection is
+    /// dropped.
+    ///
+    /// **Fail closed.** There is no variant of this function that yields a connection without a
+    /// role. A peer that authenticates but does not bind is refused, because *authentic* is not
+    /// *authorised*: the cluster CA's signature says the peer belongs to the cluster, never that it
+    /// may speak as a coordinator.
+    pub async fn accept(&self) -> Result<AcceptedConn, TransportError> {
+        let (tcp, _addr) = self.listener.accept().await?;
         let tls = self.acceptor.accept(tcp).await?;
-        Ok(Conn::new(tls))
+        // Bind BEFORE the connection is handed up, so no frame can be read from an unbound peer.
+        let peer = {
+            let (_io, session) = tls.get_ref();
+            self.roles.bind(session.peer_certificates())?
+        };
+        Ok(AcceptedConn { conn: Conn::new(tls), peer })
+    }
+
+    /// The roles this listener will accept — for tests and for logging what an endpoint expects.
+    pub fn roles(&self) -> &RoleTable {
+        &self.roles
     }
 }
 

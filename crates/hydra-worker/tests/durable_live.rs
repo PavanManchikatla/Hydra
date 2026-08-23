@@ -39,10 +39,10 @@ fn spawn_durability_endpoint(server_cfg: rustls::ServerConfig, path: std::path::
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg).await.expect("bind dur");
+            let listener = TcpMtlsListener::bind_with_config("127.0.0.1:0".parse().unwrap(), server_cfg, hydra_worker::pair::dev_role_table()).await.expect("bind dur");
             tx.send(listener.local_addr().unwrap()).unwrap();
             let mut store = BoundaryStore::create(&path, [1; 16], [2; 16]).expect("store");
-            let mut conn = listener.accept().await.expect("accept");
+            let mut conn = listener.accept().await.expect("accept").conn;
             while let Ok(frame) = conn.recv().await {
                 match wire::decode(&frame.payload, &keys) {
                     Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations })) => {
