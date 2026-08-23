@@ -23,6 +23,20 @@ pub enum BoundaryError {
     Wal(#[from] hydra_wal::WalError),
     #[error("malformed BOUNDARY_COPY record: {0}")]
     Malformed(String),
+    /// **Audit H5 / M7 — a boundary that does not continue the durable sequence.** The frontier
+    /// this store returns is a `DURABILITY_ACK`, and an upstream stage **releases its retain
+    /// buffer** on it (R3′). A frontier that ran ahead of a hole would therefore free the very
+    /// boundary a recovery needs, permanently.
+    #[error("boundary at input_pos {got} does not continue the durable sequence (frontier {frontier}); refusing")]
+    NotContiguous { got: i64, frontier: i64 },
+    /// **Audit H5 — the stored record must be fenced to this session/epoch.** A boundary from
+    /// another session or a superseded epoch, replayed into a rebuild, is a wrong-context KV.
+    #[error("boundary fence mismatch: {what}")]
+    FenceMismatch { what: &'static str },
+    /// **Audit H5 (the H9 shape, on the durability plane).** An earlier append failed, so the
+    /// on-disk tail is unknown and the frontier can no longer be trusted to describe the file.
+    #[error("boundary store poisoned by an earlier failed append ({why})")]
+    Poisoned { why: String },
 }
 
 /// One durable boundary read back for a recovery replay.
@@ -38,14 +52,53 @@ pub struct DurableBoundary {
 pub struct BoundaryStore {
     writer: WalWriter,
     durable_through_input_pos: i64,
+    /// **Audit H5 — the session/epoch this store is fenced to.** Every stored record must belong
+    /// to it; a boundary from another session or a superseded epoch is not durability, it is a
+    /// wrong-context KV waiting to be replayed into a rebuild.
+    fence: BoundaryFence,
+    /// Audit H5: positions already made durable, for dedupe. A duplicate is idempotent (the same
+    /// position, already on disk) — never a second record and never a frontier advance.
+    seen: std::collections::BTreeSet<i64>,
+    /// Audit H5 (the H9 shape): set by the first failed append; refuses every later one.
+    poisoned: Option<String>,
+}
+
+/// The identity a boundary store is fenced to (audit H5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryFence {
+    pub cluster_id: [u8; 16],
+    pub session_id: [u8; 16],
+    pub epoch: u32,
 }
 
 impl BoundaryStore {
     /// Create the boundary-durability segment (header `fdatasync`'d + dir `fsync`'d before any record).
     pub fn create(path: impl AsRef<std::path::Path>, cluster_id: [u8; 16], session_id: [u8; 16]) -> Result<BoundaryStore, BoundaryError> {
-        let header = FileHeader { flags: 0, cluster_id, session_scope: session_id };
+        Self::create_fenced(path, BoundaryFence { cluster_id, session_id, epoch: 0 })
+    }
+
+    /// Create a store fenced to `fence` (audit H5). Prefer this: the two-argument [`Self::create`]
+    /// defaults the epoch to 0, which is right for a fresh session and wrong for anything else.
+    pub fn create_fenced(path: impl AsRef<std::path::Path>, fence: BoundaryFence) -> Result<BoundaryStore, BoundaryError> {
+        let header = FileHeader { flags: 0, cluster_id: fence.cluster_id, session_scope: fence.session_id };
         let writer = WalWriter::create(path, &header)?;
-        Ok(BoundaryStore { writer, durable_through_input_pos: -1 })
+        Ok(BoundaryStore {
+            writer,
+            durable_through_input_pos: -1,
+            fence,
+            seen: std::collections::BTreeSet::new(),
+            poisoned: None,
+        })
+    }
+
+    /// The fence this store is bound to.
+    pub fn fence(&self) -> BoundaryFence {
+        self.fence
+    }
+
+    /// Audit H5: has an append failed, leaving the on-disk tail unknown?
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
     }
 
     pub fn durable_through_input_pos(&self) -> i64 {
@@ -56,11 +109,78 @@ impl BoundaryStore {
     /// frontier — the `DURABILITY_ACK` position the upstream stage's R3′ buffer waits on. The
     /// frontier advances **only after** the `fdatasync`'d append returns (structural emit-after-commit
     /// for the durability plane).
+    /// **Audit H5 + M7 — four defects lived in the three lines this replaces.**
+    ///
+    /// 1. **A `max()` frontier.** `durable_through = max(durable_through, pos)` means a boundary
+    ///    that arrives out of order **jumps the frontier over the gap**. The returned value is a
+    ///    `DURABILITY_ACK`, and R3′ tells the upstream stage it may **release its retain buffer**
+    ///    up to it — so acking 5 when 4 never landed frees the boundary a recovery needs, and it
+    ///    is gone. *Acking durability over holes*, in the audit's words.
+    /// 2. **Swallowed append errors.** The durability-target serve loops wrote
+    ///    `append_boundary(..).unwrap_or(-1)` and carried on. Combined with (1), a failed write
+    ///    followed by a successful later one acked straight over the failure.
+    /// 3. **No dedupe.** A retransmitted boundary appended a second copy of the same position.
+    /// 4. **No session/epoch fence on stored records** — a boundary from another session or a
+    ///    superseded epoch was stored and later replayed into a rebuild as if it belonged.
+    ///
+    /// All four are now refusals. **Contiguity (M7) is the frontier rule**: a boundary must be
+    /// `frontier + 1`, or a duplicate of something already durable (idempotent, no second record);
+    /// anything else is `NotContiguous` and the frontier does not move. An error poisons the store
+    /// (the H9 shape) because after a failed write the file's tail — and therefore the meaning of
+    /// the frontier — is unknown.
     pub fn append_boundary(&mut self, boundary_id: u32, first_input_pos: i64, chunk_id: u32, activations: &[f32]) -> Result<i64, BoundaryError> {
+        self.append_boundary_fenced(
+            BoundaryFence { cluster_id: self.fence.cluster_id, session_id: self.fence.session_id, epoch: self.fence.epoch },
+            boundary_id,
+            first_input_pos,
+            chunk_id,
+            activations,
+        )
+    }
+
+    /// [`Self::append_boundary`] with the sender's fence stated explicitly — the form a real
+    /// durability target uses, since the fence arrives on the wire with the `BOUNDARY_COPY` frame
+    /// and must be checked against the store's own before anything is written (audit H5).
+    pub fn append_boundary_fenced(
+        &mut self,
+        fence: BoundaryFence,
+        boundary_id: u32,
+        first_input_pos: i64,
+        chunk_id: u32,
+        activations: &[f32],
+    ) -> Result<i64, BoundaryError> {
+        if let Some(why) = &self.poisoned {
+            return Err(BoundaryError::Poisoned { why: why.clone() });
+        }
+        if fence.cluster_id != self.fence.cluster_id {
+            return Err(BoundaryError::FenceMismatch { what: "cluster_id" });
+        }
+        if fence.session_id != self.fence.session_id {
+            return Err(BoundaryError::FenceMismatch { what: "session_id" });
+        }
+        if fence.epoch != self.fence.epoch {
+            return Err(BoundaryError::FenceMismatch { what: "session_epoch" });
+        }
+        if first_input_pos < 0 {
+            return Err(BoundaryError::NotContiguous { got: first_input_pos, frontier: self.durable_through_input_pos });
+        }
+        // Dedupe: a position already durable is acked from the frontier, with nothing written.
+        if self.seen.contains(&first_input_pos) {
+            return Ok(self.durable_through_input_pos);
+        }
+        // Contiguity (M7): the only position that may extend the durable sequence is the next one.
+        if first_input_pos != self.durable_through_input_pos + 1 {
+            return Err(BoundaryError::NotContiguous { got: first_input_pos, frontier: self.durable_through_input_pos });
+        }
+
         let payload = encode_boundary_record(boundary_id, first_input_pos, chunk_id, activations);
-        self.writer.append(rec_type::BOUNDARY_COPY, 0, &payload)?;
-        // Durable now — advance the frontier (boundaries are appended in input-position order).
-        self.durable_through_input_pos = self.durable_through_input_pos.max(first_input_pos);
+        if let Err(e) = self.writer.append(rec_type::BOUNDARY_COPY, 0, &payload) {
+            self.poisoned = Some(e.to_string());
+            return Err(BoundaryError::Wal(e));
+        }
+        // Durable now — and only now does the frontier move, by exactly one position.
+        self.durable_through_input_pos = first_input_pos;
+        self.seen.insert(first_input_pos);
         Ok(self.durable_through_input_pos)
     }
 
@@ -72,6 +192,15 @@ impl BoundaryStore {
             out.push(decode_boundary_record(&r.payload)?);
         }
         out.sort_by_key(|b| b.first_input_pos);
+        // **M7 on the read side.** A rebuild replays these into a KV, so a gap is not a missing
+        // record — it is a KV that skips a position and every later position attending over a
+        // history that never existed. The write side refuses gaps; this asserts the file agrees,
+        // because the file is what a *different process* recovers from.
+        for (i, b) in out.iter().enumerate() {
+            if b.first_input_pos != i as i64 {
+                return Err(BoundaryError::NotContiguous { got: b.first_input_pos, frontier: i as i64 - 1 });
+            }
+        }
         Ok(out)
     }
 }

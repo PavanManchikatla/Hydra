@@ -141,3 +141,111 @@ fn group_committer_thresholds_at_k() {
     assert!(!batch.snapshot.is_empty(), "the last position's snapshot is carried");
     assert!(g.is_empty() && g.take().is_none());
 }
+
+// ---------------------------------------------------------------------------------------------
+// H10 — reopening the commit stream after a restart.
+//
+// **Standing rule 19: what the oracle could not see.** Nothing here could see anything about the
+// restart path, because the restart path *did not exist*: `CommitStream` had `create` and
+// `with_durability` and no `open`. The ledger was readable (`recovery::read` reconstructs the
+// token history), but the STREAM's own state — its watermarks, its commit-id chain — was not
+// reconstructed by anything, so a coordinator that came back up and resumed appending did so as
+// if the file were empty. There was no failing test to write, because there was no function to
+// call: the absence of an API is the most complete oracle blindness there is.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn reopening_restores_every_watermark_and_continues_the_commit_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.wal");
+
+    // A session that ran: admission, a prefill chunk, two generation commits.
+    let (durable_pos, ckpt_id, stable_pos, last_id, len) = {
+        let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
+        cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        cs.append_input_chunk_commit(&wal_fence(), 0, 0, 0, 31, &[31]).expect("chunk");
+        cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(5, 2, 2)).expect("gen1");
+        cs.append_generation_commit(&wal_fence(), 3, 5, &[(3, 103), (4, 104), (5, 105)], &snapshot(9, 5, 5)).expect("gen2");
+        (cs.generation_durable_pos(), cs.committed_sampler_checkpoint_id(), cs.prefill_stable_pos(), cs.last_commit_id(), cs.durable_len())
+    }; // the coordinator process dies here
+
+    let mut re = CommitStream::open(&path).expect("reopen");
+    assert_eq!(re.generation_durable_pos(), durable_pos, "generation_durable_pos must be restored — otherwise every durable position looks un-emitted and the emit-after-commit gate re-opens");
+    assert_eq!(re.committed_sampler_checkpoint_id(), ckpt_id, "the committed checkpoint id must be restored — recovery installs it");
+    assert_eq!(re.prefill_stable_pos(), stable_pos, "prefill_stable_pos must be restored — otherwise a chunk that moves the input frontier BACKWARDS is accepted");
+    assert_eq!(re.last_commit_id(), last_id, "the commit-id chain must continue, not restart");
+    assert_eq!(re.durable_len(), len, "nothing was discarded from an intact log");
+
+    // The next commit continues the chain rather than re-using an id already on disk.
+    let next = re.append_generation_commit(&wal_fence(), 6, 6, &[(6, 106)], &snapshot(11, 6, 6)).expect("post-restart commit");
+    assert_eq!(next, last_id + 1, "commit ids continue across the restart");
+
+    // And the restored monotonicity check is live: a backwards chunk is refused, which a
+    // freshly-constructed stream (prefill_stable_pos = -1) would have accepted.
+    assert!(re.append_input_chunk_commit(&wal_fence(), 0, 1, 0, 15, &[15]).is_err(), "a backwards chunk must be refused after a restart, exactly as before it");
+
+    // The whole file still reads back as one consistent ledger.
+    let scan = hydra_wal::reader::WalScan::open(&path).expect("scan");
+    assert!(!scan.truncated_tail);
+    let gens = scan.records.iter().filter(|r| r.record_type == hydra_wal::record::rec_type::GENERATION_COMMIT).count();
+    assert_eq!(gens, 3, "two pre-restart generation commits plus the post-restart one");
+}
+
+/// **The discard is durable, and it is a discard — not a silent overwrite.** A crash mid-append
+/// leaves a partial record; reopening must truncate to the durable prefix, `fdatasync` that
+/// truncation, and then append after it.
+#[test]
+fn reopening_discards_a_partial_tail_durably_and_appends_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.wal");
+    let durable_len = {
+        let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
+        cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        cs.append_generation_commit(&wal_fence(), 0, 0, &[(0, 100)], &snapshot(3, 0, 0)).expect("gen");
+        cs.durable_len()
+    };
+
+    // Simulate the crash: a partially written record is on the platter.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0x43, 0x52, 0xAB, 0xCD, 0x00, 0x00]).unwrap(); // a torn record header
+        f.sync_data().unwrap();
+    }
+    assert!(std::fs::metadata(&path).unwrap().len() > durable_len, "the partial tail really is on disk");
+
+    let mut re = CommitStream::open(&path).expect("reopen over a torn tail");
+    assert_eq!(re.generation_durable_pos(), 0, "the durable prefix is what counts");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        durable_len,
+        "the partial tail must be truncated on disk — a bookkeeping-only discard would leave it to be re-read after the NEXT crash"
+    );
+
+    re.append_generation_commit(&wal_fence(), 1, 1, &[(1, 101)], &snapshot(4, 1, 1)).expect("append after the discard");
+    let scan = hydra_wal::reader::WalScan::open(&path).expect("the log is clean");
+    assert!(!scan.truncated_tail, "no torn tail remains");
+    assert_eq!(scan.records.len(), 3, "INITIAL + two GENERATION commits, and no trace of the discarded bytes");
+}
+
+/// **H8 meets H10:** a log with mid-stream damage must not be reopened at all. Silently starting
+/// from a truncated prefix would be the H8 defect wearing H10's clothes.
+#[test]
+fn reopening_refuses_a_log_with_mid_stream_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.wal");
+    {
+        let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
+        cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        for pos in 0..4i64 {
+            cs.append_generation_commit(&wal_fence(), pos, pos, &[(pos, 100)], &snapshot(3, pos, pos)).expect("gen");
+        }
+    }
+    // Corrupt the magic of a middle record: valid records follow it.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mid = hydra_wal::file::FILE_HEADER_LEN + 8; // inside the first record's header region
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(CommitStream::open(&path).is_err(), "a damaged ledger must refuse to reopen, not resume from a guess");
+}

@@ -20,6 +20,16 @@ pub enum WalKindTag {
     Intent,
     Complete,
     Abort,
+    /// **Audit M6 (2026-08-23).** `ACTIVATION_UNSERVABLE` used to be recorded *atomically* — the
+    /// SM pushed it into its durable WAL in the same step that emitted the write effect, i.e. it
+    /// treated the write as instantly durable. Spec §6.7 step 1 says *"C **fsyncs**
+    /// ACTIVATION_UNSERVABLE"* and §1.2 lists it under WAL-before-wire, so the atomic form was the
+    /// **code and the model agreeing with each other and not with the spec**. It now goes through
+    /// `WalDurable` like every other durable decision, which makes the crash window between write
+    /// and durability reachable — the window §6.5's restart classification depends on.
+    Unservable,
+    /// `SESSION_TERMINATE`, on the same footing (spec §1.2).
+    Terminate,
 }
 
 /// Coordinator activation state (subset of TLA+ `cState` for the transition-core slice).
@@ -45,7 +55,23 @@ pub enum CoordState {
     Finalizing,
     /// Finalized everywhere; data plane may serve (I16/I20).
     Serviceable,
-    /// `ACTIVATION_UNSERVABLE` recorded: the decision stands but is not served (§6.7).
+    /// `ACTIVATION_UNSERVABLE` written, awaiting its fdatasync (audit M6).
+    ///
+    /// **TLA+ correspondence (BLUEPRINT §4.3), and why the model does not change:** the model's
+    /// `Wal(r) == wal' = wal ∪ {r}` makes every write **atomically durable**, i.e. its `wal` *is*
+    /// the durable set — a record is in it iff it survived. `CoordRecordUnservable` is therefore
+    /// one atomic action, and a crash "in the write→fdatasync window" is indistinguishable in the
+    /// model from a crash *before* the action: the record is simply absent, which is what a real
+    /// disk gives you too. The defect was that the **code violated that abstraction** by putting
+    /// the record into its own durable set before the fdatasync returned. This state maps onto the
+    /// model's *pre-action* state (`ACTIVATION_COMPLETE`/`FINALIZING`), exactly as `IntentPending`
+    /// and `CompletePending` already do, and the model action is taken at `WalDurable`. **The model
+    /// semantics do not move, so per rule 11 no full TLC rerun is owed — this is the code
+    /// conforming to the model, the same shape as H2/H3.** A crash here loses the
+    /// record — which is precisely why §6.5 classifies a restart with no durable UNSERVABLE as
+    /// *still finalizing*, and why the record must be durable before the transition is taken.
+    UnservablePending,
+    /// `ACTIVATION_UNSERVABLE` **durable**: the decision stands but is not served (§6.7).
     Superseding,
     Crashed,
     Terminal,
@@ -202,6 +228,8 @@ impl Coordinator {
                     && !self.lost.is_empty()
             }
             ProceedStartSuperseding => self.state == CoordState::Superseding,
+            // M6: while the UNSERVABLE record is in flight the coordinator is committed to the
+            // decision but must not act on it, exactly like IntentPending/CompletePending.
             // external events: deliverable in any live (non-crashed/terminal) state
             _ => !matches!(self.state, CoordState::Terminal),
         }
@@ -325,9 +353,15 @@ impl Coordinator {
                 // WriteWal effect below is still emitted (a real disk / the sim's virtual WAL records
                 // it), but `self.wal` does not — so restart misclassifies. The sim re-finds it via
                 // the WAL-codec cross-check (monotone-mutation rule).
-                #[cfg(not(feature = "mutation_unservable_restart"))]
-                self.wal.push(WalRecord::ActivationUnservable { completion_id });
-                self.state = CoordState::Superseding;
+                // **Audit M6: the transition now waits for durability.** This used to push the
+                // record into `self.wal` (the SM's durable truth) and enter SUPERSEDING in the same
+                // step as emitting the write — treating the fdatasync as instantaneous, and making
+                // the crash window between them unreachable in both the code and the sim (whose
+                // hard-coded fsync mirrored the same assumption). The record is now applied in
+                // `on_wal_durable`, so a crash in the window leaves NO durable UNSERVABLE, and
+                // §6.5's restart classification correctly reports "still finalizing" — which is
+                // what the spec's "C fsyncs ACTIVATION_UNSERVABLE" always implied.
+                self.state = CoordState::UnservablePending;
                 vec![Effect::WriteWal {
                     id,
                     record: WalRecord::ActivationUnservable { completion_id },
@@ -389,6 +423,29 @@ impl Coordinator {
                     self.wal.push(WalRecord::ActivationComplete { tuple, completion_id });
                     self.state = CoordState::ActivationComplete;
                 }
+            }
+            WalKindTag::Unservable => {
+                if self.state == CoordState::UnservablePending {
+                    let completion_id = self.completion_id().unwrap_or(0);
+                    // Mut5 (`mutation_unservable_restart`) reintroduces the original omission: the
+                    // WriteWal effect was emitted (a real disk / the sim's virtual WAL records it)
+                    // but `self.wal` does not, so a restart misclassifies. The sim re-finds it via
+                    // the WAL-codec cross-check (monotone-mutation rule).
+                    #[cfg(not(feature = "mutation_unservable_restart"))]
+                    self.wal.push(WalRecord::ActivationUnservable { completion_id });
+                    let _ = completion_id;
+                    self.state = CoordState::Superseding;
+                }
+            }
+            WalKindTag::Terminate => {
+                // `SESSION_TERMINATE` is durable-then-terminal for the same reason (spec §1.2).
+                //
+                // **Stated honestly: nothing in this SM emits that record yet** — the tag exists
+                // so the sim's WAL interpretation is total and so the transition is written down
+                // where the rest of the durability choreography lives, rather than being invented
+                // later by whoever first needs it. It is unreached code, and calling it "covered"
+                // because it compiles would be exactly the over-promise §7.31 is about.
+                self.state = CoordState::Terminal;
             }
             WalKindTag::Abort => {
                 if self.state == CoordState::AbortPending {

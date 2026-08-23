@@ -148,7 +148,19 @@ fn spawn_mac_durability(cluster: &Cluster, name: &str, port: u16, path: std::pat
             let mut conn = a.conn;
             while let Ok(frame) = conn.recv().await {
                 if let Ok((view, Msg::BoundaryCopy { boundary_id, first_input_pos, chunk_id, activations, .. })) = wire::decode(&frame.payload, &fence) {
-                    let durable_through = store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations).unwrap_or(-1);
+                    // **Audit H5: a failed durable write is never swallowed.** This read
+                    // `.unwrap_or(-1)` and carried on — so a failure became an ack of "-1",
+                    // the loop continued, and the NEXT success acked straight over the hole
+                    // (with the old max() frontier). The upstream stage releases its retain
+                    // buffer on this number, so the boundary a recovery needs was freed.
+                    // A durability target that cannot persist must stop, loudly.
+                    let durable_through = match store.append_boundary(boundary_id, first_input_pos, chunk_id, &activations) {
+                        Ok(frontier) => frontier,
+                        Err(e) => {
+                            eprintln!("durability target: refusing to ack — {e}");
+                            break;
+                        }
+                    };
                     let ack = wire::encode_durability_ack(&fence, view.epoch, boundary_id, durable_through, 0);
                     if conn.send(0, &ack).await.is_err() {
                         break;

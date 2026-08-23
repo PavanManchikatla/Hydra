@@ -150,6 +150,82 @@ impl CommitStream {
         Ok(Self::with_durability(Box::new(writer)))
     }
 
+    /// **Audit H10 — reopen an existing commit stream after a coordinator restart, restoring
+    /// EVERY watermark from the durable prefix, and discarding any partial tail DURABLY.**
+    ///
+    /// # What did not exist before, and what that cost
+    ///
+    /// There was no `open`. A restarting coordinator could only `create` (which refuses an
+    /// existing file) or build a fresh stream over a new sink — so the restart-and-continue path
+    /// had **no implementation and therefore no oracle**: `recovery::read` reconstructed the
+    /// *token ledger* from the file, and nothing reconstructed the *stream's own* state. A
+    /// coordinator that resumed appending would have done so with `generation_durable_pos = -1`,
+    /// `prefill_stable_pos = -1`, `committed_sampler_checkpoint_id = 0` and `next_commit_id = 1`,
+    /// which means:
+    ///
+    /// * **commit ids restart at 1**, re-using ids already on disk and breaking the
+    ///   `previous_commit_id` chain that makes the ledger self-linking;
+    /// * **`prefill_stable_pos = -1` accepts a chunk that moves the input frontier backwards** —
+    ///   the monotonicity check exists but has nothing to compare against;
+    /// * **the emit-after-commit gate re-opens**: `generation_durable_pos = -1` means every
+    ///   already-durable position looks un-emitted.
+    ///
+    /// # The durable discard
+    ///
+    /// A crash can leave a partially-written record. `WalScan` decides where the durable prefix
+    /// ends (and since H8 **refuses** a log whose damage is not a tail); `WalWriter::open_append`
+    /// then truncates to that boundary **and `fdatasync`s the truncation** before this returns, so
+    /// a second crash cannot resurrect the discarded bytes. The discard is a durable act, not a
+    /// bookkeeping one.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<CommitStream, CommitError> {
+        let path = path.as_ref();
+        let scan = hydra_wal::reader::WalScan::open(path)?;
+
+        let mut generation_durable_pos: i64 = -1;
+        let mut prefill_stable_pos: i64 = -1;
+        let mut committed_sampler_checkpoint_id: u64 = 0;
+        let mut last_commit_id: u64 = 0;
+
+        for r in &scan.records {
+            match r.record_type {
+                rec_type::INITIAL_COMMIT => {
+                    let ic = flatbuffers::root::<wal::InitialCommit>(&r.payload)
+                        .map_err(|e| CommitError::BadCheckpoint(format!("INITIAL_COMMIT at {}: {e}", r.offset)))?;
+                    committed_sampler_checkpoint_id = ic.initial_checkpoint().checkpoint_id();
+                }
+                rec_type::GENERATION_COMMIT => {
+                    // Re-validate I19 on the way in: the reader already does it, and doing it here
+                    // too costs nothing and keeps this constructor honest about what it accepts.
+                    validate_generation_commit_i19(&r.payload).map_err(CommitError::I19)?;
+                    let gc = flatbuffers::root::<wal::GenerationCommit>(&r.payload)
+                        .map_err(|e| CommitError::BadCheckpoint(format!("GENERATION_COMMIT at {}: {e}", r.offset)))?;
+                    generation_durable_pos = gc.last_output_pos();
+                    committed_sampler_checkpoint_id = gc.checkpoint().checkpoint_id();
+                    last_commit_id = last_commit_id.max(gc.commit_id());
+                }
+                rec_type::INPUT_CHUNK_COMMIT => {
+                    let icc = flatbuffers::root::<wal::InputChunkCommit>(&r.payload)
+                        .map_err(|e| CommitError::BadCheckpoint(format!("INPUT_CHUNK_COMMIT at {}: {e}", r.offset)))?;
+                    prefill_stable_pos = icc.last_input_pos();
+                }
+                _ => {}
+            }
+        }
+
+        // The DURABLE discard: truncate to the scanned prefix and fdatasync before any append.
+        let writer = WalWriter::open_append(path, scan.durable_len)?;
+
+        Ok(CommitStream {
+            writer: Box::new(writer),
+            poisoned: None,
+            generation_durable_pos,
+            committed_sampler_checkpoint_id,
+            next_commit_id: last_commit_id + 1,
+            last_commit_id,
+            prefill_stable_pos,
+        })
+    }
+
     /// Build over an arbitrary [`Durability`] sink (tests: a stalling/failing `fdatasync` to prove
     /// the emit-after-commit gate by absence).
     pub fn with_durability(writer: Box<dyn Durability>) -> CommitStream {

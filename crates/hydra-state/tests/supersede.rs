@@ -59,8 +59,12 @@ fn drive_to_post_decision_loss() -> Coordinator {
 fn post_decision_loss_supersedes_and_recovers() {
     let mut c = drive_to_post_decision_loss();
     assert!(!c.post_decision_deadlock(), "supersession path is available → not stuck");
-    // record ACTIVATION_UNSERVABLE → SUPERSEDING (decision stands; nothing served)
+    // Record ACTIVATION_UNSERVABLE → **the record is written, not yet durable** (audit M6). The
+    // transition waits for the fdatasync, exactly as the intent and complete writes do; this step
+    // used to be atomic, which is what made the crash window below unreachable.
     c.step(ProceedRecordUnservable);
+    assert_eq!(c.state(), CoordState::UnservablePending, "written, awaiting fdatasync");
+    c.step(WalDurable(hydra_state::coordinator::WalKindTag::Unservable));
     assert_eq!(c.state(), CoordState::Superseding);
     assert!(invariants::check(&c).is_empty());
     // open the superseding recovery at epoch+1 → progress restored
@@ -85,8 +89,9 @@ fn post_decision_loss_supersedes_and_recovers() {
 fn f_unservable_crash_in_superseding_window_restarts_to_superseding() {
     let mut c = drive_to_post_decision_loss();
     let effs = c.step(ProceedRecordUnservable);
-    assert_eq!(c.state(), CoordState::Superseding);
     assert!(no_finalize(&effs), "recording unservable must not emit FINALIZE");
+    c.step(WalDurable(hydra_state::coordinator::WalKindTag::Unservable));
+    assert_eq!(c.state(), CoordState::Superseding);
     // crash + restart while still in the superseding window (epoch not yet advanced)
     c.step(Crash);
     let effs = c.step(Restart);
@@ -127,4 +132,55 @@ fn mut1_post_decision_loss_deadlocks() {
         c.post_decision_deadlock(),
         "mutation parity: the sim's deadlock watchdog must flag Mut1's PostDecisionLoss hole"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// **Audit M6 — the crash window between writing ACTIVATION_UNSERVABLE and its fdatasync.**
+//
+// # What the oracles could not see
+//
+// Two of them, agreeing with each other and with neither the spec nor a real disk:
+//
+// * **The coordinator SM** pushed the UNSERVABLE record into its durable WAL *in the same step*
+//   that emitted the write effect — treating the fdatasync as instantaneous.
+// * **The DST sim** called `vwal.fsync()` the instant such a record was written, "to keep the
+//   virtual disk's durable set == self.wal". It was keeping the sim consistent with the SM's
+//   mistake.
+//
+// So no schedule in 10M+ steps could place a crash between the write and its durability — the
+// simulator was blind by construction to the exact window the record exists to survive. Spec §6.7
+// step 1 says *"C **fsyncs** ACTIVATION_UNSERVABLE"* and §1.2 lists it under WAL-before-wire, so
+// the atomic form was code and model agreeing against the spec.
+//
+// The test below is the window itself, and it asserts the *opposite* outcome from its sibling
+// above: a crash BEFORE the record is durable must NOT classify the restart as superseding,
+// because on a real disk there is nothing to classify from.
+// ---------------------------------------------------------------------------------------------
+#[cfg(not(any(feature = "mutation_no_unservable", feature = "mutation_unservable_restart")))]
+#[test]
+fn a_crash_before_the_unservable_record_is_durable_leaves_no_unservable_fact() {
+    let mut c = drive_to_post_decision_loss();
+
+    // The write is issued; the fdatasync has NOT returned.
+    let effs = c.step(ProceedRecordUnservable);
+    assert_eq!(c.state(), CoordState::UnservablePending);
+    assert!(no_finalize(&effs), "the write must not emit FINALIZE");
+
+    // The machine dies in the window. Nothing durable was written.
+    c.step(Crash);
+    let effs = c.step(Restart);
+    assert_ne!(
+        c.state(),
+        CoordState::Superseding,
+        "with no DURABLE unservable record there is no unservable fact to restart into — claiming \
+         one would be the coordinator believing a write that may never have reached the platter"
+    );
+    assert!(no_finalize(&effs), "restart must not emit FINALIZE for a lost participant either");
+    assert!(invariants::check(&c).is_empty(), "the state after the lost write is still legal");
+
+    // And the recourse is intact: the coordinator can record it again, and this time it lands.
+    c.step(ProceedRecordUnservable);
+    c.step(WalDurable(hydra_state::coordinator::WalKindTag::Unservable));
+    assert_eq!(c.state(), CoordState::Superseding, "re-recording after the lost write converges");
+    assert!(invariants::check(&c).is_empty());
 }

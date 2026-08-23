@@ -309,6 +309,7 @@ dependencies = [
  "hydra-state",
  "hydra-tokenizer",
  "hydra-wal",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",

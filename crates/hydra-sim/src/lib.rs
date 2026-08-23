@@ -237,13 +237,23 @@ impl World {
                         WalRecord::ActivationAbort { .. } => {
                             self.pending_wal = Some(WalKindTag::Abort)
                         }
-                        // ACTIVATION_UNSERVABLE (and SESSION_TERMINATE) are recorded synchronously
-                        // by the coordinator (atomic WAL-write + state transition, no separate
-                        // WalDurable step — F-UNSERVABLE / TLA+ CoordRecordUnservable), so fsync
-                        // them immediately here to keep the virtual disk's durable set == self.wal.
-                        WalRecord::ActivationUnservable { .. } | WalRecord::SessionTerminate => {
-                            self.vwal.fsync()
+                        // **Audit M6 — the hard-coded fsync is GONE (2026-08-23).**
+                        //
+                        // This arm used to call `self.vwal.fsync()` the instant an
+                        // ACTIVATION_UNSERVABLE or SESSION_TERMINATE record was written, on the
+                        // grounds that the coordinator records them "synchronously". The effect
+                        // was that **no schedule could ever place a crash between the write and
+                        // its durability** — the simulator was blind by construction to the exact
+                        // window the record exists to survive (§6.5's restart classification reads
+                        // it, and F-UNSERVABLE is the finding that it must be durable to be read).
+                        // A sim that cannot produce the window cannot guard it, which is standing
+                        // rule 19. These records now go through the same `pending_wal` →
+                        // `WalDurable` path as every other WAL write, so the crash window is
+                        // schedulable like any other.
+                        WalRecord::ActivationUnservable { .. } => {
+                            self.pending_wal = Some(WalKindTag::Unservable)
                         }
+                        WalRecord::SessionTerminate => self.pending_wal = Some(WalKindTag::Terminate),
                     }
                 }
                 Effect::Send { msg, .. } => match msg {

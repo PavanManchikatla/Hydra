@@ -20,5 +20,8 @@ futures-core = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# Audit H10: the reopen tests need a real file on a real filesystem — the durable discard is a
+# truncate + fdatasync, and an in-memory sink cannot express it.
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
