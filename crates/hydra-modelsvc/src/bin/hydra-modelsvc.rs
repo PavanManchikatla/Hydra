@@ -16,6 +16,21 @@ use hydra_modelsvc::gguf::{layers_present, Gguf};
 use hydra_modelsvc::manifest::{generate_keypair, keypair_from_pkcs8, Manifest};
 use hydra_modelsvc::split::split;
 
+/// **Audit H11 / M19 — join a single, non-escaping component onto a directory.**
+///
+/// `Path::join` silently discards the directory when the component is absolute, and happily walks
+/// upward on `..`. Requiring exactly one `Normal` component makes both impossible, and the failure
+/// is an error rather than a sanitised path: a name the operator did not choose should not become
+/// a file they did not expect, even a harmless-looking one.
+fn safe_join(dir: &str, component: &str) -> Result<std::path::PathBuf, String> {
+    let p = Path::new(component);
+    let mut it = p.components();
+    match (it.next(), it.next()) {
+        (Some(std::path::Component::Normal(c)), None) => Ok(Path::new(dir).join(c)),
+        _ => Err(format!("REFUSED: {component:?} is not a single safe path component (audit H11/M19)")),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -77,16 +92,22 @@ fn cmd_split(args: &[String]) -> Result<(), String> {
     let out = split(&g, &ranges, &kp).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {out_dir}: {e}"))?;
     for shard in &out.shards {
-        let p = Path::new(out_dir).join(&shard.file_name);
+        // Audit H11 / M19: a file name from a manifest may never escape `out_dir`. `Path::join`
+        // discards the left side on an absolute right side, so this is checked, not assumed.
+        let p = safe_join(out_dir, &shard.file_name)?;
         std::fs::write(&p, &shard.bytes).map_err(|e| format!("write {}: {e}", p.display()))?;
         println!("wrote {} ({} bytes)", p.display(), shard.bytes.len());
     }
-    let arch = out.manifest.architecture.clone();
-    let mp = Path::new(out_dir).join(format!("{arch}.manifest"));
+    // Audit H11: `architecture` is already validated at the source (`split::sanitize_arch`), but
+    // the value written into a manifest by an OLDER build is untrusted input to this one — so the
+    // joins below are guarded here too, and the guard is a re-validation rather than a comment
+    // saying it happened earlier.
+    let arch = hydra_modelsvc::split::sanitize_arch(&out.manifest.architecture).map_err(|e| e.to_string())?;
+    let mp = safe_join(out_dir, &format!("{arch}.manifest"))?;
     std::fs::write(&mp, out.manifest.to_bytes().map_err(|e| e.to_string())?).map_err(|e| format!("write manifest: {e}"))?;
     println!("wrote {} (signed)", mp.display());
     if let Some(pk8) = pk8 {
-        let kp_path = Path::new(out_dir).join(format!("{arch}.signing.pkcs8"));
+        let kp_path = safe_join(out_dir, &format!("{arch}.signing.pkcs8"))?;
         std::fs::write(&kp_path, pk8).map_err(|e| format!("write key: {e}"))?;
         println!("wrote {} (dev signing key — keep private)", kp_path.display());
     }
@@ -132,7 +153,10 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     println!("manifest blake3: {} — bind this into the session fence tuple's manifest_hash (H14)", hex8(&self_hash));
     // 2. Each shard's bytes hash to the manifest's recorded BLAKE3.
     for s in &m.shards {
-        let bytes = read(&Path::new(dir).join(&s.file_name).to_string_lossy())?;
+        // Audit M19: `file_name` is manifest-controlled, and the manifest is verified but not
+        // therefore *safe* — a validly signed manifest can still name `../../etc/passwd`, and this
+        // command would read and hash it. One Normal component, or refuse.
+        let bytes = read(&safe_join(dir, &s.file_name)?.to_string_lossy())?;
         let got = *blake3::hash(&bytes).as_bytes();
         if got != s.shard_blake3 {
             return Err(format!("SHARD REFUSED: {} BLAKE3 mismatch", s.file_name));

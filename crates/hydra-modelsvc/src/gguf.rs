@@ -17,6 +17,12 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GgufError {
+    /// **Audit H12.** An array whose elements are themselves arrays. The parser used to recurse
+    /// for each one, unbounded — 12 wire bytes per level, so a small file overflows the stack and
+    /// aborts. Upstream GGUF has no nested-array support, so this shape never occurs in a real
+    /// model file.
+    #[error("nested array at offset {at}: GGUF arrays may not contain arrays")]
+    NestedArray { at: usize },
     #[error("not a GGUF file (bad magic)")]
     BadMagic,
     #[error("unsupported GGUF version {0} (expected 2 or 3)")]
@@ -192,6 +198,23 @@ impl<'a> Cursor<'a> {
             8 => GgufValue::Str(self.string()?),
             9 => {
                 let elem_type = self.u32()?;
+                // **Audit H12 — nested arrays are refused, not recursed into.**
+                //
+                // `value()` called itself for each element with no depth bound, and each nesting
+                // level costs **12 wire bytes** (`elem_type = 9`, `n = 1`). Observed rather than
+                // reasoned about: a **600 KB** input at depth 50 000 overflows the main thread's
+                // 8 MiB stack and aborts — `fatal runtime error: stack overflow`. A stack overflow
+                // is SIGSEGV/abort, the same **uncatchable** class as the `reserve_for`
+                // amplification this parser was hardened against; no `catch_unwind` sees it.
+                //
+                // The bound is a refusal rather than a depth cap because **upstream GGUF does not
+                // support nested arrays at all** (`llama.cpp`'s reader has no case for it), so no
+                // real model file contains one: a cap would preserve a shape nothing produces,
+                // while a refusal removes the recursion outright. The array itself (depth 1) is
+                // ordinary and stays — `tokenizer.ggml.tokens` is one.
+                if elem_type == 9 {
+                    return Err(GgufError::NestedArray { at: self.i });
+                }
                 let n = self.u64()?;
                 // Smallest element on the wire is 1 byte (u8/i8/bool), so `remaining` is the ceiling.
                 let mut values = Vec::with_capacity(self.reserve_for(n, 1));

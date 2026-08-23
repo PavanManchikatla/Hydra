@@ -217,3 +217,35 @@ fn a_case_is_reproducible_from_seed_and_iteration_alone() {
         }
     }
 }
+
+/// **Audit H12 — the generator can now reach nesting the parser refuses.**
+///
+/// The oracle half of the fix. `gen.rs` read `if depth >= 2 { 4 }`, so **no case the fuzzer could
+/// ever generate nested deeper than two levels**, while the parser's unbounded recursion needed
+/// thousands to matter: 24 CPU-hours of green verdicts *structurally excluded* the bug this target
+/// exists to find. A generator that stops where the parser stops can only confirm the parser
+/// agrees with itself — so this asserts the generator produces the shape that is now refused.
+#[test]
+fn the_generator_reaches_array_nesting_deeper_than_the_old_cap() {
+    let mut deepest = 0usize;
+    for iteration in 0..4_000u64 {
+        let mut rng = hydra_fuzz::Rng::for_case(11, iteration);
+        let case = hydra_fuzz::gen::gguf_case(&mut rng);
+        // Consecutive `elem_type = 9` markers: a lower bound on the nesting emitted.
+        let (mut d, mut i) = (0usize, 0usize);
+        while i + 12 <= case.len() {
+            if u32::from_le_bytes([case[i], case[i + 1], case[i + 2], case[i + 3]]) == 9 {
+                d += 1;
+                i += 12;
+            } else {
+                i += 1;
+            }
+        }
+        deepest = deepest.max(d);
+    }
+    assert!(
+        deepest > 2,
+        "the generator must nest deeper than the old `depth >= 2` cap, or it structurally excludes \
+         H12 all over again (deepest seen: {deepest})"
+    );
+}

@@ -135,6 +135,13 @@ pub fn gguf_case(rng: &mut Rng) -> Vec<u8> {
 
 /// Serialize a plausible value for GGUF type `ty`. `depth` bounds array nesting so the *generator*
 /// cannot be the thing that runs out of stack.
+/// How deep the generator will nest an array (audit H12).
+///
+/// Deliberately generous: the parser now refuses nesting outright, so this exists to *produce* the
+/// refused shape, not to stay inside it. A generator that stops where the parser stops can only
+/// confirm the parser agrees with itself.
+const MAX_GEN_NEST: u32 = 64;
+
 fn put_gguf_value(v: &mut Vec<u8>, rng: &mut Rng, ty: u32, depth: u32) {
     match ty {
         0 | 1 | 7 => v.push(rng.byte()),                              // u8 / i8 / bool
@@ -150,7 +157,16 @@ fn put_gguf_value(v: &mut Vec<u8>, rng: &mut Rng, ty: u32, depth: u32) {
         9 => {
             // An array: element type, then a declared count. A huge count with no elements behind it
             // is the allocation-amplification case.
-            let elem = if depth >= 2 { 4 } else { rng.below(13) as u32 };
+            //
+            // **Audit H12 — the depth cap was here, and it is why the fuzzer could not find H12.**
+            // This line read `if depth >= 2 { 4 }`, so **no generated case could nest deeper than
+            // two** — and the parser's unbounded recursion needs thousands of levels to matter.
+            // The banked verdicts therefore *structurally excluded* the bug this target exists to
+            // find: rule 19's SILENT degree, in the generator rather than the assertion.
+            //
+            // The cap is now far above the shape the parser accepts (which is: no nesting at all),
+            // so a regression that re-admits nested arrays produces cases that reach it.
+            let elem = if depth >= MAX_GEN_NEST { 4 } else { rng.below(13) as u32 };
             put_u32(v, elem);
             let n = if rng.below(3) == 0 { nasty_len(rng) } else { rng.below(8) };
             put_u64(v, n);

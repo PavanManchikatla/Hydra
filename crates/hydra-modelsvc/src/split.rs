@@ -8,8 +8,31 @@ use ring::signature::Ed25519KeyPair;
 use crate::gguf::{tensor_layer, Gguf, GgufValue, GgufWriter};
 use crate::manifest::{chat_template_hash, inference_config_hash, tokenizer_hash, Manifest, ShardEntry};
 
+/// **Audit H11 — the only architecture strings that may become path components.**
+///
+/// `^[A-Za-z0-9_.-]+$`, no leading dot, bounded length. This is deliberately an **allow-list**: a
+/// deny-list of `..` and `/` invites the next encoding (`..%2f`, a backslash on some filesystem, a
+/// NUL, a Unicode look-alike), and the set of legitimate architecture names is tiny and boring —
+/// `llama`, `qwen2`, `gemma3`. A name outside it is refused rather than escaped, because a
+/// sanitised-but-accepted name still ends up as a file the operator did not choose.
+pub fn sanitize_arch(arch: &str) -> Result<String, SplitError> {
+    const MAX: usize = 64;
+    let ok = !arch.is_empty()
+        && arch.len() <= MAX
+        && !arch.starts_with('.')
+        && arch.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !ok {
+        return Err(SplitError::UnsafeArchitecture { arch: arch.chars().take(MAX).collect() });
+    }
+    Ok(arch.to_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SplitError {
+    /// **Audit H11.** `general.architecture` is attacker-controlled input that became an output
+    /// path. Refused, never sanitised-and-used.
+    #[error("REFUSED: general.architecture {arch:?} is not a safe path component (audit H11)")]
+    UnsafeArchitecture { arch: String },
     #[error("gguf: {0}")]
     Gguf(#[from] crate::gguf::GgufError),
     #[error("empty stage range list")]
@@ -58,7 +81,18 @@ pub fn split(g: &Gguf, ranges: &[(u32, u32)], keypair: &Ed25519KeyPair) -> R<Spl
         expect = b;
     }
 
-    let arch = g.architecture().unwrap_or("").to_string();
+    // **Audit H11 — `general.architecture` comes from the INPUT FILE and becomes an output PATH.**
+    //
+    // `file_name = format!("{arch}-stage{stage}-...")` and, in the CLI, `out_dir.join(format!(
+    // "{arch}.signing.pkcs8"))`. `Path::join` **discards the left side entirely when the right side
+    // is absolute**, so a community model declaring `general.architecture = "/etc/cron.d/x"` — or
+    // `"../../tmp/x"` — writes shards, the manifest, **and the private signing key** wherever the
+    // operator can write. There was no character validation anywhere on this value.
+    //
+    // It is validated here, at the point it enters the program, rather than at each of the three
+    // places it is later joined onto a directory: a check at the use site has to be remembered
+    // three times; a check at the source has to be remembered once.
+    let arch = sanitize_arch(g.architecture().unwrap_or(""))?;
     let first_stage = 0usize;
     let last_stage = ranges.len() - 1;
 

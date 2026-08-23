@@ -150,3 +150,133 @@ fn a_hostile_alignment_value_does_not_overflow_the_data_offset() {
         let _ = Gguf::parse(&v);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// **Audit H12 — nested arrays recursed without a depth bound.**
+//
+// # Standing rule 19, SILENT degree — and the auditor named the line
+//
+// `gen.rs` read `let elem = if depth >= 2 { 4 } else { … }`, so **no case the fuzzer could ever
+// generate nested deeper than two levels**, while the parser's unbounded recursion needs thousands
+// to matter. Twenty-four CPU-hours of green verdicts *structurally excluded* the bug the target
+// existed to find — the blindness was in the generator, not the assertion, which is why no amount
+// of additional fuzzing would have helped.
+//
+// The auditor marked this "CONFIRMED BY READING, NOT EXECUTED". It is now executed: **600 053
+// bytes at depth 50 000 overflowed the main thread's 8 MiB stack** — `fatal runtime error: stack
+// overflow, aborting`. That is SIGSEGV/abort, the same uncatchable class as the `reserve_for`
+// amplification this file was written to close; `catch_unwind` never sees it.
+// ---------------------------------------------------------------------------------------------
+
+/// Build a GGUF whose single KV value is an array nested `depth` levels deep. Each level costs 12
+/// wire bytes, which is the whole problem: a tiny file buys unbounded recursion.
+fn nested_array_gguf(depth: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"GGUF");
+    v.extend_from_slice(&3u32.to_le_bytes()); // version
+    v.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+    v.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+    v.extend_from_slice(&1u64.to_le_bytes()); // key length
+    v.push(b'k');
+    v.extend_from_slice(&9u32.to_le_bytes()); // value type = ARRAY
+    for _ in 0..depth {
+        v.extend_from_slice(&9u32.to_le_bytes()); // elem_type = ARRAY
+        v.extend_from_slice(&1u64.to_le_bytes()); // n = 1
+    }
+    v.extend_from_slice(&4u32.to_le_bytes()); // innermost elem_type = u32
+    v.extend_from_slice(&1u64.to_le_bytes()); // n = 1
+    v.extend_from_slice(&7u32.to_le_bytes()); // the value
+    v
+}
+
+#[test]
+fn a_nested_array_is_refused_rather_than_recursed_into() {
+    // The depth that actually aborted the process before the fix.
+    let deep = nested_array_gguf(50_000);
+    assert!(deep.len() < 700_000, "the attack costs almost nothing to build: {} bytes", deep.len());
+    let err = Gguf::parse(&deep).unwrap_err();
+    assert!(
+        matches!(err, GgufError::NestedArray { .. }),
+        "50 000 levels must be refused structurally, not recursed into: {err:?}"
+    );
+
+    // One level of nesting is refused too — the bound is "no nesting", not "not too much nesting",
+    // because upstream GGUF has no nested-array support and no real model file contains one.
+    assert!(matches!(Gguf::parse(&nested_array_gguf(1)).unwrap_err(), GgufError::NestedArray { .. }));
+
+    // The metadata-only path (audit H6, the worker's pre-flight) refuses it as well — the worker
+    // must not be the one component that still recurses.
+    let d = nested_array_gguf(50_000);
+    assert!(matches!(Gguf::parse_metadata(&d, d.len() as u64).unwrap_err(), GgufError::NestedArray { .. }));
+}
+
+/// **The control: an ordinary (unnested) array still parses.** `tokenizer.ggml.tokens` is one, so a
+/// fix that refused all arrays would refuse every real model — a worse failure than the one fixed.
+#[test]
+fn an_ordinary_array_value_still_parses() {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"GGUF");
+    v.extend_from_slice(&3u32.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(&1u64.to_le_bytes());
+    v.extend_from_slice(&6u64.to_le_bytes());
+    v.extend_from_slice(b"tokens");
+    v.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+    v.extend_from_slice(&4u32.to_le_bytes()); // of u32
+    v.extend_from_slice(&3u64.to_le_bytes()); // three of them
+    for x in [1u32, 2, 3] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    // Pad to the default alignment: a real GGUF's data section starts on that boundary, and the
+    // parser (correctly) refuses a file whose declared data start lies past its end.
+    while v.len() % 32 != 0 {
+        v.push(0);
+    }
+    let g = Gguf::parse(&v).expect("a flat array is ordinary GGUF and must parse");
+    assert_eq!(g.metadata.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// **Audit H11 — `general.architecture` from the input file became an output path.**
+//
+// # Standing rule 19: what the oracle could not see — INDISTINGUISHING
+//
+// Every splitter test used a fixture whose architecture was `llama` or `qwen2`. Under those inputs
+// `format!("{arch}-stage{stage}...")` and `sanitize(arch)?` produce **identical output for every
+// call**, so no test could tell the sanitised implementation from the unsanitised one. The defect
+// is only visible for an input no fixture contained — and the value comes from a *community model
+// file*, which is exactly the input the project treats as untrusted everywhere else.
+//
+// The harm is not a stray file: `Path::join` **discards the directory when the component is
+// absolute**, and the CLI writes `{arch}.signing.pkcs8` — the **private signing key** — through
+// that join.
+// ---------------------------------------------------------------------------------------------
+#[test]
+fn a_hostile_architecture_string_is_refused_rather_than_used_as_a_path() {
+    use hydra_modelsvc::split::{sanitize_arch, SplitError};
+
+    for hostile in [
+        "../../tmp/x",              // traversal
+        "/etc/cron.d/x",            // absolute — Path::join discards out_dir entirely
+        ".hidden",                  // leading dot
+        "a/b",                      // separator
+        "a\\b",                     // separator on another platform
+        "",                         // empty: format! would yield "-stage0-..."
+        "with space",
+        "sémantique",               // non-ASCII look-alikes
+        "x\0y",                     // NUL
+    ] {
+        assert!(
+            matches!(sanitize_arch(hostile), Err(SplitError::UnsafeArchitecture { .. })),
+            "{hostile:?} must be refused as a path component"
+        );
+    }
+
+    // A very long name is refused too — a 4 KB "architecture" is not an architecture.
+    assert!(sanitize_arch(&"a".repeat(65)).is_err());
+
+    // Controls: the names real models actually carry still work, or the fix would be an outage.
+    for ok in ["llama", "qwen2", "gemma3", "phi-3", "deepseek_v2", "Qwen2.5"] {
+        assert_eq!(sanitize_arch(ok).unwrap(), ok, "{ok} is a legitimate architecture name");
+    }
+}
