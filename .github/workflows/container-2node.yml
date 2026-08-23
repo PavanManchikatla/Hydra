@@ -53,6 +53,37 @@ jobs:
             exit 1
           fi
 
+      # ---------------- M3 gate row 14(a): the network-jitter chaos arm ----------------
+      # `tc netem` needs NET_ADMIN and a real network namespace, so the Linux containers of this
+      # workflow are its ONLY home — the owner's Mac cannot inject it natively (no tc, and the
+      # local-pair is loopback in one process). Annotated as such rather than pretended otherwise:
+      # this arm is CONTAINER-CI-ONLY, and it is a correctness check under jitter, never a latency
+      # measurement (the wired-LAN envelope remains separately owed and hardware-contingent).
+      - name: Inject network jitter (tc netem) and re-run the recovery
+        env:
+          HYDRA_WORKER_IMAGE: hydra-worker:ci
+        run: |
+          set -o pipefail
+          # 50 ms ± 20 ms of normally-distributed delay with 1 % loss and reordering, applied to the
+          # container bridge both workers sit on. The recovery must still hold: jitter may degrade
+          # latency, it may never change what the pipeline computes.
+          sudo tc qdisc add dev docker0 root netem delay 50ms 20ms distribution normal loss 1% reorder 25% 50% \
+            || { echo "verdict=FAIL — could not install netem on docker0"; exit 1; }
+          tc qdisc show dev docker0
+          ./target/release/hydra-2node-ci 2>&1 | tee ci-2node-jitter.log || true
+          sudo tc qdisc del dev docker0 root || true
+
+      - name: Assert the recovery held UNDER JITTER (rule 16 — the log, not the exit)
+        run: |
+          if grep -q "CONTAINER_2NODE_RECOVERY_OK" ci-2node-jitter.log; then
+            echo "verdict=GREEN (two-node docker-kill recovery held under tc netem jitter)"
+          else
+            echo "verdict=FAIL — CONTAINER_2NODE_RECOVERY_OK absent under jitter; correctness did NOT hold"
+            exit 1
+          fi
+
       - name: Cleanup containers
         if: always()
-        run: docker rm -f hydra-ci-s1 hydra-ci-sp hydra-ci-sp2 2>/dev/null || true
+        run: |
+          docker rm -f hydra-ci-s1 hydra-ci-sp hydra-ci-sp2 2>/dev/null || true
+          sudo tc qdisc del dev docker0 root 2>/dev/null || true

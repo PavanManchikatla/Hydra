@@ -276,6 +276,18 @@ async fn rebuild_s1_from_tokens<S: AsyncRead + AsyncWrite + Unpin>(c1: &mut Conn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+/// **⚑ This is the MULTI-STAGE D0 CASE, despite the `d1_` file prefix — annotated 2026-08-23 so the
+/// name cannot mislead a future reader (M3 gate row 14).**
+///
+/// Every `apply_relay` below passes `None` for the boundary store: **no `BOUNDARY_COPY` is written
+/// and none is read.** The replacement S1 is rebuilt purely by `rebuild_s1_from_tokens` — full
+/// teacher-forced replay from the durable ledger, i.e. **Strategy-B**, which is exactly D0's
+/// recovery path — and the result is byte-identical to the uninterrupted run with the disk-truth
+/// assertions holding.
+///
+/// So P2·8's "owed multi-stage D0 kill" is **substantively covered here**, and was closed by
+/// annotation rather than by duplicating ~200 lines under a `d0_` name. Re-proving a green path
+/// under a new file name is ceremony, not evidence.
 async fn d1_two_stage_kill_s1_survivor_sp_frozen_replacement_s1_from_tokens_byte_identical() {
     let Some(model) = dev_model_path() else {
         eprintln!("SKIP: no engine/model (dev-environment artifacts)");

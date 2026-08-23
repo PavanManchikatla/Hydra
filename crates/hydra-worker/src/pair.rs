@@ -312,6 +312,55 @@ pub async fn run_teacher_forced_pipeline(
     Ok(last_digest)
 }
 
+/// Per-token timing for the teacher-forced pipeline, with **connection setup excluded**.
+///
+/// The M3 calibration clause needs steady-state TPOT, and a caller that simply times a call to
+/// [`run_teacher_forced_pipeline`] cannot get it: that function opens its own mTLS connections, so
+/// the one-time handshake lands inside the measurement. On a short prompt the handshake *is* the
+/// measurement — a 3-token run once reported a "link cost" of 171 ms/token that was purely
+/// handshake ÷ 3, and a cross-run marginal produced a *negative* per-token cost because each run
+/// paid its own setup. See PROJECT_STATE §8 / `verification/M3-GATE.md` row 8.
+///
+/// So the timing lives **here**, inside the loop, and the driver returns one duration per token.
+/// The caller decides what to discard; nothing about warm-up policy is baked in.
+pub async fn time_teacher_forced_pipeline(
+    connector: &TcpMtls,
+    ep: &Endpoints,
+    keys: &SessionKeys,
+    tokens: &[u32],
+) -> Result<Vec<std::time::Duration>, String> {
+    let mut c1 = connector.connect(ep.s1_addr, &ep.s1_name).await.map_err(|e| format!("connect s1: {e}"))?;
+    let mut c2 = connector.connect(ep.s2_addr, &ep.s2_name).await.map_err(|e| format!("connect s2: {e}"))?;
+    // Both connections are established BEFORE the first timer starts — that is the whole point.
+    let mut per_token = Vec::with_capacity(tokens.len());
+
+    for (pos, &tok) in tokens.iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        c1.send(0, &wire::encode_apply_token(keys, 0, pos as i64, tok, true))
+            .await
+            .map_err(|e| format!("send s1: {e}"))?;
+        let f1 = c1.recv().await.map_err(|e| format!("recv s1: {e}"))?;
+        let boundary = match wire::decode(&f1.payload, keys).map_err(|e| format!("decode s1: {e}"))?.1 {
+            Msg::Fwd { activations, .. } => activations,
+            other => return Err(format!("s1 pos {pos}: expected FWD, got {other:?}")),
+        };
+        c2.send(0, &wire::encode_fwd(keys, 0, pos as i64, true, &boundary))
+            .await
+            .map_err(|e| format!("send s2: {e}"))?;
+        let f2 = c2.recv().await.map_err(|e| format!("recv s2: {e}"))?;
+        match wire::decode(&f2.payload, keys).map_err(|e| format!("decode s2: {e}"))?.1 {
+            Msg::AppliedAck { cumulative_input_pos, .. } => {
+                if cumulative_input_pos != pos as i64 {
+                    return Err(format!("s2 pos mismatch: {cumulative_input_pos} != {pos}"));
+                }
+            }
+            other => return Err(format!("s2 pos {pos}: expected APPLIED_ACK, got {other:?}")),
+        }
+        per_token.push(t0.elapsed());
+    }
+    Ok(per_token)
+}
+
 /// The unsplit greedy next token: apply `tokens` one-at-a-time to the full model and take the
 /// argmax of the final logits — the exact-tier reference for greedy sampling across the pipeline
 /// (test (a): sampling at the end of a teacher-forced run stays bit-exact vs unsplit).
