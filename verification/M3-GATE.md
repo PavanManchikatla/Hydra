@@ -43,7 +43,7 @@ without new hardware. Mac + container-CI only from here.
 | `greedy_sample_across_pipeline_matches_unsplit_argmax` | ✅ green |
 | `two_worker_anchor_is_bit_exact_with_shard_loaded_weights` (P2·10b) | ✅ green |
 | `chunked_prefill_is_bit_exact_with_unchunked_prefill` (P2·7) | ✅ green |
-| Workspace | **252 passed / 0 failed**; clippy clean |
+| Workspace | **252 passed / 0 failed / 7 ignored** (2026-08-23, at flip time); clippy clean |
 | M1 (upstream gate) | ✅ **PASSED (FULL)** 2026-08-23 — `verification/ci-results/m1-flip-2026-08-23.md` |
 
 ---
@@ -64,27 +64,53 @@ without new hardware. Mac + container-CI only from here.
 
 ---
 
-## Verdict sought
+## VERDICT — **M3 TRACK-A: ✅ PASSED**
 
-**Updated 2026-08-23 after the row-8 / row-14 ruling.**
+**Flipped 2026-08-23** under the design authority's delegation: *on the row-8 production-shaped
+receipt, with rows 1–14 unchanged, the flip is mechanical and delegated.* Both conditions hold and
+are checkable from this file:
 
-**Row 14 is CLOSED** — both arms built, and the one suite retired three debts (its own, P2·7's
-chunk-boundary stall, P2·8's multi-stage D0 kill).
+* **Row 8 is MET** on its own receipt — `verification/ci-results/m3-calibration-2026-08-23.md`,
+  worst error **2.9 %** across two out-of-sample splits against a **15 %** gate, measured on the
+  **production-shaped** path (real sampling, no digest witness) exactly as the §7.25 ruling
+  specified. Nothing was subtracted from the measurement and nothing extra added to the prediction.
+* **Rows 1–7 and 9–14 are unchanged** since the table was assembled, and every one of them still
+  points at the receipt it pointed at then.
 
-**Row 15 is NOT a blocker** — hardware-contingent items were phased out of Track-A by ruling. It
-remains a **permanently-annotated owed item**: no LAN number may ever be implied from a loopback or
-container run.
+### What the flip does and does not claim
 
-**Row 8 is the sole remaining blocker, and it is now an ESCALATION rather than an unknown.** The
-harness fault I diagnosed is fixed, the measurement is sound by the project's own hygiene standard,
-and it says the cost model is **incomplete by two named terms** — a fixed per-STAGE decode cost
-(+5.02 ms/tok measured for one extra context) and a per-CROSSING protocol cost. Both are legitimate,
-ratifiable amendments. **Neither was applied**, and the calibration assertion is left failing,
-because tuning the model to clear its own gate is the one move that would make this table worthless.
+**Claimed, verbatim, and no further:**
 
-**Note the direction:** a fixed per-stage cost makes splitting *more* expensive than objective (a)
-currently predicts, so §7.23's "when it fits on one device, do not split" holds **a fortiori**. The
-correction does not flatter the architecture, and it is not being reported as if it did.
+> *A 3-node heterogeneous cluster runs a pipeline-sharded model with per-shard weights and full
+> recovery on the direct-FWD topology; capability, links, placement, admission, stability and
+> telemetry are measured rather than assumed; the placement cost model predicts measured TPOT
+> within **2.9 %** on the production-shaped path; and no chaos arm — worker kill, `tc netem`
+> jitter, or disk fault — produces a silent corruption.*
 
-**PAUSED at the gate, pending ratification of the §7.24 cost-model amendment. On that ruling — and
-with rows 1–13 unchanged — the flip is mechanical and delegated.**
+**Not claimed:**
+
+* **No wired-LAN performance number.** Row 15 is owed, not waived (below). The honesty rule stands:
+  nothing measured on loopback or in a container may be reported as a LAN figure.
+* **No claim that splitting is fast.** §7.23's result is carried into the gate unchanged: for a
+  model that fits on one device, on these links, the optimal placement is **not to split**, and
+  row 8's 4.7 ms/stage fixed cost makes that hold *a fortiori*. Hydra's claim has always been
+  **correctness and running-at-all**, not parallel speedup, and the solver proves it rather than
+  asserting it.
+* **No claim that the contention-group prober was validated against real numbers.** Row 6 is green
+  as **logic only**, and says so.
+
+### Row 15 — the permanent annotation
+
+**Wired-LAN performance envelope: OWED, hardware-contingent, and NOT a Track-A blocker** (ruled
+2026-08-23: hardware-contingent items are phased out of Track-A). It was never measured, and after
+the cloud VMs died on 2026-08-05 it cannot be measured without hardware the project does not have.
+It travels **with** this verdict rather than being cleared by it: **no LAN number may ever be
+implied from a loopback or container run**, in this file, in `PROJECT_STATE.md`, or in the README.
+
+### Carried forward into M4
+
+Every deferral in section (c) above is carried, unchanged and in its own terms — `mutation_preactive_maroon`,
+the 7B re-measure, 70B, the contention-matrix validation, and now the teacher-forced prefill/rebuild
+digest (§7.26). None of them is closed by this flip.
+
+**M4 opens.**
