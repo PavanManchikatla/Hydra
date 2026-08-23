@@ -1,0 +1,135 @@
+//! **The fast lane of the M4·1 (c) fuzzing arm.**
+//!
+//! The 24-CPU-hour DoD is accumulated by the CI arm (`.github/workflows/fuzz.yml`, dispatch +
+//! weekly). This file is the part that runs on **every push**, because a weekly job is a slow
+//! feedback loop for a defect introduced on a Monday: a fixed, seeded slice of the same generator
+//! and the same oracle, sized to a few seconds.
+//!
+//! **The seeds are fixed on purpose.** A test that fuzzed from a random seed would be flaky —
+//! sometimes catching a regression and sometimes not — and a flaky security test is one that gets
+//! muted. Fixed seeds give a deterministic corpus that either passes or does not, and the CI arm
+//! does the exploratory search.
+
+use hydra_fuzz::{run_case, Target};
+
+/// Iterations per (target, seed). Chosen so the whole file runs in a couple of seconds in debug —
+/// the budget of a push-time test, not of a fuzzing campaign.
+const ITERATIONS: u64 = 20_000;
+const SEEDS: [u64; 3] = [1, 0xC0FFEE, 0xDEADBEEF];
+
+fn sweep(target: Target) {
+    let mut crashes = Vec::new();
+    for seed in SEEDS {
+        for iteration in 0..ITERATIONS {
+            if let Some(c) = run_case(target, seed, iteration) {
+                crashes.push(format!(
+                    "seed={} iteration={} input_len={} message={:?} (replay: cargo run -p hydra-fuzz \
+                     --bin hydra-fuzz -- --target {} --seed {} --replay {})",
+                    c.seed, c.iteration, c.input_len, c.message, target.name(), c.seed, c.iteration
+                ));
+                if crashes.len() >= 5 {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        crashes.is_empty(),
+        "{} parser crashed on {} of {} seeded cases:\n  {}",
+        target.name(),
+        crashes.len(),
+        SEEDS.len() as u64 * ITERATIONS,
+        crashes.join("\n  ")
+    );
+}
+
+/// The GGUF parser — a **downloaded model file** is the untrusted input of report Addendum 2 §D1,
+/// and this is the surface that had both of the M4·1 defects (allocation amplification from a
+/// declared count; unchecked 64-bit shape arithmetic).
+#[test]
+fn the_gguf_parser_survives_a_seeded_hostile_corpus() {
+    // Suppress per-case backtraces; a crash is reported by the assertion, with its replay command.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::Gguf));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// The transport frame header — the **pre-allocation** path. Everything here runs before a payload
+/// buffer is sized, which is exactly why it must not be able to panic on a hostile header.
+#[test]
+fn the_frame_header_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::FrameHeader));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// The wire body — FlatBuffers decoding plus the F1 fence, reached from the network after the
+/// header check. Cases are bit-flips of *structurally valid* frames, so they exercise the vtable
+/// and offset arithmetic rather than dying at the root offset.
+#[test]
+fn the_wire_body_parser_survives_a_seeded_hostile_corpus() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(|| sweep(Target::WireBody));
+    std::panic::set_hook(prev);
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// The generator itself must produce **varied, non-trivial** inputs. Without this, every test above
+/// could pass because the fuzzer emits nothing but empty buffers — a green that means nothing. The
+/// same reason the D0 zero-traffic test is paired with a D1 control.
+#[test]
+fn the_generator_produces_varied_nonempty_inputs() {
+    for target in Target::ALL {
+        let mut lens = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for iteration in 0..2_000u64 {
+            let mut rng = hydra_fuzz::Rng::for_case(7, iteration);
+            let input = match target {
+                Target::Gguf => hydra_fuzz::gen::gguf_case(&mut rng),
+                Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
+                Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
+            };
+            total += input.len();
+            lens.insert(input.len());
+        }
+        assert!(lens.len() > 50, "{} generator produced only {} distinct lengths", target.name(), lens.len());
+        assert!(total / 2_000 > 8, "{} generator's mean input is {} bytes — too small to reach anything", target.name(), total / 2_000);
+    }
+}
+
+/// A case is reproducible from `(seed, iteration)` alone — the contract a crash report rests on
+/// (BLUEPRINT §4.2, *"determinism or it didn't happen"*). If this were not true, every `CRASH` line
+/// the driver prints would be unactionable.
+#[test]
+fn a_case_is_reproducible_from_seed_and_iteration_alone() {
+    for target in Target::ALL {
+        for iteration in [0u64, 1, 999, 12_345] {
+            let build = |i: u64| {
+                let mut rng = hydra_fuzz::Rng::for_case(42, i);
+                match target {
+                    Target::Gguf => hydra_fuzz::gen::gguf_case(&mut rng),
+                    Target::FrameHeader => hydra_fuzz::gen::frame_header_case(&mut rng),
+                    Target::WireBody => hydra_fuzz::gen::wire_body_case(&mut rng),
+                }
+            };
+            assert_eq!(build(iteration), build(iteration), "{} case {iteration} is not reproducible", target.name());
+            assert_ne!(
+                build(iteration),
+                build(iteration + 1),
+                "{} case {iteration} equals its successor — the iteration is not varying the case",
+                target.name()
+            );
+        }
+    }
+}

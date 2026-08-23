@@ -29,6 +29,18 @@ pub enum WireError {
     FenceMismatch(&'static str),
     #[error("unsupported body for this endpoint")]
     UnsupportedBody,
+    /// A **[RESERVED] forward-compatibility hook** carried a non-v1 value. Reserved fields are
+    /// typed so the wire never changes shape when the feature lands, and **fenced** so that until
+    /// it lands v1 can never be driven down a path it does not implement. A peer that sets one is
+    /// speaking a protocol this build does not serve — refuse loudly, never ignore the field and
+    /// proceed (that is the silent-downgrade shape this project refuses everywhere else).
+    #[error("RESERVED field carries a non-v1 value: {0}")]
+    ReservedInUse(&'static str),
+    /// A declared length exceeded a normative cap from `hydra-proto.fbs`. Raised **before** the
+    /// payload is copied into an owned buffer, so an oversized record is refused rather than
+    /// allocated. Maps to `ErrCode::ERR_LIMIT_EXCEEDED`.
+    #[error("{what} length {value} exceeds cap {cap}")]
+    LimitExceeded { what: &'static str, value: u64, cap: u64 },
 }
 
 /// The stable part of the F1 fence tuple — one session's identity. Constant in v1 (spec §1.4).
@@ -135,6 +147,14 @@ pub fn decode(payload: &[u8], keys: &SessionKeys) -> Result<(FenceView, Msg), Wi
         return Err(WireError::FenceMismatch("session_id"));
     }
 
+    // RESERVED hooks (spec §1.1, `hydra-proto.fbs`). `model_instance_id` is fenced by the identity
+    // check above and is **never branched on** — note it is deliberately absent from [`FenceView`],
+    // so no downstream code *can* branch on it. `branch_id` has no identity to check against: the
+    // schema says "must be 0 in v1", and this is where that becomes true rather than aspirational.
+    if fence.branch_id() != 0 {
+        return Err(WireError::ReservedInUse("branch_id"));
+    }
+
     let view = FenceView {
         epoch: fence.session_epoch(),
         recovery_id: fence.recovery_id(),
@@ -165,6 +185,56 @@ fn tuple_from_wire(t: proto::ActivationTuple<'_>) -> ActivationTuple {
     }
 }
 
+/// Copy a wire byte-vector into an owned `Vec<u8>` **only after** checking it against its normative
+/// cap (`hydra-proto.fbs`). The order is the whole point: the FlatBuffer itself is zero-copy, so
+/// the allocation happens *here*, and a cap checked after the copy is not a cap.
+fn capped_bytes(v: flatbuffers::Vector<'_, u8>, what: &'static str, cap: u32) -> Result<Vec<u8>, WireError> {
+    let len = v.bytes().len() as u64;
+    if len > cap as u64 {
+        return Err(WireError::LimitExceeded { what, value: len, cap: cap as u64 });
+    }
+    Ok(v.bytes().to_vec())
+}
+
+/// Admission checks for a boundary tensor, run **before** the payload is copied into a `Vec<f32>`.
+///
+/// Two of the three are RESERVED-hook fences (BLUEPRINT §1.3, amended 2026-07-12):
+///
+/// * **`I8_BLOCKQ` is not offerable in v1.** The dtype stays in the schema (append-only evolution),
+///   but the naive per-block characterization failed M2's mixed-backend tolerance for a *structural*
+///   reason — outlier-dominated error — so a peer must not be able to put v1 on that path. Only
+///   `F32` crosses the FFI, and `F16`/`BF16` are refused here too: the boundary is `f32` at this
+///   layer by construction, and silently widening a narrower payload is exactly the kind of
+///   accommodation that turns a precision decision into an accident.
+/// * **`block_scales` is present iff `dtype == I8_BLOCKQ`** (schema comment, normative). Since
+///   `I8_BLOCKQ` is refused, a frame carrying `block_scales` is *by definition* malformed — and
+///   accepting-and-ignoring it would leave a field a future peer could use to smuggle state past a
+///   build that does not understand it.
+fn check_boundary_tensor(t: proto::Tensor<'_>, what: &'static str) -> Result<(), WireError> {
+    if t.dtype() == proto::DType::I8_BLOCKQ {
+        return Err(WireError::ReservedInUse("DType::I8_BLOCKQ"));
+    }
+    if t.dtype() != proto::DType::F32 {
+        return Err(WireError::Malformed(format!("{what} must be F32 across the FFI")));
+    }
+    if t.block_scales().is_some() {
+        return Err(WireError::ReservedInUse("Tensor::block_scales (valid only with I8_BLOCKQ)"));
+    }
+    // `MAX_TENSOR_BYTES` (48 MiB), checked **before** `bytes_to_f32_le` allocates. The frame cap
+    // (64 MiB) already bounds the transport read, but it is a *different* cap on a *different*
+    // quantity, and the schema declares this one as normative. A cap that exists in `limits.rs` and
+    // is never called is documentation, not enforcement.
+    let n = t.data().bytes().len() as u64;
+    if !hydra_proto::limits::check_tensor_len(n).is_ok() {
+        return Err(WireError::LimitExceeded {
+            what,
+            value: n,
+            cap: hydra_proto::limits::MAX_TENSOR_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
 fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireError> {
     use proto::Body;
     match frame.body_type() {
@@ -178,10 +248,15 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         }
         Body::Fwd => {
             let f = frame.body_as_fwd().ok_or(WireError::Malformed("Fwd".into()))?;
-            let t = f.activations();
-            if t.dtype() != proto::DType::F32 {
-                return Err(WireError::Malformed("Fwd activations must be F32 across the FFI".into()));
+            check_boundary_tensor(f.activations(), "Fwd activations")?;
+            if !hydra_proto::limits::check_positions(f.n_positions() as u32).is_ok() {
+                return Err(WireError::LimitExceeded {
+                    what: "Fwd n_positions",
+                    value: f.n_positions() as u64,
+                    cap: hydra_proto::limits::MAX_POSITIONS_PER_FRAME as u64,
+                });
             }
+            let t = f.activations();
             Ok(Msg::Fwd {
                 first_input_pos: f.first_input_pos(),
                 no_sample: f.policy() == proto::SamplePolicy::NO_SAMPLE,
@@ -192,15 +267,16 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
             let a = frame.body_as_applied_ack().ok_or(WireError::Malformed("AppliedAck".into()))?;
             Ok(Msg::AppliedAck {
                 cumulative_input_pos: a.cumulative_input_pos(),
-                output_checksum: a.output_checksum().map(|v| v.bytes().to_vec()).unwrap_or_default(),
+                output_checksum: match a.output_checksum() {
+                    Some(v) => capped_bytes(v, "APPLIED_ACK output_checksum", HASH_LEN as u32)?,
+                    None => Vec::new(),
+                },
             })
         }
         Body::BoundaryCopy => {
             let b = frame.body_as_boundary_copy().ok_or(WireError::Malformed("BoundaryCopy".into()))?;
+            check_boundary_tensor(b.activations(), "BoundaryCopy activations")?;
             let t = b.activations();
-            if t.dtype() != proto::DType::F32 {
-                return Err(WireError::Malformed("BoundaryCopy activations must be F32".into()));
-            }
             Ok(Msg::BoundaryCopy {
                 boundary_id: b.boundary_id(),
                 first_input_pos: b.first_input_pos(),
@@ -266,7 +342,7 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
             let s = frame.body_as_sample_next().ok_or(WireError::Malformed("SampleNext".into()))?;
             Ok(Msg::SampleNext {
                 output_pos: s.output_pos(),
-                sampling_config_hash: s.sampling_config_hash().bytes().to_vec(),
+                sampling_config_hash: capped_bytes(s.sampling_config_hash(), "sampling_config_hash", HASH_LEN as u32)?,
                 expected_sampler_checkpoint_id: s.expected_sampler_checkpoint_id(),
             })
         }
@@ -275,20 +351,23 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
             Ok(Msg::Sampled {
                 output_pos: s.output_pos(),
                 token_id: s.token_id(),
-                post_sample_snapshot: s.post_sample_snapshot().bytes().to_vec(),
-                sampler_state_digest: s.sampler_state_digest().bytes().to_vec(),
+                post_sample_snapshot: capped_bytes(s.post_sample_snapshot(), "post_sample_snapshot", hydra_proto::limits::MAX_SNAPSHOT_BYTES)?,
+                sampler_state_digest: capped_bytes(s.sampler_state_digest(), "sampler_state_digest", HASH_LEN as u32)?,
             })
         }
         Body::InstallSamplerCheckpoint => {
             let i = frame.body_as_install_sampler_checkpoint().ok_or(WireError::Malformed("InstallSamplerCheckpoint".into()))?;
-            Ok(Msg::InstallSamplerCheckpoint { checkpoint_id: i.checkpoint_id(), snapshot: i.snapshot().bytes().to_vec() })
+            Ok(Msg::InstallSamplerCheckpoint {
+                checkpoint_id: i.checkpoint_id(),
+                snapshot: capped_bytes(i.snapshot(), "sampler snapshot", hydra_proto::limits::MAX_SNAPSHOT_BYTES)?,
+            })
         }
         Body::SamplerCheckpointInstalled => {
             let i = frame.body_as_sampler_checkpoint_installed().ok_or(WireError::Malformed("SamplerCheckpointInstalled".into()))?;
             Ok(Msg::SamplerCheckpointInstalled {
                 checkpoint_id: i.checkpoint_id(),
                 sampled_output_pos: i.sampled_output_pos(),
-                resulting_state_digest: i.resulting_state_digest().bytes().to_vec(),
+                resulting_state_digest: capped_bytes(i.resulting_state_digest(), "resulting_state_digest", HASH_LEN as u32)?,
             })
         }
         Body::Error => {
@@ -397,7 +476,13 @@ pub fn encode_fwd(keys: &SessionKeys, epoch: Epoch, first_input_pos: i64, no_sam
         &mut fbb,
         &proto::TensorArgs { dtype: proto::DType::F32, dims: Some(dims), data: Some(data), block_scales: None },
     );
-    let n_positions = u16::try_from(activations.len()).unwrap_or(u16::MAX); // placeholder; real n = len/n_embd
+    // `n_positions` is a POSITION count, not a float count. It carried `activations.len()` — the
+    // number of f32s — which was harmless only because nothing read it. Once M4·1 made the schema's
+    // `<= MAX_POSITIONS_PER_FRAME` cap real, the wrong value became a live defect: every model with
+    // `n_embd > 1024` (i.e. every model above the 0.5 B dev one — a 7 B has 4096) would have had its
+    // boundaries REFUSED. v1's pipeline is strictly position-at-a-time, so a `FWD` carries exactly
+    // one position — the same value `encode_boundary_copy` has always used. See PROJECT_STATE §7.27.
+    let n_positions: u16 = 1;
     let body = proto::Fwd::create(
         &mut fbb,
         &proto::FwdArgs {

@@ -38,6 +38,10 @@ impl TcpMtlsListener {
         addr: SocketAddr,
         cfg: rustls::ServerConfig,
     ) -> Result<Self, TransportError> {
+        // Addendum 2 §E1: refuse a wildcard bind unless it was explicitly opted into. Checked
+        // BEFORE the socket exists, so there is no window in which the port is open on every
+        // interface while we decide whether it should be.
+        crate::check_bind_addr(addr)?;
         let acceptor = TlsAcceptor::from(Arc::new(cfg));
         let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener, acceptor })

@@ -58,6 +58,12 @@ impl ContainerWorker {
         docker(&[
             "run", "-d", "--name", name,
             "-v", &format!("{boot_path}:/hydra.boot:ro"),
+            // The ONE place in the project that opts into a wildcard bind, and it has to say so
+            // out loud (report Addendum 2 §E1 / `hydra_transport::check_bind_addr`). Inside a
+            // container the network namespace IS the isolation boundary, and the port is published
+            // only on 127.0.0.1 below — so this is namespaced, not exposed. Nothing else in the
+            // tree sets this variable, and `security_checklist.rs` asserts that.
+            "-e", &format!("{}=1", hydra_transport::ALLOW_WILDCARD_BIND_ENV),
             "-p", &format!("127.0.0.1:0:{CONTAINER_PORT}"),
             &image(), "/hydra.boot",
         ])?;
@@ -90,7 +96,7 @@ fn write_boot(cluster: &Cluster, name: &str, dir: &std::path::Path, recovery_sta
     let boot = Bootstrap {
         // Container-internal bind; the runner reaches it only via the 127.0.0.1-published port
         // (docker's network namespace is the isolation boundary; never exposed on a host interface).
-        listen_addr: format!("0.0.0.0:{CONTAINER_PORT}"),
+        listen_addr: format!("0.0.0.0:{CONTAINER_PORT}"),  // see the -e opt-in in `start`
         device_name: name.to_string(),
         ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
         cert_chain_der: id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),

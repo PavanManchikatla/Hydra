@@ -1,0 +1,16 @@
+[package]
+name = "hydra-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The parser-hardening arm (M4·1 c). It depends on every crate that parses UNTRUSTED input:
+#   * `hydra-modelsvc` — GGUF, i.e. a downloaded community model file (report Addendum 2 §D1);
+#   * `hydra-proto`    — the transport frame header, before any payload is allocated;
+#   * `hydra-worker`   — the FlatBuffers frame body + the F1 fence.
+# It is a leaf: nothing depends on it, so it cannot affect what ships.
+[dependencies]
+hydra-modelsvc = { path = "../hydra-modelsvc" }
+hydra-proto = { path = "../hydra-proto" }
+hydra-worker = { path = "../hydra-worker" }

@@ -36,6 +36,37 @@ pub enum TransportError {
     Cert(String),
     #[error("invalid dns name: {0}")]
     Dns(String),
+    /// A wildcard bind (`0.0.0.0` / `[::]`) was attempted without the explicit opt-in.
+    /// See [`check_bind_addr`].
+    #[error("refusing wildcard bind {0}: v1's trust boundary is one household LAN; bind an explicit \
+             interface address, or set HYDRA_ALLOW_WILDCARD_BIND=1 if this really is a namespaced \
+             environment (report Addendum 2 §E1)")]
+    WildcardBind(std::net::SocketAddr),
+}
+
+/// The environment variable that makes a wildcard bind an explicit, visible decision.
+pub const ALLOW_WILDCARD_BIND_ENV: &str = "HYDRA_ALLOW_WILDCARD_BIND";
+
+/// **Report Addendum 2 §E1, enforced rather than documented:** *"must not bind 0.0.0.0 by
+/// default."*
+///
+/// Local inference servers of the Ollama class have been exploited by browsers on the same LAN
+/// reaching an unauthenticated API bound to every interface, so a wildcard bind is not a
+/// configuration preference here — it is the precondition of that attack. This makes it impossible
+/// to reach **by accident**: every listener in the project goes through this check, an unspecified
+/// address is refused, and the one environment that legitimately needs it (a container, whose
+/// network namespace *is* the isolation boundary) has to say so out loud.
+///
+/// It is deliberately an opt-**in**, not an opt-out. An opt-out is a flag someone forgets to set;
+/// an opt-in is a decision someone had to make.
+pub fn check_bind_addr(addr: std::net::SocketAddr) -> Result<(), TransportError> {
+    if !addr.ip().is_unspecified() {
+        return Ok(());
+    }
+    match std::env::var(ALLOW_WILDCARD_BIND_ENV).as_deref() {
+        Ok("1") => Ok(()),
+        _ => Err(TransportError::WildcardBind(addr)),
+    }
 }
 
 /// A bidirectional, authenticated, framed connection to one peer.

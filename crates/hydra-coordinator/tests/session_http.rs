@@ -173,7 +173,22 @@ fn make_app(gen_calls: Arc<AtomicUsize>) -> axum::Router {
     });
     let make_session: Arc<dyn Fn() -> Session + Send + Sync> =
         Arc::new(|| session(Box::new(OkDisk::default()), Box::new(MapPieces(HashMap::new())), 1, 1000));
-    router(AppState::new(make_session, gen_fn))
+    router(AppState::new(make_session, gen_fn, test_auth()))
+}
+
+/// The API auth every test request must satisfy (report Addendum 2 §E1). Fixed token + the
+/// loopback host/origin allow-list, so the happy path exercises the real check rather than a
+/// bypass.
+fn test_auth() -> hydra_coordinator::ApiAuth {
+    hydra_coordinator::ApiAuth::loopback(API_TOKEN, 0)
+}
+
+const API_TOKEN: &str = "test-api-token";
+const AUTH_HEADERS: [(&str, &str); 2] = [("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0")];
+
+/// Prepend the auth headers every request needs, so each test states only what it is about.
+fn with_auth<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    AUTH_HEADERS.iter().copied().chain(extra.iter().copied()).collect()
 }
 
 /// Parse an SSE body into (id, data) pairs.
@@ -209,7 +224,7 @@ async fn post(app: &axum::Router, headers: &[(&str, &str)], body: &str) -> Strin
 #[tokio::test]
 async fn sse_stream_has_dense_ids_and_emit_after_commit_text() {
     let app = make_app(Arc::new(AtomicUsize::new(0)));
-    let body = post(&app, &[("content-type", "application/json")], r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#).await;
+    let body = post(&app, &with_auth(&[("content-type", "application/json")]), r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#).await;
     let events = parse_sse(&body);
     assert_eq!(events.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5], "dense ids");
     let text: String = events.iter().map(|(_, d)| d.as_str()).collect();
@@ -220,12 +235,12 @@ async fn sse_stream_has_dense_ids_and_emit_after_commit_text() {
 async fn last_event_id_resume_yields_byte_identical_suffix() {
     let app = make_app(Arc::new(AtomicUsize::new(0)));
     let key = "resume-key";
-    let full = parse_sse(&post(&app, &[("idempotency-key", key)], "{}").await);
+    let full = parse_sse(&post(&app, &with_auth(&[("idempotency-key", key)]), "{}").await);
     let full_text: String = full.iter().map(|(_, d)| d.as_str()).collect();
 
     // Reconnect at EVERY cut point → byte-identical suffix (same session via the idempotency key).
     for cut in 0..=full.len() as u64 {
-        let resumed = parse_sse(&post(&app, &[("idempotency-key", key), ("last-event-id", &cut.to_string())], "{}").await);
+        let resumed = parse_sse(&post(&app, &with_auth(&[("idempotency-key", key), ("last-event-id", &cut.to_string())]), "{}").await);
         let prefix: String = full.iter().take(cut as usize).map(|(_, d)| d.as_str()).collect();
         let suffix: String = resumed.iter().map(|(_, d)| d.as_str()).collect();
         assert_eq!(format!("{prefix}{suffix}"), full_text, "resume at {cut} is byte-identical");
@@ -239,11 +254,182 @@ async fn idempotency_key_dedups_session_creation() {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = make_app(calls.clone());
     let key = "idem-key";
-    let a = post(&app, &[("idempotency-key", key)], "{}").await;
-    let b = post(&app, &[("idempotency-key", key)], "{}").await;
+    let a = post(&app, &with_auth(&[("idempotency-key", key)]), "{}").await;
+    let b = post(&app, &with_auth(&[("idempotency-key", key)]), "{}").await;
     assert_eq!(calls.load(Ordering::SeqCst), 1, "duplicate POST creates ONE session / one generation");
     let ta: String = parse_sse(&a).iter().map(|(_, d)| d.clone()).collect();
     let tb: String = parse_sse(&b).iter().map(|(_, d)| d.clone()).collect();
     assert_eq!(ta, tb, "same session ⇒ same response body");
     assert_eq!(ta, "Hello");
+}
+
+// ---------------- Option A: one active session per model instance (M4·1 reserved-hook audit) ----
+
+/// A generation source that produces nothing until `release` fires, so a session can be held
+/// *active* while a second request arrives. Without this the canned generator finishes in
+/// microseconds and the concurrency window never exists to test.
+fn make_blocking_app(started: Arc<AtomicUsize>, release: Arc<tokio::sync::Notify>) -> axum::Router {
+    let gen_fn: hydra_coordinator::GenFn = Arc::new(move |_prompt: String| {
+        started.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(16);
+        let release = release.clone();
+        tokio::spawn(async move {
+            release.notified().await;
+            for (pos, b) in "Hello".bytes().enumerate() {
+                let _ = tx.send(SampledToken { output_pos: pos as i64, token_id: b as u32, snapshot: snapshot(pos as i64) }).await;
+            }
+        });
+        rx
+    });
+    let make_session: Arc<dyn Fn() -> Session + Send + Sync> =
+        Arc::new(|| session(Box::new(OkDisk::default()), Box::new(MapPieces(HashMap::new())), 1, 1000));
+    router(AppState::new(make_session, gen_fn, test_auth()))
+}
+
+async fn post_raw(app: &axum::Router, headers: &[(&str, &str)], body: &str) -> (StatusCode, String) {
+    let mut req = Request::builder().method("POST").uri("/v1/chat/completions");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+/// **Spec §1.4 Option A is enforced, and Option B stays RESERVED.** *"One active session per model
+/// instance (Option A; Option B [RESERVED])."*
+///
+/// This is the reserved-hook audit's coordinator half, and it is the one that found a real gap: the
+/// HTTP surface minted a **fresh session on every POST** that did not match a known
+/// `Idempotency-Key`, so a second client simply started a second generation against the same
+/// workers. Option B was not absent — it was the default. The stage state machines, the sampler at
+/// S_P and the commit stream are all single-session by construction, so what read as an
+/// unimplemented feature was really an admission gap.
+///
+/// The refusal is **structured and names the holder**, per the same discipline as P2·4's admission
+/// refusals: a refusal that does not say what is in the way is not actionable.
+#[tokio::test]
+async fn a_second_concurrent_session_is_refused_option_b_stays_reserved() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = make_blocking_app(started.clone(), release.clone());
+
+    // Client A opens a session and holds it open (its generator is blocked).
+    let a_app = app.clone();
+    let a = tokio::spawn(async move { post_raw(&a_app, &with_auth(&[("idempotency-key", "A")]), "{}").await });
+    while started.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    // Client B asks for a *different* session while A is still generating.
+    let (status, body) = post_raw(&app, &with_auth(&[("idempotency-key", "B")]), "{}").await;
+    assert_eq!(status, StatusCode::CONFLICT, "a second concurrent session must be refused, not admitted");
+    assert!(body.contains("one_active_session_per_model_instance"), "structured code, got: {body}");
+    assert!(body.contains("active_session"), "the refusal names the session holding the instance, got: {body}");
+    assert_eq!(started.load(Ordering::SeqCst), 1, "and NO second generation was started");
+
+    // Reconnecting to the *running* session is still fine — that is what Idempotency-Key is for.
+    // (Proven by the fence not firing for key "A"; the body is the live stream, released below.)
+    release.notify_waiters();
+    release.notify_one();
+    let (a_status, a_body) = a.await.unwrap();
+    assert_eq!(a_status, StatusCode::OK);
+    assert_eq!(parse_sse(&a_body).iter().map(|(_, d)| d.as_str()).collect::<String>(), "Hello");
+
+    // The fence is a *concurrency* fence, not a one-shot: once A is done, a new session is admitted.
+    let (c_status, _) = post_raw(&app, &with_auth(&[("idempotency-key", "C")]), "{}").await;
+    assert_eq!(c_status, StatusCode::OK, "the instance is free again once the active session finishes");
+    assert_eq!(started.load(Ordering::SeqCst), 2, "exactly one further generation was started");
+}
+
+// ---------------- report Addendum 2 §E1: the LAN API is an attack surface (M4·1 b) ----------------
+
+/// **Auth is enforced even on the LAN**, and its absence is a refusal rather than a warning.
+///
+/// The threat is not a malicious user — it is a *browser* on the same network, driven by a page the
+/// user is merely visiting, holding the victim's network position. Ollama-class servers have been
+/// exploited exactly this way. So "unauthenticated but only on localhost" is not a safe state, and
+/// `AppState` has no constructor that produces one.
+#[tokio::test]
+async fn the_api_refuses_an_unauthenticated_request() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+
+    let (no_token, body) = post_raw(&app, &[("host", "127.0.0.1:0")], "{}").await;
+    assert_eq!(no_token, StatusCode::UNAUTHORIZED, "no Authorization header must be refused");
+    assert!(body.contains("missing_or_invalid_api_token"), "structured code, got: {body}");
+
+    let (bad_token, _) =
+        post_raw(&app, &[("authorization", "Bearer wrong-token"), ("host", "127.0.0.1:0")], "{}").await;
+    assert_eq!(bad_token, StatusCode::UNAUTHORIZED, "a wrong token must be refused");
+
+    // A prefix of the real token must fail exactly like an unrelated one — the comparison is over
+    // BLAKE3 digests precisely so a matching prefix is not observable.
+    let (prefix, _) = post_raw(&app, &[("authorization", "Bearer test-api"), ("host", "127.0.0.1:0")], "{}").await;
+    assert_eq!(prefix, StatusCode::UNAUTHORIZED);
+
+    // Control: the correct token on the same app is admitted, so the refusals above are caused by
+    // the token and not by a harness that could never have succeeded.
+    let (ok, _) = post_raw(&app, &with_auth(&[]), "{}").await;
+    assert_eq!(ok, StatusCode::OK);
+}
+
+/// **DNS-rebinding defence:** a rebind resolves an attacker-controlled name to the victim's
+/// address, so the request arrives carrying the attacker's name in `Host`. Refusing an unexpected
+/// `Host` breaks the attack at the application layer even when DNS and the network cooperate.
+#[tokio::test]
+async fn the_api_refuses_a_foreign_host_header() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+
+    for host in ["evil.example.com", "hydra.attacker.test:80", ""] {
+        let (status, body) =
+            post_raw(&app, &[("authorization", "Bearer test-api-token"), ("host", host)], "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Host {host:?} must be refused");
+        assert!(body.contains("host_not_allowed"), "structured code, got: {body}");
+    }
+}
+
+/// **CSRF defence:** a cross-site POST carries an `Origin`. A foreign one is refused; a plain API
+/// client that sends none is served (absence is normal, and must not be the way around the check —
+/// which is why `Host` is checked unconditionally above).
+#[tokio::test]
+async fn the_api_refuses_a_cross_site_origin_but_allows_a_plain_client() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+
+    let (status, body) = post_raw(
+        &app,
+        &[("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0"), ("origin", "https://evil.example.com")],
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a cross-site Origin must be refused");
+    assert!(body.contains("origin_not_allowed"), "structured code, got: {body}");
+
+    let (same_site, _) = post_raw(
+        &app,
+        &[("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0"), ("origin", "http://127.0.0.1:0")],
+        "{}",
+    )
+    .await;
+    assert_eq!(same_site, StatusCode::OK, "an allow-listed same-origin request is served");
+
+    let (no_origin, _) = post_raw(&app, &with_auth(&[]), "{}").await;
+    assert_eq!(no_origin, StatusCode::OK, "an API client that sends no Origin is served");
+}
+
+/// A refused request must not have started anything. An auth check that rejects the *response*
+/// while the side effect already happened is not an auth check.
+#[tokio::test]
+async fn a_refused_request_starts_no_session_and_no_generation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = make_app(calls.clone());
+
+    let _ = post_raw(&app, &[("host", "127.0.0.1:0")], "{}").await;
+    let _ = post_raw(&app, &[("authorization", "Bearer nope"), ("host", "127.0.0.1:0")], "{}").await;
+    let _ = post_raw(&app, &[("authorization", "Bearer test-api-token"), ("host", "evil.example.com")], "{}").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no generation may start behind a refused request");
+
+    let (ok, _) = post_raw(&app, &with_auth(&[]), "{}").await;
+    assert_eq!(ok, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "control: an admitted request does start one");
 }

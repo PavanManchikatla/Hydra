@@ -322,6 +322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-fuzz"
+version = "0.10.2"
+dependencies = [
+ "hydra-modelsvc",
+ "hydra-proto",
+ "hydra-worker",
+]
+
+[[package]]
 name = "hydra-modelsvc"
 version = "0.10.2"
 dependencies = [

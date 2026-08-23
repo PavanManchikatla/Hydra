@@ -1,0 +1,112 @@
+name: fuzz
+
+# M4·1 (c) — parser fuzzing for the two untrusted-input surfaces.
+#
+# BLUEPRINT §3 (M4 DoD): "GGUF parser fuzzed for 24 CPU-hours without crashes."
+# Report Addendum 2 §D1: model files are untrusted input; GGUF parsing has had real CVEs.
+#
+# The 24 CPU-hours are ACCUMULATED across runs, not claimed by one. Each run reports the CPU-seconds
+# it actually spent, and the receipts under `verification/ci-results/` carry the running total — the
+# DoD is met when the banked receipts add up, and never before.
+#
+# Rule 16, as everywhere: the job is GREEN only if the LOG says so. A green check-mark from a runner
+# is not evidence; the `verdict=` lines the driver prints are.
+#
+# Shape: `--seconds` per shard × `matrix.shard` shards × 3 targets, in parallel. Every shard uses a
+# DIFFERENT seed, so parallelism buys coverage rather than repetition — running the same seed N
+# times would multiply the CPU-hours without adding a single new input.
+
+on:
+  push:
+    paths:
+      - 'crates/hydra-fuzz/**'
+      - 'crates/hydra-modelsvc/**'
+      - 'crates/hydra-proto/**'
+      - 'crates/hydra-worker/src/wire.rs'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'CPU-seconds per shard (split evenly across the 3 targets)'
+        required: false
+        default: '900'
+  schedule:
+    - cron: '15 4 * * 2'   # weekly Tuesday 04:15 UTC — a leg toward the 24 CPU-hour DoD
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # 8 shards × 900 s ≈ 2 CPU-hours per weekly leg; ~12 legs reach the DoD.
+    timeout-minutes: 45
+    strategy:
+      # `fail-fast: false` so one crashing shard does not cancel the others — the CPU-seconds the
+      # survivors spend are real evidence and are not thrown away because a sibling found a bug.
+      fail-fast: false
+      matrix:
+        # Shard count is fixed here rather than exposed as a dispatch input, because a matrix cannot
+        # be resized from an input without `fromJSON` gymnastics — and a knob that silently does
+        # nothing is worse than no knob. Change the list to change the width.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      # No submodule init → hydra-engine-sys degrades to its control-plane stub. The parsers under
+      # test are pure Rust and need no engine; this also keeps the arm cheap enough to run weekly.
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      # Release, because a release build runs ~10x more cases per second and CPU-hours are the DoD.
+      # The debug build is NOT redundant: `cargo test -p hydra-fuzz` runs the same generator in
+      # debug on every push, where arithmetic overflow PANICS instead of wrapping silently. Both
+      # matter — debug catches the overflow, release reaches deeper. This is stated because running
+      # only release would quietly give up the overflow oracle.
+      - name: Build the fuzz driver (release)
+        run: cargo build --release -p hydra-fuzz --bin hydra-fuzz
+
+      - name: Fuzz (shard ${{ matrix.shard }}, distinct seed)
+        env:
+          SECONDS_PER_SHARD: ${{ github.event.inputs.seconds || '900' }}
+        run: |
+          set -o pipefail
+          SEED=$(( ${{ matrix.shard }} * 1000003 ))
+          ./target/release/hydra-fuzz \
+            --target all \
+            --seconds "$SECONDS_PER_SHARD" \
+            --seed "$SEED" 2>&1 | tee "fuzz-shard-${{ matrix.shard }}.log"
+
+      - name: Classify (rule 16 — read the verdict lines, never the exit status)
+        run: |
+          LOG="fuzz-shard-${{ matrix.shard }}.log"
+          echo "--- verdict lines ---"
+          grep -E '^(target=|FUZZ SUMMARY)' "$LOG" || true
+          echo "---------------------"
+
+          # A missing summary line is a FAILURE, not a pass. A job that produced no verdict proves
+          # nothing, and mapping "no output" to green is exactly the masked-failure shape rule 16
+          # exists to prevent (§7.14/§7.15 caught it twice).
+          if ! grep -q '^FUZZ SUMMARY' "$LOG"; then
+            echo "verdict=INCONCLUSIVE (no FUZZ SUMMARY line — the driver did not finish)"
+            exit 1
+          fi
+          # Every target must have reported, or the run covered less than it claims.
+          for t in gguf frame-header wire-body; do
+            grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
+          done
+          if grep -qE '^CRASH ' "$LOG"; then
+            echo "verdict=RED (parser crash — replay coordinates are in the CRASH lines above)"
+            exit 1
+          fi
+          grep '^FUZZ SUMMARY' "$LOG" | grep -q 'verdict=GREEN' || {
+            echo "verdict=RED (summary is not GREEN)"; exit 1; }
+          echo "verdict=GREEN ($(grep '^FUZZ SUMMARY' "$LOG"))"
+
+      - name: Upload the shard log (the receipt's raw source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-shard-${{ matrix.shard }}
+          path: fuzz-shard-${{ matrix.shard }}.log
+          retention-days: 90

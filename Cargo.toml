@@ -12,6 +12,7 @@ members = [
     "crates/hydra-coordinator",
     "crates/hydra-modelsvc",
     "crates/hydra-sched",
+    "crates/hydra-fuzz",
 ]
 
 [workspace.package]
