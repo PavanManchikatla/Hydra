@@ -184,15 +184,29 @@ fn make_app(gen_calls: Arc<AtomicUsize>) -> axum::Router {
 /// loopback host/origin allow-list, so the happy path exercises the real check rather than a
 /// bypass.
 fn test_auth() -> hydra_coordinator::ApiAuth {
-    hydra_coordinator::ApiAuth::loopback(API_TOKEN, 0)
+    hydra_coordinator::ApiAuth::loopback(API_TOKEN, 0).expect("the test token must satisfy the minimum")
 }
 
-const API_TOKEN: &str = "test-api-token";
-const AUTH_HEADERS: [(&str, &str); 2] = [("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0")];
+/// **Audit H15 changed this line, and the change is the finding.**
+///
+/// It was `"test-api-token"` — **14 characters**, which the auditor called out by name: *"the test
+/// uses a fixed 14-char token and cannot catch this."* A single fixed, valid token exercises the
+/// happy path and says nothing about what the check does when the CONFIGURED token is empty, which
+/// is the case where `hash("") == hash("")` made every unauthenticated request look authenticated.
+const API_TOKEN: &str = "test-api-token-with-enough-entropy";
+/// **Audit H15 note.** These used to spell the bearer value out as a literal, in five places. When
+/// the token changed, three Host/Origin tests silently became *auth* tests: they still failed the
+/// request, but for the wrong reason, and still passed. Deriving the header from `API_TOKEN` means
+/// a token change cannot quietly re-aim a test at a different check.
+static AUTH_HEADER_VALUE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("Bearer {API_TOKEN}"));
+
+fn auth_headers() -> [(&'static str, &'static str); 2] {
+    [("authorization", AUTH_HEADER_VALUE.as_str()), ("host", "127.0.0.1:0")]
+}
 
 /// Prepend the auth headers every request needs, so each test states only what it is about.
 fn with_auth<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    AUTH_HEADERS.iter().copied().chain(extra.iter().copied()).collect()
+    auth_headers().iter().copied().chain(extra.iter().copied()).collect()
 }
 
 /// Parse an SSE body into (id, data) pairs.
@@ -387,7 +401,7 @@ async fn the_api_refuses_a_foreign_host_header() {
 
     for host in ["evil.example.com", "hydra.attacker.test:80", ""] {
         let (status, body) =
-            post_raw(&app, &[("authorization", "Bearer test-api-token"), ("host", host)], "{}").await;
+            post_raw(&app, &[("authorization", AUTH_HEADER_VALUE.as_str()), ("host", host)], "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "Host {host:?} must be refused");
         assert!(body.contains("host_not_allowed"), "structured code, got: {body}");
     }
@@ -402,7 +416,7 @@ async fn the_api_refuses_a_cross_site_origin_but_allows_a_plain_client() {
 
     let (status, body) = post_raw(
         &app,
-        &[("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0"), ("origin", "https://evil.example.com")],
+        &[("authorization", AUTH_HEADER_VALUE.as_str()), ("host", "127.0.0.1:0"), ("origin", "https://evil.example.com")],
         "{}",
     )
     .await;
@@ -411,7 +425,7 @@ async fn the_api_refuses_a_cross_site_origin_but_allows_a_plain_client() {
 
     let (same_site, _) = post_raw(
         &app,
-        &[("authorization", "Bearer test-api-token"), ("host", "127.0.0.1:0"), ("origin", "http://127.0.0.1:0")],
+        &[("authorization", AUTH_HEADER_VALUE.as_str()), ("host", "127.0.0.1:0"), ("origin", "http://127.0.0.1:0")],
         "{}",
     )
     .await;
@@ -430,7 +444,7 @@ async fn a_refused_request_starts_no_session_and_no_generation() {
 
     let _ = post_raw(&app, &[("host", "127.0.0.1:0")], "{}").await;
     let _ = post_raw(&app, &[("authorization", "Bearer nope"), ("host", "127.0.0.1:0")], "{}").await;
-    let _ = post_raw(&app, &[("authorization", "Bearer test-api-token"), ("host", "evil.example.com")], "{}").await;
+    let _ = post_raw(&app, &[("authorization", AUTH_HEADER_VALUE.as_str()), ("host", "evil.example.com")], "{}").await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no generation may start behind a refused request");
 
     let (ok, _) = post_raw(&app, &with_auth(&[]), "{}").await;
@@ -470,4 +484,117 @@ fn an_out_of_vocabulary_token_is_refused_before_anything_is_written() {
     assert!(matches!(s.try_commit_by_count().unwrap(), CommitOutcome::Committed(_)));
     assert_eq!(s.durable_pos(), 0);
     assert_eq!(appends.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// **Audit H15 / H16 / M16 — the HTTP surface.**
+//
+// # Standing rule 19: the oracles, named
+//
+// * **H15** — the suite used **one fixed 14-character token**. A valid token exercises the happy
+//   path; it cannot distinguish "compares a real secret" from "compares whatever was configured,
+//   including nothing". The hole was that a missing header collapses to `""`, so an empty
+//   configured token authenticated every anonymous request.
+// * **H16** — `done` was set on exactly one exit path, and a happy-path driver only ever takes
+//   that path. No test panicked a pump, so no test could see that any other exit left the
+//   coordinator answering 409 to every later client until restart.
+// * **M16** — `client_drained` had **no caller outside its own unit test**. The unit test proved
+//   the function decrements a counter. Nothing proved anyone ever called it, and nobody did.
+// ---------------------------------------------------------------------------------------------
+
+/// **H15 — an empty or near-empty API token is refused at construction.**
+#[test]
+fn an_empty_token_is_refused_at_construction() {
+    use hydra_coordinator::{ApiAuth, AuthConfigError, MIN_API_TOKEN_LEN};
+
+    for bad in ["", "x", "short", "fifteen-chars-!"] {
+        let out = ApiAuth::new(bad, vec!["localhost:1".into()], vec![]);
+        assert!(
+            matches!(out, Err(AuthConfigError::TokenTooShort { .. })),
+            "{bad:?} ({} bytes) must be refused: an empty token makes hash(\"\") == hash(\"\"), so every \
+             request with no Authorization header authenticates",
+            bad.len()
+        );
+    }
+    assert_eq!("fifteen-chars-!".len(), MIN_API_TOKEN_LEN - 1, "the boundary case really is one short");
+
+    // Control: a token at the minimum is accepted, so the bound is `< MIN`, not `<= MIN`.
+    assert!(ApiAuth::new(&"a".repeat(MIN_API_TOKEN_LEN), vec!["localhost:1".into()], vec![]).is_ok());
+}
+
+/// **H15 — a request with NO `Authorization` header is refused before anything is hashed.**
+///
+/// The absent-header and wrong-token cases used to be the same code path, which is precisely how
+/// an empty configured token turned "absent" into "correct".
+#[tokio::test]
+async fn a_request_with_no_authorization_header_is_refused() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("host", "127.0.0.1:0")
+        .header("content-type", "application/json")
+        .body(Body::from("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no header means no access, whatever the configured token is");
+}
+
+/// **M16 — an over-long `Idempotency-Key` is refused rather than used as a map key.**
+#[tokio::test]
+async fn an_over_long_idempotency_key_is_refused() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("host", "127.0.0.1:0")
+        .header("authorization", format!("Bearer {API_TOKEN}"))
+        .header("idempotency-key", "k".repeat(4096))
+        .header("content-type", "application/json")
+        .body(Body::from("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// **Audit H16 — a panicking session must not wedge the coordinator forever.**
+///
+/// # Standing rule 19: why no existing test could see this
+///
+/// `done` was set on exactly **one** exit path: the generator channel closing cleanly. A
+/// happy-path driver only ever takes that path, so every test agreed the flag worked. Any other
+/// exit — a panic in `make()` or `gen()`, a panic inside the pump, a runtime that fails to build —
+/// left `done == false` **forever**, and `active_session()` treats any session with `done == false`
+/// as live. **One panic therefore made the instance answer 409 to every later client until the
+/// process restarted**, without ever reporting why.
+///
+/// The fix is a `Drop` guard rather than another `break` arm, because a guard cannot be forgotten:
+/// it fires on the normal path, the early return, and the unwinding panic alike.
+#[tokio::test]
+async fn a_panicking_session_does_not_wedge_the_instance() {
+    // A generator that panics on the session thread, the way a real one would if the pipeline or
+    // the tokenizer failed.
+    let gen_fn: hydra_coordinator::GenFn = Arc::new(move |_prompt: String| {
+        panic!("injected generator failure");
+    });
+    let make_session: Arc<dyn Fn() -> Session + Send + Sync> =
+        Arc::new(|| session(Box::new(OkDisk::default()), Box::new(MapPieces(HashMap::new())), 1, 1000));
+    let app = router(AppState::new(make_session, gen_fn, test_auth()));
+
+    // First request: the session is created and its thread dies.
+    let (first, _) = post_raw(&app, &with_auth(&[]), "{}").await;
+    assert_eq!(first, StatusCode::OK, "the request itself is admitted; the failure happens on the session thread");
+
+    // Give the session thread a moment to unwind and run the guard.
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let (probe, _) = post_raw(&app, &with_auth(&[]), "{}").await;
+        if probe == StatusCode::OK {
+            return; // the instance recovered, which is the property under test
+        }
+    }
+    panic!(
+        "the instance is still refusing new sessions after a panicking generation: `done` was never \
+         set, so every later client gets 409 until the process restarts (audit H16)"
+    );
 }

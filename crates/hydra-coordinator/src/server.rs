@@ -46,6 +46,75 @@ struct SessionState {
     /// Live fan-out to any currently-streaming client.
     tx: broadcast::Sender<Event>,
     done: bool,
+    /// **Audit M16 — the highest event id any client has actually been handed.**
+    ///
+    /// `Session::client_drained` **had no caller outside its own unit test**: the pump counted
+    /// events *emitted* and nothing ever told it any had been *consumed*, so `pending_emit` only
+    /// ever grew. After `emit_capacity` events `commit_group` returned `Paused` forever, the pump
+    /// stopped committing, and the stream ended **with HTTP 200 and no error** — a truncated
+    /// generation that looked like a completed one.
+    ///
+    /// The SSE task and the pump are different tasks on different threads, so the acknowledgement
+    /// travels through this field. An **id**, not a count: with `Last-Event-ID` resume a client can
+    /// reconnect and re-read, and the meaningful quantity is *how far anyone has got*, which is
+    /// monotonic, rather than *how many were handed over*, which is not.
+    client_acked_through: u64,
+}
+
+/// Record that a client has been handed every event up to `id` (audit M16).
+fn ack_through(st: &Mutex<SessionState>, id: u64) {
+    let mut s = lock_session(st);
+    if id > s.client_acked_through {
+        s.client_acked_through = id;
+    }
+}
+
+/// **Audit H16 — marks a session finished however its thread exits.**
+///
+/// Held for the lifetime of the session thread. On a normal return, an early return, or an
+/// unwinding panic, `Drop` runs and the session stops being "live" — so a failed generation frees
+/// the instance instead of wedging it.
+struct DoneOnDrop(Arc<Mutex<SessionState>>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        lock_session(&self.0).done = true;
+    }
+}
+
+/// **Audit H16 — a poisoned mutex must not wedge the instance either.**
+///
+/// `lock_session(st)` panics if any holder ever panicked, which in a `Drop` would abort the
+/// process and everywhere else would wedge the session exactly as the missing `done` did. The
+/// state behind this lock is a log, a broadcast sender and a flag: a panic mid-update cannot leave
+/// them in a shape that is unsafe to read, so recovering the inner value is the right call rather
+/// than propagating a second failure on top of the first.
+fn lock_session(st: &Mutex<SessionState>) -> std::sync::MutexGuard<'_, SessionState> {
+    st.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How many finished sessions are retained for `Last-Event-ID` resume (audit M16).
+const RETAINED_FINISHED_SESSIONS: usize = 8;
+/// Longest accepted `Idempotency-Key` (audit M16: it had no bound at all, and it is a map key).
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+
+/// Drop finished sessions beyond [`RETAINED_FINISHED_SESSIONS`], oldest first (audit M16).
+fn prune_finished(reg: &mut Registry) {
+    let mut finished: Vec<(String, u64)> = reg
+        .sessions
+        .iter()
+        .filter(|(_, st)| lock_session(st).done)
+        .map(|(id, _)| (id.clone(), id.rsplit('-').next().and_then(|n| n.parse().ok()).unwrap_or(0)))
+        .collect();
+    if finished.len() <= RETAINED_FINISHED_SESSIONS {
+        return;
+    }
+    finished.sort_by_key(|(_, seq)| *seq);
+    let drop_n = finished.len() - RETAINED_FINISHED_SESSIONS;
+    for (id, _) in finished.into_iter().take(drop_n) {
+        reg.sessions.remove(&id);
+        reg.by_idempotency.retain(|_, v| v != &id);
+    }
 }
 
 #[derive(Default)]
@@ -67,7 +136,7 @@ impl Registry {
     fn active_session(&self) -> Option<String> {
         self.sessions
             .iter()
-            .find(|(_, st)| !st.lock().unwrap().done)
+            .find(|(_, st)| !lock_session(st).done)
             .map(|(id, _)| id.clone())
     }
 }
@@ -90,6 +159,19 @@ impl Registry {
 ///   same-origin allow-listed one is allowed.
 ///
 /// Every failure is a **refusal**, never a downgrade: there is deliberately no "warn and serve".
+/// The shortest API token `ApiAuth::new` will accept (audit H15).
+///
+/// 16 bytes of a random alphabet is comfortably beyond guessing on a LAN, and short enough that a
+/// human-pasted token still passes. The point is not the exact number, it is that **there is one**.
+pub const MIN_API_TOKEN_LEN: usize = 16;
+
+/// Why an [`ApiAuth`] could not be constructed (audit H15).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AuthConfigError {
+    #[error("API token is {len} bytes; the minimum is {min}. An empty or near-empty token makes every unauthenticated request look authenticated (audit H15)")]
+    TokenTooShort { len: usize, min: usize },
+}
+
 #[derive(Clone)]
 pub struct ApiAuth {
     token_digest: [u8; 32],
@@ -101,33 +183,73 @@ impl ApiAuth {
     /// Build from the API token and the host/origin allow-lists. Hosts are matched
     /// case-insensitively and compared **with** the port, because `localhost:8080` and
     /// `localhost:9999` are different endpoints.
-    pub fn new(token: &str, allowed_hosts: Vec<String>, allowed_origins: Vec<String>) -> ApiAuth {
-        ApiAuth {
+    /// **Audit H15 — an EMPTY token used to authenticate every request that sent no header.**
+    ///
+    /// `check` collapsed a missing `Authorization` header to `""` and then compared
+    /// `hash("") == self.token_digest`. With an empty configured token — an unset environment
+    /// variable, an `unwrap_or_default()`, a config field someone left blank — those are equal, so
+    /// **the server accepted every unauthenticated request while reporting itself as
+    /// authenticated.** The M4·1 checklist row said the token was *"required by the type"*, and
+    /// that was true of the **argument** and not of a **non-empty secret**: `ApiAuth::new` could not
+    /// be called without passing something, and `""` is something.
+    ///
+    /// Construction now fails instead. A minimum length is enforced because a one-character token
+    /// is not meaningfully better than none, and the bound is stated rather than left to the
+    /// operator's judgement at the moment they are least likely to exercise it.
+    pub fn new(token: &str, allowed_hosts: Vec<String>, allowed_origins: Vec<String>) -> Result<ApiAuth, AuthConfigError> {
+        if token.len() < MIN_API_TOKEN_LEN {
+            return Err(AuthConfigError::TokenTooShort { len: token.len(), min: MIN_API_TOKEN_LEN });
+        }
+        Ok(ApiAuth {
             token_digest: *blake3::hash(token.as_bytes()).as_bytes(),
             allowed_hosts: Arc::new(allowed_hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect()),
             allowed_origins: Arc::new(allowed_origins.into_iter().map(|o| o.to_ascii_lowercase()).collect()),
-        }
+        })
     }
 
     /// The loopback default for a single-machine dev/desktop coordinator.
-    pub fn loopback(token: &str, port: u16) -> ApiAuth {
+    pub fn loopback(token: &str, port: u16) -> Result<ApiAuth, AuthConfigError> {
         let hosts = vec![
             format!("127.0.0.1:{port}"),
             format!("localhost:{port}"),
             format!("[::1]:{port}"),
         ];
-        let origins = hosts.iter().flat_map(|h| [format!("http://{h}"), format!("https://{h}")]).collect();
+        // **Audit H21 (the half that is fixable here).** This allow-listed `https://` origins that
+        // the server **cannot serve**: the axum router has no TLS layer, so the one link carrying
+        // user prompts and the API bearer token is plaintext. Allow-listing a scheme we do not
+        // offer is a claim the code cannot honour, so the list now names only what is actually
+        // served. Serving the API over the cluster's own rustls material is the real fix and is
+        // owed (§8) — it lands with M4·0, which is the first binary that will serve this router.
+        let origins = hosts.iter().map(|h| format!("http://{h}")).collect();
         ApiAuth::new(token, hosts, origins)
     }
 
     /// `Ok(())`, or the refusal with the status and machine-readable code it should carry.
     fn check(&self, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str, &'static str)> {
-        let presented = headers
+        // **Audit H15 — an ABSENT header is refused before anything is hashed.**
+        //
+        // Collapsing "no header" to `""` and hashing it made the missing-header case
+        // indistinguishable from the wrong-token case *in the code*, which is how an empty
+        // configured token turned "no header" into "correct token". Refusing absence first means
+        // the comparison below only ever runs on something a client actually sent.
+        let Some(presented) = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if *blake3::hash(presented.as_bytes()).as_bytes() != self.token_digest {
+            .filter(|t| !t.is_empty())
+        else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "missing_or_invalid_api_token",
+                "this endpoint requires `Authorization: Bearer <token>` even on a trusted LAN",
+            ));
+        };
+        // **Audit M16 — constant-time comparison.** `!=` on `[u8; 32]` may exit at the first
+        // differing byte. What leaks is a digest prefix rather than the token, so this is a small
+        // hole and is fixed for a small reason: the checklist claims a digest comparison, and
+        // `blake3::Hash`'s `PartialEq` is constant-time while `[u8; 32]`'s is not. A claim that is
+        // *nearly* true is the §7.31 shape.
+        if blake3::Hash::from(self.token_digest) != blake3::hash(presented.as_bytes()) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "missing_or_invalid_api_token",
@@ -213,7 +335,22 @@ async fn chat_completions(
             .into_response();
     }
 
-    let idempotency = headers.get("idempotency-key").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    // Audit M16: an unbounded header value used as a map key. Bounded, and an over-long one is
+    // refused rather than truncated (truncating would silently merge two distinct keys).
+    let idempotency = match headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+        Some(k) if k.len() > MAX_IDEMPOTENCY_KEY_LEN => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                format!(
+                    "{{\"error\":{{\"code\":\"idempotency_key_too_long\",\"message\":\"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LEN} bytes\"}}}}"
+                ),
+            )
+                .into_response();
+        }
+        Some(k) => Some(k.to_string()),
+        None => None,
+    };
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -245,10 +382,18 @@ async fn chat_completions(
                 )
                     .into_response();
             }
+            // **Audit M16 — the registry and the idempotency map never pruned.**
+            //
+            // `sessions` and `by_idempotency` grew for the life of the process, each finished
+            // session retaining its **full event log**. A long-lived coordinator therefore held
+            // every token of every generation it had ever served. Finished sessions are dropped
+            // here, oldest first, keeping a bounded tail so `Last-Event-ID` resume still works for
+            // a client that reconnects shortly after a generation ends.
+            prune_finished(&mut reg);
             reg.seq += 1;
             let id = format!("chatcmpl-{}", reg.seq);
             let (tx, _rx) = broadcast::channel(256);
-            let st = Arc::new(Mutex::new(SessionState { log: Vec::new(), tx, done: false }));
+            let st = Arc::new(Mutex::new(SessionState { log: Vec::new(), tx, done: false, client_acked_through: 0 }));
             reg.sessions.insert(id.clone(), st.clone());
             if let Some(k) = idempotency.clone() {
                 reg.by_idempotency.insert(k, id.clone());
@@ -266,7 +411,25 @@ async fn chat_completions(
         let gen = state.gen_fn.clone();
         let st = session.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            // **Audit H16 — `done` is now set by a DROP GUARD, so it is set on EVERY exit.**
+            //
+            // It used to be set only where the generator channel closed cleanly. Every other way
+            // out left it `false` **forever**: a panic in `make()` or `gen()`, a panic inside the
+            // pump, a runtime that failed to build, or a thread killed for any reason. And because
+            // `active_session()` treats any session with `done == false` as live, **one panic made
+            // the coordinator answer 409 to every later client until the process restarted** —
+            // a single-session instance wedged by a failure it never reported.
+            //
+            // A guard cannot be forgotten the way a `break` arm can: it fires on the normal path,
+            // the early-return path, and the unwinding path alike.
+            let _guard = DoneOnDrop(st.clone());
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("hydra-coordinator: session runtime failed to build: {e}");
+                    return; // `_guard` still marks the session done on the way out
+                }
+            };
             rt.block_on(async move {
                 let sess = make();
                 let rx = gen(prompt);
@@ -284,7 +447,18 @@ async fn chat_completions(
 async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<Mutex<SessionState>>) {
     let mut deadline = tokio::time::interval(std::time::Duration::from_millis(50));
     deadline.tick().await; // consume the immediate first tick
+    // Audit M16: how far the pump has already credited the session for client consumption.
+    let mut credited: u64 = 0;
     loop {
+        // Relieve backpressure with whatever the streaming task has handed over since last time.
+        // Without this the emit buffer only ever fills (see `client_acked_through`).
+        {
+            let acked = lock_session(&st).client_acked_through;
+            if acked > credited {
+                sess.client_drained((acked - credited) as usize);
+                credited = acked;
+            }
+        }
         tokio::select! {
             maybe = rx.recv() => match maybe {
                 Some(tok) => {
@@ -293,7 +467,7 @@ async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<M
                     // generation ends here — loudly, with nothing committed for this token.
                     if let Err(e) = sess.push_sampled(tok) {
                         eprintln!("hydra-coordinator: generation aborted: {e}");
-                        st.lock().unwrap().done = true;
+                        lock_session(&st).done = true;
                         break;
                     }
                     if let Ok(CommitOutcome::Committed(evs)) = sess.try_commit_by_count() {
@@ -302,7 +476,7 @@ async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<M
                 }
                 None => {
                     if let Ok(evs) = sess.finish() { publish(&st, evs); }
-                    st.lock().unwrap().done = true;
+                    lock_session(&st).done = true;
                     break;
                 }
             },
@@ -319,7 +493,7 @@ fn publish(st: &Arc<Mutex<SessionState>>, events: Vec<Event>) {
     if events.is_empty() {
         return;
     }
-    let mut s = st.lock().unwrap();
+    let mut s = lock_session(st);
     for ev in events {
         s.log.push(ev.clone());
         let _ = s.tx.send(ev); // best-effort live fan-out; the log is the source of truth
@@ -344,7 +518,7 @@ fn async_stream_impl(
     // so no event slips between the two (an event is appended to the log then broadcast, both under
     // the lock — so it is either in the backlog or in the subscription, never lost).
     let (mut rx, backlog, already_done) = {
-        let s = st.lock().unwrap();
+        let s = lock_session(&st);
         let backlog: Vec<Event> = s.log.iter().filter(|e| e.id > last_event_id).cloned().collect();
         (s.tx.subscribe(), backlog, s.done)
     };
@@ -353,6 +527,7 @@ fn async_stream_impl(
         for ev in backlog {
             last = ev.id;
             y.yield_one(sse(&ev)).await;
+            ack_through(&st, last);
         }
         if already_done {
             return;
@@ -365,13 +540,14 @@ fn async_stream_impl(
                     if ev.id > last {
                         last = ev.id;
                         y.yield_one(sse(&ev)).await;
+                        ack_through(&st, last);
                     }
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
                 // Slow reader / timeout: recover any gap from the durable log, then stop if done.
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {
                     let (more, done) = {
-                        let s = st.lock().unwrap();
+                        let s = lock_session(&st);
                         (s.log.iter().filter(|e| e.id > last).cloned().collect::<Vec<_>>(), s.done)
                     };
                     for ev in &more {

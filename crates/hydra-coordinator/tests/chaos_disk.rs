@@ -457,6 +457,13 @@ fn a_failed_commit_retains_the_batch_instead_of_discarding_sampled_tokens() {
          discarding them leaves a permanent hole that recovery replays as a shifted generation"
     );
 
+    // **⚑ TO THE NEXT READER: THE REFUSAL BELOW IS CORRECT. DO NOT "FIX" IT.**
+    //
+    // When this test was written the retry was expected to SUCCEED. It does not, and the test
+    // caught the author's expectation rather than a defect in the code. Recorded here because the
+    // natural next move on seeing a refused retry is to make the retry work, and that would undo
+    // H9.
+    //
     // **How M7 and H9 compose, which is the interesting part.** The retry is REFUSED, and that is
     // correct: H9 poisoned the stream because the failed append may have left a partial record, so
     // the on-disk tail is unknown and appending again would manufacture mid-stream corruption. The

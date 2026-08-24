@@ -19,5 +19,5 @@ pub use boundary_store::{BoundaryError, BoundaryStore, DurableBoundary};
 pub use commit_stream::{CommitError, CommitStream, Durability, GroupBatch, GroupCommitter, WalFenceCtx};
 pub use event_log::{Event, EventLog};
 pub use recovery::{CommitStreamStats, RecoveryError, RecoveryState};
-pub use server::{router, ApiAuth, AppState, GenFn};
+pub use server::{AuthConfigError, MIN_API_TOKEN_LEN, router, ApiAuth, AppState, GenFn};
 pub use session::{CommitOutcome, PieceSource, SampledToken, Session, TokenizerPieces};
