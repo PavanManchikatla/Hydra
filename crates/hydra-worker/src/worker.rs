@@ -35,6 +35,8 @@ use hydra_transport::roles::PeerRole;
 const ERR_FENCED: u16 = 1;
 /// `ERR_RECOVERY_COMPLETED` (Case B′).
 const ERR_RECOVERY_COMPLETED: u16 = 3;
+/// `ERR_TRANSITION` — an invalid transition (spec §1.3 Case C; audit M10).
+const ERR_TRANSITION: u16 = 2;
 /// `ERR_CHECKPOINT_MISMATCH` — sampler drift (spec §2.6b: fatal, never silently repaired).
 const ERR_CHECKPOINT_MISMATCH: u16 = 9;
 /// How many recent output positions the `SAMPLED` cache retains (audit H20).
@@ -771,6 +773,17 @@ impl Worker {
             }
             StageEffect::RecoveryCompleted { target, .. } => Some(wire::encode_error(fence, target, 0, ERR_RECOVERY_COMPLETED)),
             StageEffect::Fenced { attempt, .. } => Some(wire::encode_error(fence, self.stage.epoch(), attempt, ERR_FENCED)),
+            // **Audit M10 — the refusal goes on the wire.** Silence was costing debugging time
+            // proportional to the size of the system: M4·0's acceptance test hung rather than
+            // failing, because a refused finalize simply did not reply.
+            StageEffect::Refused { code, detail, .. } => {
+                let wire_code = match code {
+                    hydra_state::stage::RefusalCode::Fenced => ERR_FENCED,
+                    hydra_state::stage::RefusalCode::Transition => ERR_TRANSITION,
+                };
+                eprintln!("hydra-worker: refused a control frame: {detail}");
+                Some(wire::encode_error(fence, self.stage.epoch(), self.stage.attempt(), wire_code))
+            }
             // `Ready` is an internal catch-up milestone (no wire ack in this slice).
             StageEffect::Ready { .. } => None,
         }

@@ -2,7 +2,7 @@
 //! and its Mut3 mutation parity. Invariants asserted after every step.
 
 use hydra_state::invariants::check_stage;
-use hydra_state::stage::{StageEffect, StageEvent::*, StageState};
+use hydra_state::stage::{RefusalCode, StageEffect, StageEvent::*, StageState};
 use hydra_state::{ActivationKind, ActivationTuple, Stage};
 
 fn tuple(attempt: u32) -> ActivationTuple {
@@ -64,7 +64,17 @@ fn mixed_epoch_commit_is_rejected_by_f1() {
     let mut s = Stage::frozen_ready(0, 1, 0);
     // A delayed COMMIT for epoch 0 (a mixed-epoch retransmit) must be a no-op — not applied.
     let e = step_ok(&mut s, RecvCommit { tuple: tuple(1) }); // tuple() is epoch 0
-    assert!(e.is_empty(), "a COMMIT for the wrong epoch produces no ack (F1 reject)");
+    // **Audit M10 changed what "rejected" looks like, and this assertion is why it mattered.**
+    // It used to read `e.is_empty()` — i.e. it asserted the stage says NOTHING, which is the
+    // silence M10 removes. A rejection is still not an ack; it is now a message that names itself.
+    assert!(
+        matches!(e[..], [StageEffect::Refused { code: RefusalCode::Fenced, .. }]),
+        "a COMMIT for the wrong epoch is REFUSED and says so (F1 reject), never silently dropped: {e:?}"
+    );
+    assert!(
+        !matches!(e[0], StageEffect::Committed { .. }),
+        "and it is certainly not an ack"
+    );
     assert_eq!(s.state(), StageState::FrozenReady, "stage does not act on a mixed-epoch message");
     assert_eq!(s.epoch(), 1, "stage stays at its own epoch");
     // the matching-epoch COMMIT is accepted normally, proving the reject was epoch-specific
@@ -202,7 +212,13 @@ fn a_finalize_whose_evidence_names_a_different_activation_is_refused() {
     assert_ne!(wrong, tuple.completion_hash(), "the fixture must actually differ, or this proves nothing");
 
     let effects = s.step(RecvFinalize { epoch: 0, attempt: 1, completion_id: 5, complete_record_hash: wrong });
-    assert!(effects.is_empty(), "a finalize carrying another activation's evidence must not finalize this one");
+    // Audit M10: refused, and it SAYS so. This exact refusal is what made M4·0's acceptance test
+    // hang rather than fail, back when it produced silence.
+    assert!(
+        matches!(effects[..], [StageEffect::Refused { code: RefusalCode::Fenced, .. }]),
+        "a finalize carrying another activation's evidence must be refused with a message: {effects:?}"
+    );
+    assert!(!matches!(effects[0], StageEffect::Finalized { .. }), "and must not finalize this one");
     assert_eq!(s.state(), StageState::Preactive, "and the stage stays PREACTIVE — never serviceable on foreign evidence");
     assert!(!s.holds_final_evidence());
 

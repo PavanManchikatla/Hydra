@@ -74,6 +74,33 @@ pub enum StageEffect {
     Finalized { rank: StageRank, attempt: AttemptId },
     /// F2 rejection (would carry `ERR_FENCED{FenceState}` on the wire).
     Fenced { rank: StageRank, attempt: AttemptId, highest: AttemptId },
+    /// **Audit M10 — a refusal that SAYS SO.**
+    ///
+    /// Every arm below that used to `return Vec::new()` was a refusal the sender never heard
+    /// about. The spec defines the codes (§4's `ErrCode`) and names the cases (§1.3: an invalid
+    /// transition is `ERR_TRANSITION`); the code simply never emitted them, so a refused control
+    /// frame produced **silence**.
+    ///
+    /// **The cost, measured rather than argued:** M4·0's acceptance test **hung** instead of
+    /// failing, because a stage refusing a finalize on mismatched completion evidence just did not
+    /// reply — and a hang reads as a network fault, so it is debugged as one. The debugging cost of
+    /// silence grows with the size of the system; the cost of a reply is one frame.
+    Refused { rank: StageRank, code: RefusalCode, detail: &'static str },
+}
+
+/// Why a control frame was refused (audit M10). Maps 1:1 onto `hydra-proto`'s `ErrCode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefusalCode {
+    /// The frame is for a different epoch/attempt than this stage holds (`ERR_FENCED`).
+    Fenced,
+    /// The transition is not one this stage can take from here (`ERR_TRANSITION`; spec §1.3 Case C).
+    Transition,
+}
+
+/// A refusal, as an effect (audit M10). A free function so every site reads identically and a new
+/// refusal cannot accidentally be written as a bare `Vec::new()`.
+fn refused(rank: StageRank, code: RefusalCode, detail: &'static str) -> Vec<StageEffect> {
+    vec![StageEffect::Refused { rank, code, detail }]
 }
 
 /// One stage's participation in the activation transaction for a (session, epoch, recovery_id).
@@ -228,10 +255,10 @@ impl Stage {
                 // here and the message is dropped (→ `ERR_TRANSITION` on the wire, Case C), never
                 // clamped: a clamp would let a wrong frame produce a *plausible* truncation.
                 if target != base.saturating_add(1) {
-                    return Vec::new();
+                    return refused(self.rank, RefusalCode::Transition, "BEGIN_RECOVERY target must be base + 1");
                 }
                 if truncate_to < 0 || truncate_to >= n_ctx {
-                    return Vec::new();
+                    return refused(self.rank, RefusalCode::Transition, "BEGIN_RECOVERY truncate_to outside [0, n_ctx)");
                 }
                 // Case B′: a completed activation is locally decidable — ERR_RECOVERY_COMPLETED.
                 if self.state == ActiveFinal && self.epoch == target && self.final_evidence {
@@ -297,7 +324,8 @@ impl Stage {
             }
             RecvCommit { tuple } => {
                 if tuple.epoch != self.epoch || tuple.recovery_id != self.recovery_id {
-                    return Vec::new(); // wrong (epoch, recovery_id) — F1/precondition
+                    // Audit M10: a fenced commit now says so instead of vanishing.
+                    return refused(self.rank, RefusalCode::Fenced, "COMMIT_ACTIVATION for another (epoch, recovery_id)");
                 }
                 if !self.attempt_passes_fence(tuple.attempt) {
                     // F2: fence a stale attempt.
@@ -325,7 +353,7 @@ impl Stage {
                         self.attempt = tuple.attempt;
                         self.highest_attempt = self.highest_attempt.max(tuple.attempt);
                     }
-                    _ => return Vec::new(),
+                    _ => return refused(self.rank, RefusalCode::Transition, "COMMIT_ACTIVATION in a state that cannot accept it"),
                 }
                 vec![StageEffect::Committed {
                     rank: self.rank,
@@ -345,7 +373,7 @@ impl Stage {
                 // audit event. The attempt id does not save it: attempt space is per (session,
                 // epoch), so the same id recurs in the next epoch.
                 if epoch != self.epoch {
-                    return Vec::new();
+                    return refused(self.rank, RefusalCode::Fenced, "FINALIZE_ACTIVATION for another epoch");
                 }
                 // **Audit H2's OTHER half — the evidence is now CHECKED, not merely carried.**
                 //
@@ -378,7 +406,9 @@ impl Stage {
                     self.completion_id = completion_id;
                     return vec![StageEffect::Finalized { rank: self.rank, attempt }];
                 }
-                Vec::new()
+                // Audit M10 — and this is the exact refusal that made M4·0's acceptance test HANG
+                // rather than fail. It is a message now.
+                refused(self.rank, RefusalCode::Fenced, "FINALIZE_ACTIVATION: wrong attempt, state, or completion evidence")
             }
             RecvAbort { attempt } => {
                 // abort ⇒ FROZEN_READY, next attempt fence (I21). A finalized stage is never aborted.
