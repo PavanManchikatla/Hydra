@@ -193,6 +193,14 @@ impl Coordinator {
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
+    /// **Test/driver seam: enter the state a coordinator is in when a session was already
+    /// serving.** A recovery begins from SERVICEABLE (TLA+ `CoordBeginRecovery`), and a freshly
+    /// constructed `Coordinator` has not been through an activation. Named for what it does so a
+    /// call site outside a recovery entry reads as the mistake it would be.
+    pub fn force_state_for_recovery_entry(&mut self) {
+        self.state = CoordState::Serviceable;
+    }
+
     /// The reconstruction attempt this coordinator is on (spec §6.4; M4·0b).
     pub fn recovery_id(&self) -> crate::RecoveryId {
         self.recovery_id

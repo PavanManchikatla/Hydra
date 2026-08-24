@@ -213,6 +213,90 @@ impl<L: StageLink> ActivationDriver<L> {
         link.recv().await
     }
 
+    /// **M4·0c — reconstruct a stage's context: the strategy path, driven by the coordinator.**
+    ///
+    /// This is everything between `BEGIN_RECOVERY` and re-activation, and until now **every line of
+    /// it lived in a demo binary or a test**: `hydra-wan`, `hydra-3node-kill`, `hydra-2node-ci` and
+    /// the recovery test files each hand-sent `CATCH_UP_CONTEXT` and
+    /// `INSTALL_SAMPLER_CHECKPOINT` in the right order. So the *sequence* was demonstrated many
+    /// times and was **never owned by the product** — which is the same shape as the activation
+    /// transaction before M4·0, one layer further in.
+    ///
+    /// The order is the spec's (§6.2/§6.3) and is not negotiable:
+    /// 1. **rebuild the KV** with the strategy's frames (`REBUILD_APPLY` / boundary replay),
+    /// 2. **drive the control-plane frontier** with `CATCH_UP_CONTEXT{goal}` and wait for
+    ///    `CATCH_UP_READY` — the SM's `applied` must reach the goal or activation cannot commit,
+    /// 3. **install the sampler checkpoint** (I17: installation precedes activation, always).
+    ///
+    /// Returns when the stage is reconstructed. The caller then feeds `StagesReconstructed`, and
+    /// the activation transaction proceeds exactly as it does for a fresh session — which is the
+    /// point of §6.6 being *one* mechanism for INITIAL and RECOVERY.
+    pub async fn reconstruct(
+        &mut self,
+        rank: AuthenticatedRank,
+        strategy: &RecoveryStrategy,
+        goal_input_pos: i64,
+        checkpoint_id: u64,
+        checkpoint_snapshot: &[u8],
+    ) -> Result<Executed, DriverError>
+    where
+        L: Receivable,
+    {
+        let mut out = Executed::default();
+        let epoch = self.coord.epoch();
+
+        // 1. Rebuild the KV. These are data-plane frames; the stage applies them with NO_SAMPLE,
+        //    so nothing is sampled and no output position is produced (I14 is untouched).
+        match strategy {
+            RecoveryStrategy::TokenReplay { tokens } => {
+                for (pos, tok) in tokens.iter().enumerate() {
+                    let frame = hydra_wire::encode_apply_token(&self.fence, epoch, pos as i64, *tok, true);
+                    self.send_to(rank, frame).await?;
+                    out.frames_sent += 1;
+                    // Each apply is acked; draining keeps the connection in step and surfaces a
+                    // refusal (audit M10) instead of leaving it in the socket.
+                    let _ = self.recv_from(rank).await?;
+                }
+            }
+            RecoveryStrategy::BoundaryReplay { boundaries } => {
+                for (pos, activations) in boundaries {
+                    let frame = hydra_wire::encode_fwd(&self.fence, epoch, *pos, true, activations);
+                    self.send_to(rank, frame).await?;
+                    out.frames_sent += 1;
+                    let _ = self.recv_from(rank).await?;
+                }
+            }
+        }
+
+        // 2. Drive the SM's control-plane frontier to the goal.
+        let frame = hydra_wire::encode_catch_up_context(&self.fence, epoch, self.coord.recovery_id(), goal_input_pos);
+        self.send_to(rank, frame).await?;
+        out.frames_sent += 1;
+        let ready = self.recv_from(rank).await?;
+        let (_v, msg) = hydra_wire::decode(&ready, &self.fence).map_err(|e| DriverError::Wire(e.to_string()))?;
+        if !matches!(msg, hydra_wire::Msg::CatchUpReady { .. }) {
+            return Err(DriverError::Wire(format!("expected CATCH_UP_READY, got {msg:?}")));
+        }
+
+        // 3. Install the sampler checkpoint BEFORE activation (I17). A stage that activated first
+        //    could serve a token from a sampler state the ledger never committed to.
+        let frame = hydra_wire::encode_install_sampler_checkpoint(&self.fence, epoch, checkpoint_id, checkpoint_snapshot);
+        self.send_to(rank, frame).await?;
+        out.frames_sent += 1;
+        let installed = self.recv_from(rank).await?;
+        let (_v, msg) = hydra_wire::decode(&installed, &self.fence).map_err(|e| DriverError::Wire(e.to_string()))?;
+        if !matches!(msg, hydra_wire::Msg::SamplerCheckpointInstalled { .. }) {
+            return Err(DriverError::Wire(format!("expected SAMPLER_CHECKPOINT_INSTALLED, got {msg:?}")));
+        }
+        Ok(out)
+    }
+
+    /// Send one frame to a specific authenticated peer (M4·0c).
+    async fn send_to(&mut self, rank: AuthenticatedRank, frame: Vec<u8>) -> Result<(), DriverError> {
+        let link = self.links.get_mut(&rank.rank()).ok_or(DriverError::NoLink(rank.rank()))?;
+        link.send(frame).await
+    }
+
     /// Feed an inbound frame from a **specific, authenticated** peer.
     ///
     /// The `rank` argument is an [`AuthenticatedRank`], which only `hydra-transport` can mint from
@@ -230,6 +314,33 @@ impl<L: StageLink> ActivationDriver<L> {
         match event {
             Some(e) => self.step(e).await,
             None => Ok(Executed::default()),
+        }
+    }
+}
+
+/// **M4·0c — how a rebuilt stage's context is reconstructed (spec §6.2 / §6.3).**
+///
+/// The choice is a property of the session's **durability mode**, fixed at admission, not a
+/// per-recovery decision: D1 (the default) keeps boundary logs outside the protected failure
+/// domain and therefore replays *boundaries*; D0 has only the commit stream and the prompt and
+/// therefore replays *tokens*. The state machine decides **when** each phase happens; this decides
+/// **what the rebuild frames carry**, which is an effect, not a transition.
+pub enum RecoveryStrategy {
+    /// **Strategy B (spec §6.3, D0):** replay the committed tokens as `REBUILD_APPLY`
+    /// (`APPLY_TOKEN` with `NO_SAMPLE`). Correct anywhere, and the slowest — it recomputes the
+    /// whole KV from the prompt forward.
+    TokenReplay { tokens: Vec<u32> },
+    /// **Strategy A (spec §6.2, D1 default):** replay the durable `BOUNDARY_COPY` records into the
+    /// replacement, which is what makes D1 faster than a full recompute — the boundaries were
+    /// already paid for once.
+    BoundaryReplay { boundaries: Vec<(i64, Vec<f32>)> },
+}
+
+impl RecoveryStrategy {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RecoveryStrategy::TokenReplay { .. } => "B/token-replay",
+            RecoveryStrategy::BoundaryReplay { .. } => "A/boundary-replay",
         }
     }
 }

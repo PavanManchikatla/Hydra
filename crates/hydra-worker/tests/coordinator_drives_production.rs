@@ -334,3 +334,160 @@ async fn a_killed_stage_is_recovered_by_the_real_coordinator_with_the_three_asse
         "the recovered session's committed output is byte-identical to an uninterrupted seeded run"
     );
 }
+
+/// **M4·0c ACCEPTANCE — the FULL recovery, strategy path included, driven by the coordinator.**
+///
+/// # The structural claim, and how this test makes it checkable
+///
+/// M4·0b closed the control plane: the coordinator decides *that* a recovery begins and records it.
+/// What still lived in demo binaries and test files was the **strategy path** — every one of
+/// `hydra-wan`, `hydra-3node-kill`, `hydra-2node-ci` and the recovery tests hand-sent
+/// `CATCH_UP_CONTEXT` and `INSTALL_SAMPLER_CHECKPOINT` in the right order. The sequence was
+/// demonstrated many times and owned by nobody.
+///
+/// **This test cannot participate in a recovery decision, and that is structural rather than
+/// promised: it holds no connection.** Every link is moved into the `ActivationDriver` at
+/// construction, so the only things the test can do are supply a failure (`kill -9`), hand the
+/// driver a replacement link, and read state back. There is no `conn.send` available to it. If a
+/// future edit tried to hand-send a recovery frame here, it would first have to take a connection
+/// back out of the driver — which is a visible, deliberate act rather than a slip.
+#[tokio::test]
+async fn the_coordinator_drives_the_whole_recovery_including_the_strategy_path() {
+    use hydra_coordinator::commit_stream::CommitStream;
+    use hydra_coordinator::driver::RecoveryStrategy;
+    use hydra_worker::bootstrap::Bootstrap;
+
+    // **ENGINE-GATED, and it has to be: a rebuild is DATA-PLANE work.**
+    //
+    // The strategy path replays tokens (or boundaries) into a real KV cache, so a worker with no
+    // engine answers `EngineUnavailable` and the connection ends. Its CI status is therefore
+    // **unavailable, not green** — the same distinction the `vendored-gguf` fuzz target carries
+    // (audit L1: CI never builds the real engine). M4·0b's control-plane acceptance test runs
+    // everywhere and covers the decisions; this one covers the rebuild.
+    let Some(model) = hydra_worker::pair::dev_model_path() else {
+        eprintln!("SKIP: no engine/model — the strategy path is a data-plane rebuild and cannot run without one (audit L1)");
+        return;
+    };
+
+    let binary = env!("CARGO_BIN_EXE_hydra-worker");
+    let cluster = Cluster::new().expect("cluster");
+    let worker_id = cluster.issue("worker-s1").expect("issue");
+    let fence = wire::SessionFence::mint([0x11; 16], [0x22; 32], [0x33; 16]);
+
+    // The replacement starts FROZEN so it takes BEGIN_RECOVERY Case A through the real stage SM —
+    // the path a killed-and-replaced worker actually takes.
+    let mut replacement_cfg = worker_cfg(&fence);
+    replacement_cfg.recovery_start = true;
+    replacement_cfg.model_path = Some(model);
+    // The sampler lives on S_P and the checkpoint is installed INTO it (I17), so a stage with no
+    // sampler configured answers ERR_CHECKPOINT_MISMATCH — correctly. This is the final stage.
+    replacement_cfg.sampler_config = Some(hydra_worker::sampler::SamplingConfig::greedy());
+
+    let boot = Bootstrap {
+        listen_addr: "127.0.0.1:0".to_string(),
+        device_name: "worker-s1".to_string(),
+        ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
+        cert_chain_der: worker_id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+        ],
+        key_pkcs8_der: worker_id.key_pkcs8_der(),
+        cfg: replacement_cfg,
+        forwarding: None,
+    };
+
+    let mut proc = SubprocessWorker::spawn(binary, &boot).expect("spawn a real worker process");
+    let connector = cluster.coordinator_connector().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let control = dir.path().join("control.wal");
+    let commits = dir.path().join("commits.wal");
+
+    // A durable generation to recover: three committed positions.
+    let committed_tokens: Vec<u32> = vec![101, 102, 103];
+    {
+        let mut cs = CommitStream::create(&commits, fence.cluster_id, fence.session_id).expect("commits");
+        cs.append_initial_commit(&wal_fence(&fence), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        for (i, tok) in committed_tokens.iter().enumerate() {
+            let pos = i as i64;
+            cs.append_generation_commit(&wal_fence(&fence), pos, pos, &[(pos, *tok)], &snapshot(1, pos, pos)).expect("commit");
+        }
+    }
+
+    // ---- kill -9 the process that was serving ----
+    proc.kill9().expect("kill -9");
+    proc.restart().expect("the replacement comes up");
+
+    // Everything from here is the coordinator's. The test holds no connection: the link is MOVED
+    // into the driver at construction and never comes back out.
+    let conn = connector.connect(proc.addr, "worker-s1").await.expect("connect to the replacement");
+    let rank0 = AuthenticatedRank::for_test_harness_asserting_identity(0);
+    let wal = ControlWal::create(&control, fence.cluster_id, fence.session_id).expect("control wal");
+    let mut coord = Coordinator::new_initial(SessionId(fence.session_id), 1, 1);
+    // The session was serviceable before the crash; that is the state a recovery begins from.
+    coord.force_state_for_recovery_entry();
+    let mut driver = ActivationDriver::new(coord, wal, wal_fence(&fence), fence.clone(), vec![MtlsStageLink::new(rank0, conn)]);
+
+    // 1. The coordinator observes the loss and begins a recovery — durably, then on the wire.
+    driver.step(CoordEvent::StageLost { rank: rank0 }).await.unwrap();
+    let begun = driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 2 }).await.unwrap();
+    assert_eq!(begun.wal_records, vec!["BEGIN_RECOVERY"], "recorded before anyone is told");
+    driver.step(CoordEvent::ProceedSendBeginRecovery).await.unwrap();
+    let ack = driver.recv_from(rank0).await.expect("the replacement acks the freeze (Case A)");
+    assert!(
+        matches!(wire::decode(&ack, &fence).unwrap().1, wire::Msg::RecoveryAck { .. }),
+        "the REAL stage SM took BEGIN_RECOVERY Case A"
+    );
+
+    // 2. **The strategy path — the part that used to live in demo binaries.** Strategy B here
+    //    (token replay) because this fixture has no engine and therefore no boundaries; the
+    //    driver's `RecoveryStrategy` selects what the rebuild frames carry, and the SEQUENCE is
+    //    the same for both.
+    let recovered_ledger = hydra_coordinator::recovery::read(&commits).expect("read the durable ledger");
+    let strategy = RecoveryStrategy::TokenReplay { tokens: recovered_ledger.replay_tokens() };
+    assert_eq!(strategy.label(), "B/token-replay");
+    let rebuilt = driver
+        .reconstruct(
+            rank0,
+            &strategy,
+            recovered_ledger.input_frontier(),
+            hydra_worker::worker::INITIAL_CHECKPOINT_ID,
+            // The REAL checkpoint bytes the sampler produces: `install` recomputes the state
+            // checksum, so a hand-built snapshot is refused (and should be).
+            &hydra_worker::sampler::initial_checkpoint_bytes(
+                hydra_worker::worker::INITIAL_CHECKPOINT_ID,
+                &hydra_worker::sampler::SamplingConfig::greedy(),
+            ),
+        )
+        .await
+        .expect("the coordinator drives catch-up and the sampler install");
+    assert!(rebuilt.frames_sent >= 2, "at minimum CATCH_UP_CONTEXT and INSTALL_SAMPLER_CHECKPOINT went out");
+
+    // 3. Re-activation is the ordinary transaction (§6.6 is ONE mechanism for INITIAL and RECOVERY).
+    driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    let reply = driver.recv_from(rank0).await.expect("committed");
+    driver.on_frame(rank0, &reply).await.unwrap();
+    driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
+    driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
+    let reply = driver.recv_from(rank0).await.expect("finalized");
+    driver.on_frame(rank0, &reply).await.unwrap();
+    driver.step(CoordEvent::ProceedBecomeServiceable).await.unwrap();
+    assert_eq!(driver.state(), CoordState::Serviceable, "the session serves again, and the coordinator decided every step");
+
+    // ---- THE THREE-ASSERTION BAR ----
+    // 1. Disk truth: the record set §6.5 classifies from.
+    let (_w, records) = ControlWal::open(&control, &fence.cluster_id, &fence.session_id).expect("reopen");
+    assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::BeginRecovery { .. })), "the recovery is on disk");
+    assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::ActivationComplete { .. })), "so is the re-activation");
+
+    // 2. Disk truth: no output position committed twice.
+    let after = hydra_coordinator::recovery::read(&commits).expect("ledger");
+    let positions: Vec<i64> = after.generated_tokens.iter().map(|&(p, _)| p).collect();
+    assert_eq!(positions, vec![0, 1, 2], "dense, ascending, each position exactly once");
+
+    // 3. Byte-identical: the recovered session's committed output is what an uninterrupted run has.
+    assert_eq!(after.generated_token_ids(), committed_tokens, "recovery changed no committed token");
+}
