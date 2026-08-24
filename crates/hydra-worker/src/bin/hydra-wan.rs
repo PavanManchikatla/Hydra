@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fence = SessionFence::dev(0x7A);
     let cluster = Cluster::new()?;
     let local_boot = std::env::temp_dir().join("hydra-wan-sp.boot");
-    sp_bootstrap(&cluster, &fence, k, n_ctx, false).write_to(local_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k, n_ctx, false).write_to_replacing(local_boot.to_str().unwrap())?;
     let vm_addr: std::net::SocketAddr = format!("{VM_IP}:{VM_PORT}").parse()?;
     let connector = cluster.coordinator_connector()?;
 
@@ -317,7 +317,7 @@ async fn recover<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>, fence: &Ses
 async fn wan_kill_window(cluster: &Cluster, fence: &SessionFence, n_ctx: i32, prompt: &[u32], n: usize) -> Result<Duration, Box<dyn std::error::Error>> {
     let boot = full_sp_bootstrap(cluster, fence, n_ctx, false);
     let local = std::env::temp_dir().join("hydra-wan-full.boot");
-    boot.write_to(local.to_str().unwrap())?;
+    boot.write_to_replacing(local.to_str().unwrap())?;
     let connector = cluster.coordinator_connector()?;
     let vm_addr: std::net::SocketAddr = format!("{VM_IP}:{VM_PORT}").parse()?;
     let h = greedy().hash();
@@ -344,7 +344,7 @@ async fn wan_kill_window(cluster: &Cluster, fence: &SessionFence, n_ctx: i32, pr
 
     // Replacement full-range S_P (FROZEN) + drive recovery.
     let rboot = full_sp_bootstrap(cluster, fence, n_ctx, true);
-    rboot.write_to(local.to_str().unwrap())?;
+    rboot.write_to_replacing(local.to_str().unwrap())?;
     start_remote_sp(local.to_str().unwrap())?;
     let mut rc = connector.connect(vm_addr, "sp").await?;
     let replay: Vec<u32> = prompt.iter().copied().chain(pre.iter().copied()).collect();

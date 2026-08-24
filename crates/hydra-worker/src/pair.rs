@@ -754,7 +754,7 @@ impl SubprocessWorker {
             .join(format!("hydra-worker-{}-{seq}.boot", std::process::id()))
             .to_string_lossy()
             .into_owned();
-        boot.write_to(&boot_path)?;
+        boot.write_to_replacing(&boot_path)?;
         let (child, addr) = Self::launch(binary, &boot_path)?;
         Ok(SubprocessWorker { binary: binary.to_string(), boot_path, child, addr })
     }

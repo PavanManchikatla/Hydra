@@ -104,13 +104,31 @@ pub struct ClusterCa {
     ca_key: KeyPair,
 }
 
+/// Leaf certificate validity (audit M3). Long enough not to break a household cluster that is
+/// powered off for a season; short enough that a leaked key is not a permanent credential.
+/// Re-pairing is the rotation mechanism; a CRL/OCSP flow is M4·2 (§8).
+pub const LEAF_VALIDITY_DAYS: i64 = 397; // the CA/Browser Forum's leaf maximum, as a familiar bound
+/// Cluster CA validity (audit M3).
+pub const CA_VALIDITY_DAYS: i64 = 3650;
+
+fn now_utc() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
+
 impl ClusterCa {
     /// Mint a fresh cluster CA.
     pub fn new() -> Result<Self, TransportError> {
         ensure_provider();
         let ca_key = KeyPair::generate().map_err(cert_err)?;
         let mut params = CertificateParams::new(Vec::<String>::new()).map_err(cert_err)?;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // **Audit M3 — the CA is path-length constrained and does not live forever.**
+        //
+        // `BasicConstraints::Unconstrained` lets any certificate this CA signs act as a CA itself
+        // if it were ever issued with `IsCa` set — a property nothing in this project needs and
+        // nobody would notice acquiring. `Constrained(0)` says what is true: this CA signs leaves.
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.not_before = now_utc();
+        params.not_after = now_utc() + time::Duration::days(CA_VALIDITY_DAYS);
         params.distinguished_name.push(DnType::CommonName, "Hydra Cluster CA");
         params.key_usages =
             vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
@@ -129,6 +147,13 @@ impl ClusterCa {
         let key = KeyPair::generate().map_err(cert_err)?;
         let mut params = CertificateParams::new(vec![name.to_string()]).map_err(cert_err)?;
         params.distinguished_name.push(DnType::CommonName, name);
+        // **Audit M3 — leaves expire.** `rcgen`'s defaults are 1975 → 4096, so a device key leaked
+        // through H17's 0644 bootstrap file stayed valid **forever**, and with no CRL and no
+        // rotation there was no mechanism by which it could ever stop being valid. A bounded
+        // lifetime is not revocation, and is not claimed to be — it is the difference between a
+        // leak that expires and a leak that does not.
+        params.not_before = now_utc();
+        params.not_after = now_utc() + time::Duration::days(LEAF_VALIDITY_DAYS);
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages =
             vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];

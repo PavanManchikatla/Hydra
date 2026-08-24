@@ -114,7 +114,7 @@ fn write_boot(cluster: &Cluster, name: &str, dir: &std::path::Path, recovery_sta
         forwarding: None,
     };
     let path = dir.join(format!("{name}.boot")).to_string_lossy().into_owned();
-    boot.write_to(&path).unwrap();
+    boot.write_to_replacing(&path).unwrap();
     path
 }
 

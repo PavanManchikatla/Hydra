@@ -87,9 +87,28 @@ impl TcpMtlsListener {
     /// role. A peer that authenticates but does not bind is refused, because *authentic* is not
     /// *authorised*: the cluster CA's signature says the peer belongs to the cluster, never that it
     /// may speak as a coordinator.
+    /// **Audit H18 — the TLS handshake is bounded in time.**
+    ///
+    /// `accept()` performs the handshake, and callers (`serve_multi_conn` and every `pair.rs`
+    /// endpoint) `await` it **sequentially**, spawning only the *post-handshake* connection. So a
+    /// peer that opens a TCP socket and **sends nothing** parks the accept loop forever and every
+    /// other peer — including the coordinator — is never accepted. No certificate is needed: the
+    /// stall happens before any authentication, which is why C2's role binding does not help.
+    ///
+    /// A timeout here is not the whole fix — moving the handshake into the spawned task is the
+    /// structural one, and that is a change to every call site's shape. **This bounds the damage
+    /// now**: a silent peer costs one connection slot for `HANDSHAKE_TIMEOUT`, not the listener.
+    /// The residual is named in §8 rather than implied by a green test.
     pub async fn accept(&self) -> Result<AcceptedConn, TransportError> {
-        let (tcp, _addr) = self.listener.accept().await?;
-        let tls = self.acceptor.accept(tcp).await?;
+        let (tcp, addr) = self.listener.accept().await?;
+        let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(tcp)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                // Logged WITH the peer address: the previous code discarded it, so a stalling peer
+                // was not merely unbounded, it was unattributable.
+                return Err(TransportError::HandshakeTimeout { peer: addr.to_string() });
+            }
+        };
         // Bind BEFORE the connection is handed up, so no frame can be read from an unbound peer.
         let peer = {
             let (_io, session) = tls.get_ref();
@@ -103,6 +122,13 @@ impl TcpMtlsListener {
         &self.roles
     }
 }
+
+/// How long a peer may take to complete the TLS handshake (audit H18).
+///
+/// Long enough for a slow LAN link and a real key exchange; short enough that a silent socket is
+/// not a denial of service. A cluster peer that cannot handshake in ten seconds has a problem the
+/// operator needs to see as an error rather than as a hang.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Connecting side.
 pub struct TcpMtls {

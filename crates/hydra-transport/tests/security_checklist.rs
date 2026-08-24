@@ -153,11 +153,15 @@ fn only_the_container_ci_runner_opts_into_a_wildcard_bind() {
 /// are fine — they are how the rule stays legible.
 #[test]
 fn no_source_file_hardcodes_a_wildcard_listen_address() {
-    const ALLOWED: [&str; 4] = [
+    const ALLOWED: [&str; 5] = [
         "crates/hydra-worker/src/bin/hydra-2node-ci.rs", // namespaced container, published on 127.0.0.1
         "crates/hydra-transport/src/lib.rs",             // defines and documents the policy
         "crates/hydra-transport/tests/security_checklist.rs", // this file
         "crates/hydra-worker/src/bin/hydra-wan.rs",      // comments only: "bind here ONLY, never 0.0.0.0"
+        // Audit M2: the test that asserts EVERY spelling of the wildcard is refused — including
+        // `::ffff:0.0.0.0`, which this grep would not have caught and `is_unspecified` did not.
+        // It must name the addresses to refuse them; being flagged here is the guard working.
+        "crates/hydra-transport/tests/platform_hardening.rs",
     ];
     let mut offenders = Vec::new();
     for (path, src) in rust_sources() {
@@ -166,7 +170,10 @@ fn no_source_file_hardcodes_a_wildcard_listen_address() {
         }
         for (i, line) in src.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            if code.contains("0.0.0.0") || code.contains("[::]:") {
+            // Audit M2: the grep now also looks for the IPv4-mapped spelling, since that is the
+            // one `is_unspecified` missed and therefore the one a source file could carry while
+            // every existing check called it safe.
+            if code.contains("0.0.0.0") || code.contains("[::]:") || code.contains("::ffff:0:0") {
                 offenders.push(format!("{path}:{}", i + 1));
             }
         }

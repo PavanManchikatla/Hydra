@@ -18,6 +18,28 @@ fn main() {
     let libdir = vendor.join("build/bin");
 
     let headers_ok = inc_llama.join("llama.h").exists();
+    // **Audit L1 — the layer-window patch must be PRESENT, not merely presumed.**
+    //
+    // The patch exists only as an **uncommitted working-tree modification** of the submodule
+    // (7 files; it does match `spike/llama-cpp-layer-window.patch` byte-for-byte). A clean checkout
+    // therefore gets stock `13f2b28b`, whose headers have no `il_*` fields — and this build script
+    // happily proceeded on `llama.h.exists()` alone. That is a **release-integrity defect**: the
+    // engine that gets built is not the engine that was tested, and nothing said so.
+    //
+    // Checking for the patch's own marker turns a silent mismatch into a loud, named refusal. It
+    // does not make the patch durable — pinning a fork SHA is the real fix and is owed (§8) — but
+    // it means no build can quietly produce an ABI-mismatched engine while the tests stay green.
+    let patch_applied = std::fs::read_to_string(inc_llama.join("llama.h"))
+        .map(|h| h.contains("il_load_start") && h.contains("il_start"))
+        .unwrap_or(false);
+    if headers_ok && !patch_applied {
+        println!(
+            "cargo:warning=hydra-engine-sys: vendored llama.cpp at {} is present but UNPATCHED              (no il_start/il_load_start in llama.h). The M-1 layer-window patch              (spike/llama-cpp-layer-window.patch) is NOT applied, so the shim would compile against              one ABI and link against another. Building a stub instead — apply the patch, or pin a              fork SHA (audit L1).",
+            vendor.display()
+        );
+        println!("cargo:rustc-cfg=engine_unavailable");
+        return;
+    }
     let libs_ok = libdir.join("libllama.dylib").exists() || libdir.join("libllama.so").exists();
 
     // We set cfg(engine_unavailable) ourselves below; declare it so rustc doesn't warn.

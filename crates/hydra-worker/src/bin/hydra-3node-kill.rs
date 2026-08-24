@@ -224,11 +224,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kill_remote(&vm2);
     std::thread::sleep(std::time::Duration::from_millis(600));
     let sp_boot = dir.join("hydra-3nk-sp.boot");
-    sp_bootstrap(&cluster, &fence, k2, n_ctx, false).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx, false).write_to_replacing(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3nk.boot", "/home/azureuser/hydra/sp-3nk.log")?;
     println!("[vm1] S_P up on {VM1_TS_IP}:{SP_PORT}");
     let s2_boot = dir.join("hydra-3nk-s2.boot");
-    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
+    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to_replacing(s2_boot.to_str().unwrap())?;
     start_remote(&vm2, s2_boot.to_str().unwrap(), "/home/azureuser/hydra/s2-3nk.boot", "/home/azureuser/hydra/s2-3nk.log")?;
     println!("[vm2] S2 up on {VM2_TS_IP}:{S2_PORT} (forwarding→S_P, durability→Mac)");
 
@@ -290,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Replacement S_P on myVm-1 at the SAME address (so S2 re-links via connection-failure).
     std::thread::sleep(std::time::Duration::from_millis(800)); // let the listen port free
-    sp_bootstrap(&cluster, &fence, k2, n_ctx, true).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx, true).write_to_replacing(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3nk.boot", "/home/azureuser/hydra/sp-3nk.log")?;
     println!("[vm1] replacement S_P up on {VM1_TS_IP}:{SP_PORT} (recovery_start)");
     let mut rcp = connector.connect(sp_addr, "sp").await?;

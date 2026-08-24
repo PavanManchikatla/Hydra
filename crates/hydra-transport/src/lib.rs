@@ -26,6 +26,15 @@ use hydra_proto::framing::{FrameError, FrameHeader};
 /// Errors from the transport layer.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
+    /// **Audit M1.** A peer declared a payload length and then did not deliver it within
+    /// [`crate::framed::PAYLOAD_READ_TIMEOUT`]. The reservation it was holding is released.
+    #[error("payload read timed out after a declared length of {declared} bytes (audit M1)")]
+    PayloadReadTimeout { declared: u32 },
+    /// **Audit H18.** A peer opened a TCP connection and did not complete the TLS handshake within
+    /// [`crate::tcp_mtls::HANDSHAKE_TIMEOUT`]. Carries the peer address, which the previous code
+    /// discarded — an unbounded stall that is also unattributable is twice as hard to diagnose.
+    #[error("TLS handshake timed out for peer {peer} (audit H18)")]
+    HandshakeTimeout { peer: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// Framing/limit/checksum rejection (from `hydra-proto`); several map to structured `ErrCode`.
@@ -54,6 +63,24 @@ pub enum TransportError {
 /// The environment variable that makes a wildcard bind an explicit, visible decision.
 pub const ALLOW_WILDCARD_BIND_ENV: &str = "HYDRA_ALLOW_WILDCARD_BIND";
 
+/// **Audit M2 — every spelling of "every interface", not just the two obvious ones.**
+///
+/// `IpAddr::is_unspecified` is true for `0.0.0.0` and `::` and **false for `::ffff:0.0.0.0`** — the
+/// IPv4-mapped wildcard. On Linux an `AF_INET6` socket bound to that address with `IPV6_V6ONLY=0`
+/// accepts on **all IPv4 interfaces**, which is exactly the state this check exists to prevent.
+///
+/// The listen address is a runtime string from the bootstrap blob, so the repository-wide grep
+/// test cannot cover it and the unit test only knew the two spellings it was written with — a
+/// third spelling was, to both oracles, indistinguishable from a loopback bind.
+pub fn is_wildcard(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(|m| m.is_unspecified())
+        }
+    }
+}
+
 /// **Report Addendum 2 §E1, enforced rather than documented:** *"must not bind 0.0.0.0 by
 /// default."*
 ///
@@ -67,7 +94,7 @@ pub const ALLOW_WILDCARD_BIND_ENV: &str = "HYDRA_ALLOW_WILDCARD_BIND";
 /// It is deliberately an opt-**in**, not an opt-out. An opt-out is a flag someone forgets to set;
 /// an opt-in is a decision someone had to make.
 pub fn check_bind_addr(addr: std::net::SocketAddr) -> Result<(), TransportError> {
-    if !addr.ip().is_unspecified() {
+    if !is_wildcard(addr.ip()) {
         return Ok(());
     }
     match std::env::var(ALLOW_WILDCARD_BIND_ENV).as_deref() {

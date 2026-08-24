@@ -99,10 +99,45 @@ impl Bootstrap {
         CertificateDer::from(self.ca_cert_der.clone())
     }
 
+    /// **Audit H17 — a bootstrap blob is a PRIVATE KEY FILE, and was being written like a log.**
+    ///
+    /// This encodes `key_pkcs8_der` — the device's private key — plus the cluster CA certificate.
+    /// It was written with `File::create`, which **follows symlinks** and applies the default
+    /// umask, to **predictable names in a shared `/tmp`** (`hydra-wan-sp.boot`). Any local user
+    /// could read it; and via C2's role binding, a stolen worker key is a worker. Cleanup was
+    /// `Drop`-only, so a `kill -9` of the runner left the key on disk.
+    ///
+    /// Now: `create_new` (**refuses to clobber**, and with `O_EXCL` refuses to follow a planted
+    /// symlink), mode **0600**, inside a directory created **0700**. `create_new` also means a
+    /// stale file from a previous run is an error rather than a silent overwrite — if a key is
+    /// already there, someone should look at it before it is replaced.
     pub fn write_to(&self, path: &str) -> io::Result<()> {
-        let mut f = std::fs::File::create(path)?;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
         f.write_all(&self.encode())?;
+        f.sync_all()?;
         Ok(())
+    }
+
+    /// [`Self::write_to`] for a path that may already hold a blob from a previous run: the old file
+    /// is **removed first** so the 0600 `create_new` still applies, rather than reusing whatever
+    /// permissions the existing file happens to carry (audit H17).
+    pub fn write_to_replacing(&self, path: &str) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.write_to(path)
     }
 
     pub fn read_from(path: &str) -> io::Result<Bootstrap> {

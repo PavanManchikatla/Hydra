@@ -263,11 +263,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kill_remote(&vm2);
     std::thread::sleep(std::time::Duration::from_millis(600));
     let sp_boot = std::env::temp_dir().join("hydra-3node-sp.boot");
-    sp_bootstrap(&cluster, &fence, k2, n_ctx).write_to(sp_boot.to_str().unwrap())?;
+    sp_bootstrap(&cluster, &fence, k2, n_ctx).write_to_replacing(sp_boot.to_str().unwrap())?;
     start_remote(&vm1, sp_boot.to_str().unwrap(), "/home/azureuser/hydra/sp-3n.boot", "/home/azureuser/hydra/sp-3n.log")?;
     println!("[vm1] S_P up on {VM1_TS_IP}:{SP_PORT} (engine=true)");
     let s2_boot = std::env::temp_dir().join("hydra-3node-s2.boot");
-    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to(s2_boot.to_str().unwrap())?;
+    s2_bootstrap(&cluster, &fence, k1, k2, n_ctx, dur2).write_to_replacing(s2_boot.to_str().unwrap())?;
     start_remote(&vm2, s2_boot.to_str().unwrap(), "/home/azureuser/hydra/s2-3n.boot", "/home/azureuser/hydra/s2-3n.log")?;
     println!("[vm2] S2 up on {VM2_TS_IP}:{S2_PORT} (engine=true, forwarding→S_P, durability→Mac)");
 

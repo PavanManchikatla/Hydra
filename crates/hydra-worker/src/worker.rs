@@ -37,6 +37,13 @@ const ERR_FENCED: u16 = 1;
 const ERR_RECOVERY_COMPLETED: u16 = 3;
 /// `ERR_CHECKPOINT_MISMATCH` — sampler drift (spec §2.6b: fatal, never silently repaired).
 const ERR_CHECKPOINT_MISMATCH: u16 = 9;
+/// How many recent output positions the `SAMPLED` cache retains (audit H20).
+///
+/// Sized for the retransmit window the protocol actually produces (R1 retries the frame still in
+/// flight; group commit is k=8), with a wide margin. Beyond it a duplicate `SAMPLE_NEXT` is a
+/// position the coordinator has long since committed and will never re-request.
+const SAMPLED_RING_WINDOW: i64 = 256;
+
 /// `ERR_GAP` — the data-plane position is neither the next one nor the retransmittable last one
 /// (spec §5 R2; audit M9). Its detail field is the stage's `applied_input_pos`.
 const ERR_GAP: u16 = 4;
@@ -667,6 +674,18 @@ impl Worker {
             return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         };
         let out = sampler.sample(output_pos, logits);
+        // **Audit H20 — the ring is bounded and keyed monotonically.**
+        //
+        // It was an unbounded `HashMap` keyed by an **attacker-chosen `output_pos`**, cleared only
+        // on an accepted `BEGIN_RECOVERY`, retaining ~1 MiB per entry (a cap-compliant snapshot).
+        // A peer that walked `output_pos` upward held the worker's memory in proportion. The ring
+        // exists for **I14 idempotence** — a duplicate `SAMPLE_NEXT` must be answered from cache
+        // rather than re-sampled — and idempotence only needs the recent window, because the
+        // coordinator's resume rule never asks for a position below its own committed watermark.
+        let evict_below = output_pos.saturating_sub(SAMPLED_RING_WINDOW);
+        if evict_below > 0 {
+            self.sampled_ring.retain(|&pos, _| pos > evict_below);
+        }
         self.sampled_ring.insert(
             output_pos,
             SampledEntry { token_id: out.token_id, snapshot: out.snapshot.clone(), state_digest: out.state_digest },

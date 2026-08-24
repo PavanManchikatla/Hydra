@@ -234,7 +234,22 @@ impl Sampler {
         self.rng_counter = rec.rng_counter();
         self.generated_through = rec.generated_through_output_pos();
         self.sampled_pos = rec.sampled_output_pos();
-        self.penalty_window = penalty_from_bytes(rec.serialized_penalty_state().bytes());
+        // **Audit H20 — the installed penalty window is capped at what the config can justify.**
+        //
+        // A snapshot may legally be up to `MAX_SNAPSHOT_BYTES` (1 MiB), which is **262 144
+        // u32 entries**. Nothing bounded the window against `penalty_last_n`, and the cost is not
+        // one-off: `serialize()` re-emits the whole window into **every subsequent snapshot**, and
+        // `apply_repeat_penalty` walks it on **every sample**. So one oversized install made every
+        // later token slower and every later snapshot bigger, permanently.
+        //
+        // `penalty_last_n` is the config's own statement of how much history the sampler uses;
+        // anything beyond it cannot affect a single sampled token, so keeping it is pure cost.
+        let mut window = penalty_from_bytes(rec.serialized_penalty_state().bytes());
+        if window.len() > self.config.penalty_last_n {
+            let overflow = window.len() - self.config.penalty_last_n;
+            window.drain(0..overflow);
+        }
+        self.penalty_window = window;
         Ok(())
     }
 }

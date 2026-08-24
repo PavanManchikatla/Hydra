@@ -23,6 +23,11 @@ rustls-pki-types = "1"
 # the tree transitively via rustls; named here because the binding depends on it directly.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Audit M3: certificates need explicit not_before/not_after — rcgen's defaults are 1975..4096.
+time = "0.3"
 
 [dev-dependencies]
+# Audit M3: the regression reads the validity window and basic constraints back out of the DER —
+# asserting the constant is set is not the same as asserting the certificate carries it.
+x509-parser = "0.16"
 tokio = { version = "1", features = ["full"] }
