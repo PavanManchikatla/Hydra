@@ -10,6 +10,15 @@
 ## 0. RESUMPTION BRIEFING (read first — a fresh session resumes from the repo alone)
 
 ### (a) Standing rules currently in force
+
+> **Rules 1–24 are in force as of 2026-08-24.** Numbering is historical, not priority-ordered, and
+> 8b is a corollary to 8 rather than a rule of its own. The most load-bearing for a fresh session
+> are **12** (verification infrastructure gets no presumption of correctness), **16** (a CI outcome
+> is evidence only as a quoted `verdict=` line), **19** (an oracle must be able to produce the
+> failure it guards — with §7.41's five shapes and two hunting heuristics), **20** (reconcile
+> against the auditor's own text before declaring a finding closed), **23** (executed documentation
+> is a test; read documentation is a claim) and **24** (re-measure every number, including the
+> owner's).
 1. **Attribution:** the owner `Pavan Manchikatla <91258136+PavanManchikatla@users.noreply.github.com>` is the **primary author + committer on every commit** (repo-local `git config user.name/user.email`); every commit message ends with `Co-Authored-By: Claude <noreply@anthropic.com>`. Do **not** use `-c` overrides.
 2. **Push cadence:** small logical commits, conventional messages, **push after every commit**; local never leads remote by more than a day.
 3. **§11 same-commit:** any commit that changes project reality (milestone progress, gate verdicts, findings, TLC/sim results, amendments, owed items) updates this file **in the same commit** and appends one line to §12.
@@ -45,26 +54,95 @@
 
 24. **⚑ THE HONESTY RULES BIND NUMBERS THE DESIGN AUTHORITY SUPPLIES, EXACTLY AS THEY BIND THE AGENT'S OWN (design authority, ratified 2026-08-24).** *A handed-down figure is an input to verify, not an authority.* The M4·3 brief gave "~18k lines of hand-written Rust on ~676k lines of vendored C/C++"; measuring **this tree** gave ~21.7k `src/` Rust and ~729k vendored. The owner was quoting the **auditor's** measurement as though it were current; the agent measured and used the measured figures, naming the counting basis. **That is the required behaviour, not an exception to deference:** rule 16's *"job status is never evidence — at any layer, including the design authority's own summaries"* applies to quantities as well as verdicts. **Binding: a number arriving from any source is re-measured before it is published, and the basis is stated with it.**
 
-### (b) In-flight state (2026-07-13, pre-C checkpoint)
+### (b) In-flight state (refreshed 2026-08-24 at session close)
 
-> **⏳ IN FLIGHT AT SESSION CLOSE (2026-08-23). Read this before treating any local artifact as a result.**
+> **⏳ IN FLIGHT. Read this before treating any local artifact as a result.**
 >
-> **1. ✅✅ RESOLVED 2026-08-23 — H1/M13 IS VERIFIED. Receipt COMPLETE: `verification/ci-results/run-32654396107.md`.** All four §0(b) conditions met: `baseline-safety` **and** `baseline-live` at **`complete=1 verdict=GREEN`** (the liveness leg a genuine **clean drain** — 3 981 633 distinct, **0 states left on queue**, 35 m 56 s — which is what makes `ResetPreservesAttemptSpace`, listed in the cfg's `PROPERTIES`, meaningfully evaluated); **Mut1 fires**; **Mut3 fires** (the escalation condition did NOT trigger — narrowing the fence did not silence the mutation that exists to catch its absence). **H1/M13 is no longer "ratified and smoke-verified only".** *(The partial read that stood here is retained below for provenance.)* ➡️ READ 2026-08-23 (fresh session) — PARTIAL. Receipt: `verification/ci-results/run-32654396107.md`.** Quoted: `baseline-safety … complete=1 verdict=GREEN` (fixpoint on the amended model), `mut1 … violated=1 … GREEN`, **`mut3 … violated=1 … GREEN` — Mut3 STILL FIRES, the escalation condition is NOT triggered**, `mut3-fast` and `baseline-safety-fast` GREEN. **`baseline-live` was still `in_progress` — no verdict line exists, so `ResetPreservesAttemptSpace` is NOT yet evaluated and H1/M13 stays RATIFIED + SMOKE-VERIFIED ONLY.** The push run 32654389806 ran `smoke` only (its `long` matrix is skipped on push) and supplies no baseline — the "both runs" framing below was wrong about what the push run could contribute. **Next session: finish the receipt from the `baseline-live` line.** *(Original in-flight text follows.)* TLC legs for the H1/M13 amendment — DISPATCHED 2026-08-23: run [32654396107](https://github.com/PavanManchikatla/Hydra/actions/runs/32654396107) (`workflow_dispatch`) and [32654389806](https://github.com/PavanManchikatla/Hydra/actions/runs/32654389806) (push on `7cf1445`).** The `.tla` changed (H1's bounded window + the new `ResetPreservesAttemptSpace` property), so **rule 13 voids all prior checkpoints** (moot in practice — the schedule runs fresh weekly — but stated because the rule does not bend for convenience). **The receipt must contain, quoted per rule 16:** `baseline-safety` and `baseline-liveness` **`complete=1 verdict=GREEN`** (a **clean drain** — this is the only way `ResetPreservesAttemptSpace` is meaningfully evaluated, because **a leg that stops early on an invariant violation may never reach the temporal-property check**, so a mutation leg's silence about it means nothing either way); **`Mut1` and `Mut3` still `violated=1`** — **Mut3 going quiet is an ESCALATION, not an explanation**: narrowing a fence must never silence the mutation that exists to catch its absence, and if it does the amendment weakened the fence rather than tightening it. **Until those lines are quoted into `verification/ci-results/`, H1/M13 is RATIFIED AND LOCALLY SMOKE-VERIFIED ONLY — it is not verified.**
-> **2. Weekly fuzz leg** — `fuzz.yml`, Tuesdays 04:15 UTC, now **six targets** (a missing target is INCONCLUSIVE, not a pass). Obligation per leg: quote its per-leg `verdict=` lines into a new `verification/ci-results/fuzz-<run-id>.md` and **append its cumulative row** to leg 1's table. **Running total 2.400 / 24 CPU-hours.** Until quoted, a leg is not observed and contributes nothing.
-> **3. #25577** — rule-8 check at every session start. Read 2026-08-23: **OPEN, zero maintainer replies**; the only comment is the owner-approved bump.
+> **No local background job is running at close.** Local == remote. The tracked tree is clean
+> **except `vendor/llama.cpp`, which is expected to show as dirty and must not be "cleaned"**:
+> `git status` reports `modified content` because the layer-window patch is applied **in place** in
+> the vendored working tree — exactly the seven files listed in (1) of §0(c). Reverting them
+> silently disables the feature the patch provides.
 >
-> **No local background job is running at close.**
+> **1. Weekly fuzz legs** — `fuzz.yml`, Tuesdays 04:15 UTC, **eight targets** (`gguf`,
+> `frame-header`, `wire-body`, `manifest`, `bootstrap`, `wal-record`, `boundary-record`, and
+> `vendored-gguf`). **Only seven are required by the classify step**: `vendored-gguf` needs the real
+> engine and **CI never builds it** (audit L1), so its CI status is **unavailable, never green**.
+> **Running total 2.400 / 24 CPU-hours.** Obligation per leg: quote its `verdict=` lines into a new
+> `verification/ci-results/fuzz-<run-id>.md` and append the cumulative row. Until quoted, a leg is
+> not observed and contributes nothing.
 >
-> **Local-artifact caution for a fresh session:** `/private/tmp/.../scratchpad/*.log` from this session (`ws3`–`ws5`, `d1*.log`, `calib.log`) are **historical**. The quotable results are in `verification/ci-results/` and §12. The last full verification on this tree was **`cargo test --workspace -- --test-threads=1` → 287 passed / 0 failed / 7 ignored, clippy clean** (§3).
-
-- **⚠️ TLC C2 chain — RUN 29222085672 did NOT conclude (rule-12 log-read, 2026-07-13; corrected — the prior "all five legs green/fired" line was a MISRECORDING, read from the run-status ✓ / matrix labels, not the Classify `verdict=` lines).** Receipt: `verification/ci-results/run-29222085672.md` (verbatim verdicts). Actual per-leg Classify verdicts: `smoke` ✓; **`baseline-safety` = `verdict=INCONCLUSIVE`** (`violated=0 complete=0`; time-boxed at 320m — 327.9M distinct, 380,964 states still on queue — **NOT fixpoint**); **`baseline-live` = `verdict=INCONCLUSIVE`** (`violated=0 complete=0`; time-boxed — 25.0M distinct, 758,325 on queue — **NOT a clean drain**); **`Mut1` = `verdict=GREEN` (FIRED)** — temporal property violated, 23-state stuttering lasso, on the new model (v0.10.4); **`Mut3` = `verdict=INCONCLUSIVE`** (`violated=0 complete=0`; time-boxed — 379.7M distinct, 390,911 on queue — **did NOT fire; no counterexample landed; contingency ladder untouched**). The GitHub job ✓ marks are because time-boxed → `rc=0` by design (so `-recover` continues); the matrix labels `...clean` / `...violation` are *expected* outcomes, not results. **Only Mut1 is green.** The 558af49 hardening worked — the `verdict=` receipt was in the Classify output all along; §0b simply hadn't read it (see §7.14). **M1 full-flip BLOCKED** — the mechanical gate (§0e) needs baseline-safety→fixpoint + baseline-live→clean + Mut3→fire, none reached. **⚠️ And the mechanical continuation is itself broken (§7.15, found same session by inspecting the link before trusting it):** `tlc.yml`'s "Restore prior checkpoint" step uses `download-artifact@v4` with **no `run-id`/`github-token`** → it is scoped to the *current* run, so a fresh `recover=true` dispatch **cannot fetch run 29222085672's checkpoints** and would silently start every leg FRESH (another 320m time-box, ~22 CPU-h wasted, `-recover` still never exercised). **So `recover=true` must NOT be dispatched until the workflow is fixed** (add `run-id` + `github-token` to the restore step, and a `run_id` dispatch input identifying the source run). **UPDATE (owner-ratified, §12): §7.15 FIXED + dispatched.** `tlc.yml` restore step now fetches cross-run artifacts; **recover run 29286795638 = FAILED to resume (§7.16): every big leg errored at 00s** on a double-nested `-recover states/ci-results` path (rule-16 verdict-read: all `INCONCLUSIVE`; job `success` ≠ GREEN, caught a third time). Fetch worked, resume path broken → fixed (Restore `path: verification`; `-fast` legs fresh-only) and **re-dispatched (run TBD in §12)**. **`-recover` round-trip STILL unobserved; M1 full-flip STILL blocked — flipped nothing.** **C part 2 is GO in parallel (owner-ratified) — in progress: seam 2a (coordinator recovery reader + CI-safe assertions a & c) landed; seam 2b (engine-gated end-to-end) next.**
-- **#25577:** OPEN, 0 replies; body rewritten to engineer's voice (applied). If still reply-less ~2 weeks after 2026-07-13, draft a one-line courteous bump for owner approval before posting.
-- **§8 owed items live at close:** `mutation_preactive_maroon` (6th mutation, deferred until supersession rounds feed the stage track; directed regression is interim coverage); I24 uncommitted-segment-candidate (M3); duplicated-SAMPLE_NEXT retention half (M2); wired-LAN performance envelope (M3 gate); int8 stays FORBIDDEN (measured).
-- **One-time thermal exemption spent:** the F-LIVENESS-FAIR local-BaselineLiveness permission was repair-scoped and is now closed — local TLC is smoke-only again (parse, Mut2, Mut4).
-- **Mut3 drain-clean contingency ladder** (fires **only** if the CI Mut3 leg **completes its bounded space without firing** — a SIGTERM/timeout triggers **nothing**): (a) rerun with `StateConstraint` `|msgs| ≤ 30`; (b) if still clean, `MaxAttempt = 3`; (c) if still clean, **escalate with state-space stats** — the model needs a documented strengthening, a package change requiring ratification. Never edit model logic to force it.
-- **Pending `-recover` round-trip verification:** the checkpoint-artifact **upload** is verified (33–34 MB artifacts materialize), but **resume-from-checkpoint (`-recover`) is UNTESTED** until one artifact round-trips at a 6 h job boundary — treat the first successful resume as a **required verification, not an assumption**.
+> **2. #25577** — rule-8 check at every session start.
+> https://github.com/ggml-org/llama.cpp/issues/25577 — **read 2026-08-24: OPEN, zero maintainer
+> replies**; the only comment is the owner-approved bump. Nothing to draft.
+>
+> **3. ⏳ THE OWNER'S FRESH-ACCOUNT RUN — the one measurement this project cannot take itself.**
+> Protocol: `docs/FRESH-ACCOUNT-TEST.md`. Until the owner runs it and the result is recorded in §6
+> as a dated line (elapsed time + confusion count), **the README does not claim the 30-minute
+> figure and must not be edited to** — it currently claims only that every command has been
+> executed as written. Each recorded confusion becomes an owed item in §8.
+>
+> **4. TLC** — no rerun is owed. The last dispatched run (`32654396107`) is fully read and receipted;
+> every subsequent state-machine change has been **the code catching up with the model** (H2/H3,
+> M6, M4·0b's recovery actions), so **model semantics have not moved** and rule 11 asks for nothing
+> further. `.tla` is untouched since `7cf1445`.
+>
+> **Local-artifact caution:** `/private/tmp/.../scratchpad/*.log` from this session are
+> **historical**. The quotable results are in `verification/ci-results/` and §12.
 
 ### (c) Current status + next work
+
+> **⚡⚡⚡ CURRENT STATE — 2026-08-24 (THIS BLOCK IS AUTHORITATIVE; every narrative below it is historical record and superseded here).**
+>
+> **All milestone gates M−1 → M3 are PASSED. M4 is CODE-COMPLETE across its five slices and has not
+> been gated.** M4·0 (coordinator driver) + M4·0b (recovery/lifecycle) + M4·0c (strategy path) ·
+> M4·2 (pairing) · M4·3 (packaging, docs, README) · M4·4 (dashboard). **The external security
+> audit's remediation waves 1–5 are complete** (4C/21H/20M/12L accepted as a body; the auditor's own
+> report is banked at `verification/audit-2026-08-23-AUDITOR-REPORT.md` and is the primary source —
+> the directive is a secondary reading of it, per rule 20).
+>
+> **Verification at close: `cargo test --workspace -- --test-threads=1` → 390 passed / 0 failed /
+> 7 ignored across 94 suites; `cargo clippy --workspace --all-targets` → 0 warnings.** Rule-14
+> bit-exact anchors green within that run.
+>
+> **⚑ WHAT CHANGED MOST THIS SESSION, stated for a fresh reader:** the coordinator state machine
+> **is now deployed**. Before M4·0 it was constructed in exactly one place in the workspace — the
+> simulator — and every shipping activation was a hand-rolled `COMMIT`→`FINALIZE` pair with
+> `attempt` hard-coded to 1. `hydra_state::Coordinator` now drives activation, recovery, the
+> strategy path and session termination through `ActivationDriver`, over real mTLS, with a real
+> `hydra-coordinator` binary serving the API over TLS. **"Crash-safe sessions" is a property of the
+> product rather than of the test harnesses**, and the acceptance run that proves it kills a real
+> OS process and holds no connection with which to intervene.
+>
+> **➡️ NEXT WORK, IN ORDER (design authority, 2026-08-24):**
+>
+> **(1) THE SUBMODULE BUMP, sequenced with L1's fork pin so the layer-window patch is re-ported
+> ONCE.** `vendor/llama.cpp` is pinned at `13f2b28b`, which **predates upstream's fix for the
+> empty-key GGUF abort** (`GGML_ASSERT(!key.empty())`, `ggml/src/gguf.cpp:143`; reported upstream
+> ≥4 times and fixed on master — §7.48, which is why **nothing was filed**). **Two binding
+> conditions, both required:**
+> * **(i)** the **full 15-combination spike sweep** re-run with **quoted** results
+>   (BLUEPRINT §1.2 — `spike/shard_split`, all split × prompt combinations; quoted per rule 16, not
+>   summarised);
+> * **(ii)** a **diff review of what upstream changed in the seven patched files** —
+>   `include/llama.h`, `src/llama-context.cpp`, `src/llama-cparams.h`, `src/llama-graph.cpp`,
+>   `src/llama-model.cpp`, `src/models/{llama,qwen2}.cpp` — **before assuming the patch still
+>   applies cleanly. A patch that applies without conflict is not thereby still correct.**
+>
+> **(2) THE §8 PRE-RELEASE TRIAGE at the M4 gate.** Every residual **either closed or explicitly
+> accepted-for-v1 with its reason recorded for the release notes**. Known live at close: M3's
+> revocation half (re-pairing issues but does not revoke; the 397-day leaf lifetime is a ceiling,
+> not a remedy) · H18's structural half (handshake still inline in `accept()`; the 10 s timeout
+> bounds the damage) · M1's connection semaphore (same refactor as H18's) · L1's fork pin (goes with
+> (1)) · the fuzz accumulation (2.4 / 24 CPU-hours) · the rule-19 oracle gaps (no `on_frame` fuzz
+> target, no timeout oracle, no allocation oracle) · the normalise-before-validate sweep.
+> **⛔ `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` REMAINS V1-BLOCKING** — it is a named constant in
+> `hydra-state::stage` with its own §8 row, and it **must be `false` before v1 ships**.
+>
+> **(3) THE M4 GATE TABLE, assembled in the M1/M2/M3 format** (`verification/M4-GATE.md`), then
+> **PAUSE for the owner's verdict**. **The fresh-account result is a NAMED DoD ROW that stays OPEN
+> until the owner's run supplies it** — it is not waivable by the agent and not inferable from the
+> quickstart having been executed by its author.
 
 > **⚡⚡ CURRENT STATE — 2026-08-23 (this block is authoritative; every narrative below it is historical record and superseded here).**
 >
@@ -159,6 +237,18 @@
 The gate-evidence-table *format* (a)–(f) is preserved in `verification/M1-GATE.md`; reuse its shape for the M2 gate.
 
 ### (d) Local-environment facts a fresh session must know
+
+> **Refreshed 2026-08-24.** Workspace is **14 crates** — `hydra-proto`, `hydra-wal`,
+> `hydra-transport`, `hydra-state`, **`hydra-wire`**, `hydra-sim`, `hydra-engine-sys`,
+> `hydra-worker`, `hydra-tokenizer`, `hydra-coordinator`, `hydra-modelsvc`, `hydra-sched`,
+> `hydra-fuzz`, **`hydra-cli`**. **`hydra-wire` was extracted in M4·0** (the codec lived in
+> `hydra-worker`, which depends on `hydra-coordinator`, so the coordinator could not encode a frame
+> without a dependency cycle — see rule 21). **Binaries that matter now:** `hydra-coordinator` (the
+> real one, serves the API over TLS), `hydra-worker`, `hydra-cli` (`pair` / `status`).
+> **Build/test:** `cargo test --workspace -- --test-threads=1`. **Do NOT run overlapping `cargo`
+> invocations** — they contend for the target lock and the stall looks exactly like a deadlock in
+> the code; that misread cost real time twice this session.
+
 - **Repo:** `/Users/pavanmanchikatla/Documents/hydra` (remote `github.com/PavanManchikatla/Hydra`, branch `main`).
 - **Submodule:** `git submodule update --init` — `vendor/llama.cpp` pinned @ `13f2b28b` (a gitlink, not vendored source).
 - **flatc:** `/opt/homebrew/bin/flatc` (25.12.19) — only for `hydra-proto` regen (`scripts/gen-proto.sh`); generated code is committed.
@@ -442,6 +532,7 @@ hydra/
 
 | Item | Owner | Due |
 |---|---|---|
+| **`fuzz.yml` push-trigger path drift (found 2026-08-24 while verifying §0(b)'s claims for the handoff).** The `on.push.paths` filter still lists **`crates/hydra-worker/src/wire.rs`**, which **no longer exists** — M4·0 extracted the codec into `crates/hydra-wire/`, so a change to the wire codec **no longer triggers the fuzz workflow on push**. **Coverage is not lost** — the weekly `cron: '15 4 * * 2'` leg runs `--target all` regardless, and `wire-body` is one of the seven required targets — so this is a **latency** defect, not a hole: a codec regression waits for the next Tuesday instead of failing on the pushing commit. **Not fixed here**: found during a handoff whose directive was documentation-only. Fix = replace that path with `crates/hydra-wire/**`. **Rule 17's shape:** a file-path allowlist is a second place where a fact about the tree lives, and moving the file updated only the first | agent | next slice (one line) |
 | ~~int8+blockscale boundary characterization (item f, half-done)~~ **DONE 2026-07-12** (§7.11): `int8_blockq` QK=32 measured — peak ~1.8 logit max-abs at mid splits (~40× FP16), top-10 drops to **8/10** (below M2's ≥9/10), outlier-dominated (max\|x\|=1624.6 @ dim62, block scale 12.79) and backend-invariant. **Ruling: int8 stays FORBIDDEN for v1** (constraint upheld); outlier-aware requant + re-sweep required before any future int8 use | agent | ✅ (M2 prep) |
 | Upstream layer-window issue **FILED**: [#25577](https://github.com/ggml-org/llama.cpp/issues/25577). **Still 0 replies (read 2026-08-22; ~5–6 weeks open).** The long-deferred bump is **✅ POSTED 2026-08-22** (owner-approved via the design authority; rule 8 satisfied) — [`#issuecomment-5382467234`](https://github.com/ggml-org/llama.cpp/issues/25577#issuecomment-5382467234), posted **verbatim as drafted, no edits**: *"Gentle bump — since filing, we've built a working proof of the layer-window API (a ~47-line per-arch patch on `llama`/`qwen2`) and used it to pipeline-shard a model across 3 heterogeneous machines with crash-safe recovery. Happy to open the two prototyping bugs (non-causal embeddings default; dangling `inp_out_ids`) as separate issues if that's easier to triage. Is an enabling primitive like this something the project would consider?"* **Reply-monitoring continues at each session start (rule 8); any maintainer response is DRAFTED for owner approval before posting** — the draft-then-owner-approves loop stays in force for every future reply | agent (monitor) | ✅ bump posted; monitoring standing |
 | TLC: baseline-safety fixpoint; baseline-liveness; Mut1; **Mut3 fire-or-contingency** — **STILL OPEN (read 2026-08-22): all INCONCLUSIVE.** Weekly-scheduled fresh time-boxes never drain (§6). **⛔ BLOCKED ON F-UNBOUNDED-SEGMENT (§7.21, found 2026-08-22): the tier-2 search RAN and the criterion is NOT met — `baseline-safety`/`baseline-live`/`mut3` do not time out, they CRASH TLC on its 65535 behaviour-length ceiling (`installedCkpt`/`segCommitted` grow without bound), at every bound tried (|msgs| 8/10/12). Mut1/Mut2/Mut4 fire GREEN at every bound (8–16). Nothing is certified; M1 does not flip. PAUSED for ratification on how to bound the candidate loop — the model was NOT touched.** Path forward = tier-2 reduced-bound cert-config — ✅ AUTHORIZED 2026-08-22 under the four-mutations-fire **AND** both-baselines-conclusive acceptance criterion (§6); the bound-search is **dispatched**, iterating `|msgs|` upward until Mut3 fires. M1 stays PASSED-code-side; **nothing flips until the complete six-leg receipt set lands** (rule 16) | **CI-owned** (`.github/workflows/tlc.yml`) | M1 DoD (d) — tier-2 cert search in flight |
@@ -555,6 +646,7 @@ Apple Silicon M2, 8 GB RAM (→ small models locally; 70B targets need M2-milest
 5. If reality and this file disagree, fixing this file is the *first* task.
 
 ## 12. Changelog of this document
+- **2026-08-24** — **📋 SESSION HANDOFF: §0 refreshed to this moment.** (a) rules current through **24**, with the six most load-bearing named for a fresh reader; (b) in-flight — weekly fuzz legs (**eight targets, seven required**, `vendored-gguf` unavailable in CI pending L1; **2.400 / 24 CPU-hours**), #25577 (**open, zero maintainer replies**, read 2026-08-24), **the owner's pending fresh-account run** (and the standing prohibition on claiming the 30-minute figure until it lands), and **no TLC rerun owed** (model semantics have not moved; `.tla` untouched since `7cf1445`); (c) current status — **M−1→M3 gated, M4 code-complete across five slices and NOT gated**, audit waves 1–5 complete, **390/0/7 across 94 suites, clippy clean** — and next work in order: **(1) the submodule bump with both binding conditions, sequenced with L1's fork pin so the patch is re-ported once; (2) the §8 pre-release triage with the zero-hash allowance still v1-blocking; (3) the M4 gate table in the M1/M2/M3 format, pausing for the owner's verdict, with the fresh-account result as a named DoD row that stays open until the owner's run supplies it**; (d) environment — the workspace is now **14 crates** including the extracted `hydra-wire` and the new `hydra-cli`, with the overlapping-`cargo` warning restated because it misled this session twice, and the `vendor/llama.cpp` "expected dirty" state written down so a fresh session does not clean away the layer-window patch. **One new §8 row**, found while verifying (b)'s own claims rather than asserting them: `fuzz.yml`'s push-path filter still names the pre-M4·0 `hydra-worker/src/wire.rs`, so codec changes no longer trigger the workflow on push — a latency defect, not a coverage hole, since the weekly cron still runs all seven required targets.
 - **2026-08-24** — **✅ M4·4 (§7.59): the read-only dashboard, plus standing rules 23 and 24.** The dashboard is **another client of the API surface** — same auth, same TLS, auth checked before any state is read; verified live at 401/200. **The provenance discipline survives to the screen:** `Unavailable` renders as **`unknown`**, `BestEffort` as *"estimated"*, only `Measured` plainly, and a stage with missing sensors is labelled **"unobserved… not the same as healthy"** with no cluster average to hide behind. **No control actions in v1 and the page says so** (asserted: no form, no button, no post). **Oracle named first:** a dashboard's natural test renders a healthy cluster and proves nothing, so the tests are a degraded cluster, a sensorless stage, an absent session, and an unauthorized request. One assertion of mine was wrong while the page was right (a substring check flagged the sentence that *denies* healthiness) — rewritten to assert on the structured readings. **Rule 23:** *documentation that is executed is a test; documentation that is only read is a claim* — from M4·3's three quickstart defects, none of which reading found. **Rule 24:** the honesty rules bind numbers the design authority supplies exactly as they bind the agent's own; a handed-down figure is an input to verify, not an authority (the owner was quoting the auditor's line counts as current; this tree was measured instead). **`docs/FRESH-ACCOUNT-TEST.md`** gives the protocol for the 30-minute DoD — the one measurement the builders cannot take. **390 passed / 0 failed / 7 ignored across 94 suites; clippy clean.**
 - **2026-08-24** — **✅ M4·3 (§7.58): packaging, docs, and a README held to gate-table discipline — and writing the quickstart found three real defects.** The README leads with the verification story (the permitted TLC claim **with its bounds inline**, the DST numbers, and the recovery claim **split by evidence reach**: control plane CI-covered, data-plane rebuild a local engine-gated run whose CI status is *unavailable, not green*). WAN numbers labelled `WAN/Tailscale`; wired-LAN and 70B named as targets, not measured; fuzz at 2.4 of 24 CPU-hours. Boundaries stated as load-bearing: the honest-worker assumption, the protocol-abstraction limit of the formal guarantees, and the code proportions **measured on this tree** (~21.7k hand-written Rust src, ~12.2k tests, ~9.9k generated, ~400 shim, vs **~729k vendored C/C++**) rather than quoted. **The three defects, all found by executing the steps:** the CA was written as **DER only** and `curl --cacert` refuses DER; `--dev` minted a CA **unrelated to the paired one**, making pairing meaningless to the coordinator (now `--pairing-dir`); and the API certificate's SAN was **`DNS:coordinator`** while clients dial `127.0.0.1`. **Rule 19 on the third:** every transport test dials by *device name*, because that is how peers connect — so a DNS-only SAN and an IP-SAN certificate were indistinguishable to the whole suite. **The quickstart is now executed-as-written (200 with verification, 401 without a token), and the 30-minute DoD is explicitly NOT claimed** because no non-author has run it. Packaging: systemd + launchd units with the token kept out of the unit file, `docs/BUILD.md`, and a real `LICENSE`. **385 passed / 0 failed / 7 ignored across 93 suites; clippy clean.**
 - **2026-08-24** — **✅✅ M4·0c (§7.57): the recovery strategy path moves into the driver — the coordinator now owns recovery end to end.** **Correction first:** §7.56's residual said the path lived in `pair.rs`; it did not — `pair.rs` never drove a recovery. It lived in the demo/CI binaries and five test files. `ActivationDriver::reconstruct` now does it in the spec's order: rebuild the KV → `CATCH_UP_CONTEXT` → `CATCH_UP_READY` → sampler install (I17) → ordinary re-activation, since §6.6 is one mechanism for INITIAL and RECOVERY. `RecoveryStrategy` carries **A** (boundary replay, D1) and **B** (token replay, D0); the strategy is a durability-mode property, so the SM decides *when* and the strategy decides only *what the rebuild frames carry*. **The structural claim is checkable because the acceptance test holds no connection** — every link is moved into the driver, so the harness can supply a failure and read state back and nothing else. Three-assertion bar green. **Engine-gated and stated as such** (a rebuild is data-plane work; CI status unavailable, not green, pending L1), with M4·0b's control-plane test still covering the decisions everywhere. **No further residual.** **384 passed / 0 failed / 7 ignored across 93 suites; clippy clean.**
