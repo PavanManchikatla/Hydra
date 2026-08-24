@@ -1,0 +1,21 @@
+[package]
+name = "hydra-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hydra operator CLI: cluster pairing (QR/PIN), per-device identity issuance, and cluster status."
+
+[[bin]]
+name = "hydra-cli"
+path = "src/bin/hydra-cli.rs"
+
+[dependencies]
+hydra-transport = { path = "../hydra-transport" }
+hydra-wire = { path = "../hydra-wire" }
+blake3.workspace = true
+thiserror.workspace = true
+ring = "0.17"
+
+[dev-dependencies]
+tempfile = "3"

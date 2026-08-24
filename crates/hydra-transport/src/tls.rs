@@ -154,6 +154,50 @@ impl ClusterCa {
         Ok(Self { ca_cert, ca_key })
     }
 
+    /// **Persist the CA to a coordinator-local directory (M4·2).**
+    ///
+    /// **This is the ONLY way the CA key reaches a byte buffer, and it writes it straight to a
+    /// 0600 file inside a 0700 directory — it never returns it.** A caller cannot obtain the key to
+    /// send, log, or copy it: there is no accessor, and this method's return type is `()`.
+    ///
+    /// "The CA private key never leaves the coordinator" is therefore a property of the **API
+    /// shape**, not a rule someone has to remember. Persisting it *on* the coordinator is required
+    /// — a CA that vanishes on restart cannot issue a replacement identity when a device is
+    /// re-paired, which is exactly the recovery path H17's leaked-key scenario needs.
+    pub fn save_private(&self, dir: &std::path::Path) -> Result<(), TransportError> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        if !dir.exists() {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        let key_path = dir.join("cluster-ca.key.der");
+        let _ = std::fs::remove_file(&key_path);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path)?;
+        f.write_all(&self.ca_key.serialize_der())?;
+        f.sync_all()?;
+        let mut c = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(dir.join("cluster-ca.der"))?;
+        c.write_all(self.ca_cert.der())?;
+        c.sync_all()?;
+        Ok(())
+    }
+
+    /// Reload a CA persisted by [`Self::save_private`]. Coordinator-local by construction: it reads
+    /// the directory the coordinator writes, and there is no network path that produces one.
+    pub fn load_private(dir: &std::path::Path) -> Result<ClusterCa, TransportError> {
+        ensure_provider();
+        let key_der = std::fs::read(dir.join("cluster-ca.key.der"))?;
+        let ca_key = KeyPair::try_from(key_der.as_slice()).map_err(cert_err)?;
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(cert_err)?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.not_before = now_utc();
+        params.not_after = now_utc() + time::Duration::days(CA_VALIDITY_DAYS);
+        params.distinguished_name.push(DnType::CommonName, "Hydra Cluster CA");
+        params.key_usages =
+            vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+        let ca_cert = params.self_signed(&ca_key).map_err(cert_err)?;
+        Ok(ClusterCa { ca_cert, ca_key })
+    }
+
     /// The CA's own certificate (the trust anchor to distribute at pairing).
     pub fn ca_cert_der(&self) -> CertificateDer<'static> {
         self.ca_cert.der().clone()
