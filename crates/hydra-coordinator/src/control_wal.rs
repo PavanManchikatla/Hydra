@@ -120,6 +120,39 @@ fn encode_control_record(fence: &WalFenceCtx, record: &WalRecord) -> (u16, Vec<u
             fbb.finish(rec, None);
             (rec_type::ACTIVATION_UNSERVABLE, fbb.finished_data().to_vec())
         }
+        // M4·0b — the records §6.5's classifier reads to tell a recovery from an activation.
+        // The recovery id travels in the record's FENCE (spec §1.1), not beside it — which is why
+        // the field is not read here and is recovered from `fence().recovery_id()` on decode.
+        WalRecord::BeginRecovery { base, target, recovery_id: _, truncate_to } => {
+            let f = build_fence(&mut fbb, fence);
+            let rec = wal::BeginRecoveryRec::create(
+                &mut fbb,
+                &wal::BeginRecoveryRecArgs {
+                    fence: Some(f),
+                    base_epoch: *base,
+                    target_epoch: *target,
+                    truncate_to_input_pos: *truncate_to,
+                },
+            );
+            fbb.finish(rec, None);
+            (rec_type::BEGIN_RECOVERY, fbb.finished_data().to_vec())
+        }
+        WalRecord::ResetRecoveryAttempt { target, old_recovery_id, new_recovery_id, truncate_to } => {
+            let f = build_fence(&mut fbb, fence);
+            let _ = target;
+            let rec = wal::ResetAttemptRec::create(
+                &mut fbb,
+                &wal::ResetAttemptRecArgs {
+                    fence: Some(f),
+                    old_recovery_id: *old_recovery_id,
+                    new_recovery_id: *new_recovery_id,
+                    truncate_to_input_pos: *truncate_to,
+                    committed_checkpoint_id: 0,
+                },
+            );
+            fbb.finish(rec, None);
+            (rec_type::RESET_RECOVERY_ATTEMPT, fbb.finished_data().to_vec())
+        }
         WalRecord::SessionTerminate => {
             let f = build_fence(&mut fbb, fence);
             let reason = fbb.create_string("session terminated");
@@ -162,6 +195,25 @@ fn decode_control_record(rt: u16, payload: &[u8]) -> Option<WalRecord> {
         rec_type::ACTIVATION_UNSERVABLE => {
             let r = flatbuffers::root::<wal::ActivationUnservableRec>(payload).ok()?;
             Some(WalRecord::ActivationUnservable { completion_id: r.completion_id() })
+        }
+        rec_type::BEGIN_RECOVERY => {
+            let r = flatbuffers::root::<wal::BeginRecoveryRec>(payload).ok()?;
+            Some(WalRecord::BeginRecovery {
+                base: r.base_epoch(),
+                target: r.target_epoch(),
+                // The recovery id lives in the record's fence (spec §1.1), not beside it.
+                recovery_id: r.fence().recovery_id(),
+                truncate_to: r.truncate_to_input_pos(),
+            })
+        }
+        rec_type::RESET_RECOVERY_ATTEMPT => {
+            let r = flatbuffers::root::<wal::ResetAttemptRec>(payload).ok()?;
+            Some(WalRecord::ResetRecoveryAttempt {
+                target: r.fence().session_epoch(),
+                old_recovery_id: r.old_recovery_id(),
+                new_recovery_id: r.new_recovery_id(),
+                truncate_to: r.truncate_to_input_pos(),
+            })
         }
         rec_type::SESSION_TERMINATE => Some(WalRecord::SessionTerminate),
         _ => None,

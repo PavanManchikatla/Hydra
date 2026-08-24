@@ -49,6 +49,22 @@ fn encode_wal(rec: &WalRecord) -> (u16, Vec<u8>) {
             p.extend_from_slice(&completion_id.to_le_bytes());
             (rec_type::ACTIVATION_UNSERVABLE, p)
         }
+        // M4·0b: the recovery records the coordinator now writes. The sim's virtual WAL treats
+        // payloads opaquely, so these round-trip through the same framing as the rest.
+        WalRecord::BeginRecovery { base, target, recovery_id, truncate_to } => {
+            p.extend_from_slice(&base.to_le_bytes());
+            p.extend_from_slice(&target.to_le_bytes());
+            p.extend_from_slice(&recovery_id.to_le_bytes());
+            p.extend_from_slice(&truncate_to.to_le_bytes());
+            (rec_type::BEGIN_RECOVERY, p)
+        }
+        WalRecord::ResetRecoveryAttempt { target, old_recovery_id, new_recovery_id, truncate_to } => {
+            p.extend_from_slice(&target.to_le_bytes());
+            p.extend_from_slice(&old_recovery_id.to_le_bytes());
+            p.extend_from_slice(&new_recovery_id.to_le_bytes());
+            p.extend_from_slice(&truncate_to.to_le_bytes());
+            (rec_type::RESET_RECOVERY_ATTEMPT, p)
+        }
         WalRecord::SessionTerminate => (rec_type::SESSION_TERMINATE, p),
     }
 }
@@ -87,6 +103,24 @@ fn decode_wal(record_type: u16, payload: &[u8]) -> Result<WalRecord, String> {
             need(8)?;
             Ok(WalRecord::ActivationUnservable {
                 completion_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+            })
+        }
+        rec_type::BEGIN_RECOVERY => {
+            need(20)?;
+            Ok(WalRecord::BeginRecovery {
+                base: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                target: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                recovery_id: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                truncate_to: i64::from_le_bytes(payload[12..20].try_into().unwrap()),
+            })
+        }
+        rec_type::RESET_RECOVERY_ATTEMPT => {
+            need(20)?;
+            Ok(WalRecord::ResetRecoveryAttempt {
+                target: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                old_recovery_id: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                new_recovery_id: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                truncate_to: i64::from_le_bytes(payload[12..20].try_into().unwrap()),
             })
         }
         rec_type::SESSION_TERMINATE => Ok(WalRecord::SessionTerminate),

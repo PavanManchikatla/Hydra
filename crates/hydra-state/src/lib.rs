@@ -189,12 +189,28 @@ pub enum WalRecord {
     /// `ACTIVATION_UNSERVABLE{completion_id, ...}` (spec §6.7, I22): a decided activation whose
     /// participant was lost is superseded rather than served.
     ActivationUnservable { completion_id: CompletionId },
+    /// **M4·0b — `BEGIN_RECOVERY`, durably recorded before it is sent.**
+    ///
+    /// The TLA+ model has written this record since v0.9 (`CoordBeginRecovery` and
+    /// `CoordStartSuperseding` both `Wal([t |-> "BEGIN", ...])`); the Rust coordinator did not
+    /// write it, and did not send the message either. **§6.5's restart classifier reads exactly
+    /// this record** to decide whether a coordinator was mid-recovery, so without it a restart in
+    /// a recovery could not be classified at all.
+    BeginRecovery { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
+    /// **M4·0b — `RESET_RECOVERY_ATTEMPT`** (spec §6.4; TLA+ `CoordResetAttempt`). The sender half
+    /// of audit M13: the wire arm and the stage SM both existed, and nothing decided to send one.
+    ResetRecoveryAttempt { target: Epoch, old_recovery_id: RecoveryId, new_recovery_id: RecoveryId, truncate_to: i64 },
     SessionTerminate,
 }
 
 /// Control-plane messages the coordinator sends to stages (spec §4).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ControlMsg {
+    /// `BEGIN_RECOVERY{base, target, recovery_id, truncate_to}` (spec §1.3 / §6; TLA+
+    /// `SendBeginRecovery`). M4·0b: the coordinator finally *decides* to send one.
+    BeginRecovery { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
+    /// `RESET_RECOVERY_ATTEMPT{...}` (spec §6.4; audit M13's sender half).
+    ResetRecoveryAttempt { target: Epoch, new_recovery_id: RecoveryId, truncate_to: i64 },
     CommitActivation { tuple: ActivationTuple },
     ActivationCommitAbort { epoch: Epoch, recovery_id: RecoveryId, attempt: AttemptId },
     FinalizeActivation { tuple: ActivationTuple, completion_id: CompletionId },

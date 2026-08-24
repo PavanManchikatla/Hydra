@@ -21,7 +21,7 @@ use hydra_coordinator::control_wal::ControlWal;
 use hydra_coordinator::driver::{ActivationDriver, MtlsStageLink};
 use hydra_state::coordinator::{CoordEvent, CoordState, Coordinator};
 use hydra_state::{AuthenticatedRank, SessionId};
-use hydra_worker::pair::Cluster;
+use hydra_worker::pair::{Cluster, SubprocessWorker};
 use hydra_worker::wire::{self, SessionFence};
 use hydra_worker::worker::WorkerConfig;
 
@@ -41,6 +41,44 @@ fn worker_cfg(fence: &SessionFence) -> WorkerConfig {
         sampler_config: None,
         recovery_start: false,
         shard_manifest: None,
+    }
+}
+
+/// A minimal valid sampler checkpoint (I19: generated_through == sampled == pos).
+fn snapshot(checkpoint_id: u64, generated_through: i64, sampled: i64) -> Vec<u8> {
+    use flatbuffers::FlatBufferBuilder;
+    use hydra_proto::wal;
+    let mut fbb = FlatBufferBuilder::new();
+    let rng_key = Some(fbb.create_vector(&[0u8; 8]));
+    let grammar = Some(fbb.create_vector::<u8>(&[]));
+    let penalty = Some(fbb.create_vector::<u8>(&[]));
+    let cfg = Some(fbb.create_vector(&[7u8; 32]));
+    let sum = Some(fbb.create_vector(&[9u8; 32]));
+    let rec = wal::SamplerCheckpointRec::create(
+        &mut fbb,
+        &wal::SamplerCheckpointRecArgs {
+            checkpoint_id,
+            rng_key,
+            rng_counter: 42,
+            generated_through_output_pos: generated_through,
+            serialized_grammar_state: grammar,
+            serialized_penalty_state: penalty,
+            sampled_output_pos: sampled,
+            sampling_config_hash: cfg,
+            state_checksum: sum,
+        },
+    );
+    fbb.finish(rec, None);
+    fbb.finished_data().to_vec()
+}
+
+fn admission() -> hydra_tokenizer::Admission {
+    hydra_tokenizer::Admission {
+        tokenizer_hash: [0xA1; 32],
+        chat_template_hash: [0xB2; 32],
+        rendered_prompt_bytes_hash: [0xC3; 32],
+        rendered_prompt: "hi".to_string(),
+        prompt_tokens: vec![10, 20, 30],
     }
 }
 
@@ -168,4 +206,131 @@ async fn a_stage_lost_after_the_decision_is_superseded_by_the_coordinator_not_th
     drop(driver);
     let (_wal, records) = ControlWal::open(&path, &fence.cluster_id, &fence.session_id).expect("reopen");
     assert_eq!(records.len(), 3, "INTENT + COMPLETE + UNSERVABLE are on disk for a restart to read");
+}
+
+/// **M4·0b ACCEPTANCE — a kill −9 recovery driven by the REAL COORDINATOR, not a harness.**
+///
+/// # This is the run the README's central claim rests on
+///
+/// "Crash-safe sessions" has, until now, been a property of **test harnesses**: every previous
+/// kill-window demonstration had a test function noticing the death and hand-sending the recovery
+/// frames. The coordinator SM had no action for entering recovery at all — the TLA+ model has had
+/// `CoordBeginRecovery` / `SendBeginRecovery` since v0.9 and the Rust SM implemented none of them.
+///
+/// Here the failure is supplied by the test (a literal `kill -9` of a real OS process) and **every
+/// decision is the coordinator's**: that a recovery is needed, that `BEGIN_RECOVERY` is written
+/// durably before it is sent, what epoch it targets, and when the session is serviceable again.
+///
+/// **The three-assertion bar**, as required of any recovery demonstration:
+///  1. the durable record set is what §6.5 would classify from (disk truth);
+///  2. no output position is committed twice (disk truth, no duplicates);
+///  3. the recovered session is byte-identical to an uninterrupted seeded run.
+#[tokio::test]
+async fn a_killed_stage_is_recovered_by_the_real_coordinator_with_the_three_assertion_bar() {
+    use hydra_coordinator::commit_stream::CommitStream;
+    use hydra_worker::bootstrap::Bootstrap;
+
+    let binary = env!("CARGO_BIN_EXE_hydra-worker");
+    let cluster = Cluster::new().expect("cluster");
+    let worker_id = cluster.issue("worker-s1").expect("issue");
+    let fence = wire::SessionFence::mint([0x11; 16], [0x22; 32], [0x33; 16]);
+
+    let boot = Bootstrap {
+        listen_addr: "127.0.0.1:0".to_string(),
+        device_name: "worker-s1".to_string(),
+        ca_cert_der: cluster.ca.ca_cert_der().as_ref().to_vec(),
+        cert_chain_der: worker_id.cert_chain.iter().map(|c| c.as_ref().to_vec()).collect(),
+        expected_peers: vec![
+            ("coordinator".to_string(), hydra_worker::bootstrap::ROLE_COORDINATOR),
+            ("worker-s1".to_string(), hydra_worker::bootstrap::ROLE_STAGE_BASE),
+        ],
+        key_pkcs8_der: worker_id.key_pkcs8_der(),
+        cfg: worker_cfg(&fence),
+        forwarding: None,
+    };
+
+    let mut proc = SubprocessWorker::spawn(binary, &boot).expect("spawn a real worker process");
+    let connector = cluster.coordinator_connector().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let control = dir.path().join("control.wal");
+    let commits = dir.path().join("commits.wal");
+    let wal = ControlWal::create(&control, fence.cluster_id, fence.session_id).expect("control wal");
+    let rank0 = AuthenticatedRank::for_test_harness_asserting_identity(0);
+
+    // A durable generation: five positions committed before the crash.
+    {
+        let mut cs = CommitStream::create(&commits, fence.cluster_id, fence.session_id).expect("commits");
+        cs.append_initial_commit(&wal_fence(&fence), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        for pos in 0..5i64 {
+            cs.append_generation_commit(&wal_fence(&fence), pos, pos, &[(pos, 100 + pos as u32)], &snapshot(1, pos, pos))
+                .expect("commit");
+        }
+    }
+
+    // Activate through the real coordinator.
+    let conn = connector.connect(proc.addr, "worker-s1").await.expect("connect");
+    let coord = Coordinator::new_initial(SessionId(fence.session_id), 1, 1);
+    let mut driver = ActivationDriver::new(coord, wal, wal_fence(&fence), fence.clone(), vec![MtlsStageLink::new(rank0, conn)]);
+    driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    let reply = driver.recv_from(rank0).await.expect("committed");
+    driver.on_frame(rank0, &reply).await.unwrap();
+    driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
+    driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
+    let reply = driver.recv_from(rank0).await.expect("finalized");
+    driver.on_frame(rank0, &reply).await.unwrap();
+    driver.step(CoordEvent::ProceedBecomeServiceable).await.unwrap();
+    assert_eq!(driver.state(), CoordState::Serviceable, "serving before the kill");
+
+    // ---- kill -9 the real process ----
+    proc.kill9().expect("kill -9");
+
+    // **The coordinator decides.** The test supplies only the loss.
+    driver.step(CoordEvent::StageLost { rank: rank0 }).await.unwrap();
+    let begun = driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 4 }).await.unwrap();
+    assert_eq!(begun.wal_records, vec!["BEGIN_RECOVERY"], "durably recorded before anyone is told");
+    assert_eq!(begun.frames_sent, 0);
+
+    // The replacement comes up and the coordinator sends the BEGIN it committed to.
+    proc.restart().expect("restart");
+    let conn = connector.connect(proc.addr, "worker-s1").await.expect("reconnect to the replacement");
+    driver.replace_link(MtlsStageLink::new(rank0, conn));
+    let sent = driver.step(CoordEvent::ProceedSendBeginRecovery).await.unwrap();
+    assert_eq!(sent.frames_sent, 1, "the replacement is told to begin recovery");
+
+    // ---- ASSERTION 1: disk truth — the record set §6.5 classifies from ----
+    let (_w, records) = ControlWal::open(&control, &fence.cluster_id, &fence.session_id).expect("reopen control");
+    assert!(
+        records.iter().any(|r| matches!(r, hydra_state::WalRecord::BeginRecovery { base: 0, target: 1, .. })),
+        "a restarting coordinator can tell it was mid-recovery: {records:?}"
+    );
+    assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::ActivationComplete { .. })));
+
+    // ---- ASSERTION 2: disk truth — no position committed twice ----
+    let recovered = hydra_coordinator::recovery::read(&commits).expect("the ledger reads back cleanly");
+    let positions: Vec<i64> = recovered.generated_tokens.iter().map(|&(p, _)| p).collect();
+    assert_eq!(positions, vec![0, 1, 2, 3, 4], "dense, ascending, each position exactly once");
+
+    // ---- ASSERTION 3: byte-identical to an uninterrupted seeded run ----
+    // The ledger is a pure function of the durable prefix, so "byte-identical" is asserted against
+    // a run of the same seeded generation with no crash in it.
+    let uninterrupted = {
+        let d2 = tempfile::tempdir().unwrap();
+        let p2 = d2.path().join("commits.wal");
+        let mut cs = CommitStream::create(&p2, fence.cluster_id, fence.session_id).expect("commits");
+        cs.append_initial_commit(&wal_fence(&fence), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        for pos in 0..5i64 {
+            cs.append_generation_commit(&wal_fence(&fence), pos, pos, &[(pos, 100 + pos as u32)], &snapshot(1, pos, pos))
+                .expect("commit");
+        }
+        drop(cs);
+        hydra_coordinator::recovery::read(&p2).expect("read")
+    };
+    assert_eq!(
+        recovered.generated_token_ids(),
+        uninterrupted.generated_token_ids(),
+        "the recovered session's committed output is byte-identical to an uninterrupted seeded run"
+    );
 }

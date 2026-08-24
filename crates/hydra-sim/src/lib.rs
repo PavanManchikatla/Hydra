@@ -254,6 +254,10 @@ impl World {
                             self.pending_wal = Some(WalKindTag::Unservable)
                         }
                         WalRecord::SessionTerminate => self.pending_wal = Some(WalKindTag::Terminate),
+                        // M4·0b: the recovery records the coordinator now writes take the same
+                        // pending → WalDurable path as every other durable decision.
+                        WalRecord::BeginRecovery { .. } => self.pending_wal = Some(WalKindTag::BeginRecovery),
+                        WalRecord::ResetRecoveryAttempt { .. } => self.pending_wal = Some(WalKindTag::Reset),
                     }
                 }
                 Effect::Send { msg, .. } => match msg {
@@ -268,6 +272,10 @@ impl World {
                     ControlMsg::ActivationCommitAbort { .. } => {
                         self.commit_acks.clear();
                     }
+                    // M4·0b: recovery-plane sends. The sim's stage track drives the real `Stage`
+                    // SM's `RecvBegin`/`RecvReset` directly (it has since M1), so these carry no
+                    // extra bookkeeping here — they are recorded as sent and that is all.
+                    ControlMsg::BeginRecovery { .. } | ControlMsg::ResetRecoveryAttempt { .. } => {}
                 },
             }
         }

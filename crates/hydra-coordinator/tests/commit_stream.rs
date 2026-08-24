@@ -279,3 +279,47 @@ fn a_ledger_belonging_to_another_session_is_refused_on_open() {
     // And a different cluster must not, which is the case a copied data directory produces.
     assert!(CommitStream::open(&path, &[0xEEu8; 16], &[1u8; 16]).is_err(), "another cluster's ledger must be refused");
 }
+
+/// **M4·0b / audit H10 — a recovery restores every watermark from the durable ledger.**
+///
+/// H10's fix gave `CommitStream::open` the ability to restore the watermarks; what was still owed
+/// was **a coordinator that uses it on the recovery path**. This asserts the property the recovery
+/// depends on: after a crash mid-generation, the reopened stream resumes at the last position that
+/// is actually on disk, and the next commit continues from there rather than from zero.
+///
+/// The failure it rules out is the one that reads as success: a recovery that restarts at position
+/// 0 re-commits positions the client has already seen, and "never un-see" is broken silently.
+#[test]
+fn a_recovery_resumes_from_the_durable_frontier_and_never_re_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.wal");
+
+    // A session that generated five positions, then the process died.
+    {
+        let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
+        cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+        for pos in 0..5i64 {
+            cs.append_generation_commit(&wal_fence(), pos, pos, &[(pos, 100 + pos as u32)], &snapshot(1, pos, pos))
+                .expect("commit");
+        }
+    }
+
+    // The recovery reopens the SAME ledger, bound to the same session (audit M8).
+    let mut re = CommitStream::open(&path, &[7u8; 16], &[1u8; 16]).expect("reopen for recovery");
+    assert_eq!(re.generation_durable_pos(), 4, "the frontier is what is on disk, not what was in flight");
+    assert_eq!(re.committed_sampler_checkpoint_id(), 1, "and the sampler checkpoint to install comes with it");
+
+    // The next commit continues. A restart at 0 here would re-commit positions the client has
+    // already been shown — and M7's contiguity check is what makes that a refusal rather than a
+    // silent duplicate.
+    let err = re.append_generation_commit(&wal_fence(), 0, 0, &[(0, 100)], &snapshot(1, 0, 0));
+    assert!(err.is_err(), "re-committing an already-durable position is refused (M7), not silently accepted");
+
+    re.append_generation_commit(&wal_fence(), 5, 5, &[(5, 105)], &snapshot(1, 5, 5)).expect("resume at the frontier");
+    assert_eq!(re.generation_durable_pos(), 5);
+
+    // Disk truth: no position appears twice.
+    let state = hydra_coordinator::recovery::read(&path).expect("the ledger reads back cleanly");
+    let positions: Vec<i64> = state.generated_tokens.iter().map(|&(p, _)| p).collect();
+    assert_eq!(positions, vec![0, 1, 2, 3, 4, 5], "dense, ascending, and each position exactly once");
+}

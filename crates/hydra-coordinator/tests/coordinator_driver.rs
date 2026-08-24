@@ -301,3 +301,124 @@ async fn two_acks_from_the_same_authenticated_stage_are_not_a_quorum() {
     let out = h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert_eq!(out.wal_records, vec!["COMPLETE"], "control: two DISTINCT stages are a quorum");
 }
+
+// ---------------------------------------------------------------------------------------------
+// **M4·0b — the RECOVERY and SESSION-LIFECYCLE half of the driver.**
+//
+// M4·0 covered the activation transaction. This covers how a session gets *into* one after a
+// failure, and how it ends. Until now `hydra_state::Coordinator` had **no action for entering
+// recovery at all** — the TLA+ model has had `CoordBeginRecovery`, `SendBeginRecovery` and
+// `CoordResetAttempt` since v0.9, and the Rust SM implemented none of them. So the coordinator
+// could activate a session it had started and could not recover one, which is why D1 recovery
+// lived in test harnesses.
+// ---------------------------------------------------------------------------------------------
+
+/// **A lost participant while serviceable begins a recovery — durably, then on the wire.**
+///
+/// The record comes first because **§6.5's restart classifier reads exactly this record** to decide
+/// whether a coordinator was mid-recovery. Writing it after the message would mean a crash in
+/// between leaves stages frozen for a recovery the coordinator has no memory of starting.
+#[tokio::test]
+async fn a_lost_participant_while_serviceable_begins_a_durably_recorded_recovery() {
+    let mut h = harness(2);
+    drive_to_serviceable(&mut h).await;
+
+    h.driver.step(CoordEvent::StageLost { rank: rank(1) }).await.unwrap();
+    let begun = h.driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 4 }).await.unwrap();
+    assert_eq!(begun.wal_records, vec!["BEGIN_RECOVERY"], "the record is durable BEFORE anything is sent");
+    assert_eq!(begun.frames_sent, 0, "and nothing went on the wire ahead of it");
+    assert_eq!(h.driver.state(), CoordState::RecoveryStarted);
+
+    let sent = h.driver.step(CoordEvent::ProceedSendBeginRecovery).await.unwrap();
+    assert_eq!(sent.frames_sent, 2, "BEGIN_RECOVERY goes to every stage");
+    assert_eq!(h.driver.state(), CoordState::Reconstructing);
+
+    // A different process reading the log knows a recovery was begun.
+    let (_wal, records) = ControlWal::open(&h.path, &[7u8; 16], &[1u8; 16]).expect("reopen");
+    assert!(
+        records.iter().any(|r| matches!(r, hydra_state::WalRecord::BeginRecovery { target: 1, .. })),
+        "the BEGIN record is on disk for §6.5 to classify from: {records:?}"
+    );
+}
+
+/// **§6.5's recovery crash window: BEGIN written, not durable.**
+///
+/// The window M4·0 could not produce for recovery because recovery did not exist. A crash here
+/// must leave no recovery: the stages were never told, and a coordinator that believed it had
+/// started one would freeze a cluster on the strength of a write that may never have landed.
+#[tokio::test]
+async fn a_crash_between_writing_begin_recovery_and_its_durability_starts_no_recovery() {
+    let mut h = harness(2);
+    drive_to_serviceable(&mut h).await;
+    h.driver.step(CoordEvent::StageLost { rank: rank(1) }).await.unwrap();
+
+    let out = h.driver
+        .step_without_acknowledging_durability(CoordEvent::ProceedBeginRecovery { truncate_to: 4 })
+        .await
+        .unwrap();
+    assert_eq!(out.wal_records, vec!["BEGIN_RECOVERY"]);
+    assert_eq!(out.frames_sent, 0, "no stage was told");
+    assert_ne!(h.driver.state(), CoordState::Reconstructing, "and the SM did not enter the recovery");
+}
+
+/// **M13's SENDER HALF — the coordinator can now decide to reset a reconstruction attempt.**
+///
+/// The wire decode arm landed in Wave 4 and the stage SM has implemented `RecvReset` since M1.
+/// What did not exist was anything that *decided* to send one, so spec §6.4's
+/// reconstruction-invalidating restart was unreachable from the coordinator.
+#[tokio::test]
+async fn the_coordinator_can_reset_a_reconstruction_attempt() {
+    let mut h = harness(2);
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+
+    let out = h.driver.step(CoordEvent::ProceedResetAttempt { truncate_to: 3 }).await.unwrap();
+    assert_eq!(out.wal_records, vec!["RESET"], "the reset is durable before it is sent");
+    assert_eq!(out.frames_sent, 2, "and then every stage is told");
+    assert_eq!(h.driver.state(), CoordState::Reconstructing);
+    assert_eq!(h.driver.coordinator().recovery_id(), 1, "the recovery id advanced (I23)");
+
+    // A reset after the decision is durable is FORBIDDEN — §6.7 governs from there, and this is
+    // the same boundary I25 draws for aborts.
+    let mut h2 = harness(2);
+    drive_to_serviceable(&mut h2).await;
+    let out = h2.driver.step(CoordEvent::ProceedResetAttempt { truncate_to: 1 }).await.unwrap();
+    assert!(out.wal_records.is_empty(), "a decided activation may never be reset (I25's boundary)");
+}
+
+/// **`SESSION_TERMINATE` — the path that had a record, a tag, and nothing that emitted one.**
+#[tokio::test]
+async fn a_session_can_be_terminated_and_the_fact_is_durable() {
+    let mut h = harness(2);
+    drive_to_serviceable(&mut h).await;
+
+    let out = h.driver.step(CoordEvent::ProceedTerminate).await.unwrap();
+    assert_eq!(out.wal_records, vec!["TERMINATE"]);
+    assert_eq!(h.driver.state(), CoordState::Terminal);
+
+    // Terminal means terminal: nothing further is accepted.
+    let after = h.driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 0 }).await.unwrap();
+    assert!(after.wal_records.is_empty(), "a terminated session does not begin a recovery");
+
+    let (_wal, records) = ControlWal::open(&h.path, &[7u8; 16], &[1u8; 16]).expect("reopen");
+    assert!(
+        records.iter().any(|r| matches!(r, hydra_state::WalRecord::SessionTerminate)),
+        "the termination is durable, so a restart does not resurrect the session"
+    );
+}
+
+/// Drive a harness to `Serviceable` through the real transaction.
+async fn drive_to_serviceable(h: &mut Harness) {
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    for r in [rank(0), rank(1)] {
+        h.driver.step(CoordEvent::StageCommitted { rank: r, attempt: 1 }).await.unwrap();
+    }
+    h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
+    for r in [rank(0), rank(1)] {
+        h.driver.step(CoordEvent::StageFinalized { rank: r, attempt: 1 }).await.unwrap();
+    }
+    h.driver.step(CoordEvent::ProceedBecomeServiceable).await.unwrap();
+    assert_eq!(h.driver.state(), CoordState::Serviceable);
+}

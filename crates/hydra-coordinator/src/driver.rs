@@ -174,7 +174,30 @@ impl<L: StageLink> ActivationDriver<L> {
                 hydra_wire::encode_finalize_activation_with_evidence(&self.fence, tuple, 0, *completion_id, &tuple.completion_hash())
             }
             ControlMsg::ActivationCommitAbort { attempt, .. } => hydra_wire::encode_activation_commit_abort(&self.fence, *attempt),
+            // M4·0b — the recovery plane. The encoders have existed since M2 (and M13's decode arm
+            // since Wave 4); what did not exist was anything that *decided* to send one.
+            ControlMsg::BeginRecovery { base, target, recovery_id, truncate_to } => {
+                hydra_wire::encode_begin_recovery(&self.fence, *base, *target, *recovery_id, *truncate_to)
+            }
+            ControlMsg::ResetRecoveryAttempt { target, new_recovery_id, truncate_to } => hydra_wire::encode_reset_recovery_attempt(
+                &self.fence,
+                *target,
+                new_recovery_id.saturating_sub(1),
+                *new_recovery_id,
+                *truncate_to,
+                0,
+            ),
         }
+    }
+
+    /// Replace the link for a rank — the **re-link** a recovery needs after a stage is killed and
+    /// a replacement comes up on a fresh port.
+    ///
+    /// The rank is taken from the new link's own authenticated identity, so a replacement cannot
+    /// quietly take over a different stage's slot (audit H4 again, at the one moment when a peer
+    /// legitimately changes address).
+    pub fn replace_link(&mut self, link: L) {
+        self.links.insert(link.rank().rank(), link);
     }
 
     /// Receive one frame from the link belonging to `rank`.
@@ -260,6 +283,8 @@ fn label(r: &WalRecord) -> &'static str {
         WalRecord::ActivationComplete { .. } => "COMPLETE",
         WalRecord::ActivationAbort { .. } => "ABORT",
         WalRecord::ActivationUnservable { .. } => "UNSERVABLE",
+        WalRecord::BeginRecovery { .. } => "BEGIN_RECOVERY",
+        WalRecord::ResetRecoveryAttempt { .. } => "RESET",
         WalRecord::SessionTerminate => "TERMINATE",
     }
 }
@@ -270,6 +295,8 @@ fn tag_of(r: &WalRecord) -> Option<WalKindTag> {
         WalRecord::ActivationComplete { .. } => WalKindTag::Complete,
         WalRecord::ActivationAbort { .. } => WalKindTag::Abort,
         WalRecord::ActivationUnservable { .. } => WalKindTag::Unservable,
+        WalRecord::BeginRecovery { .. } => WalKindTag::BeginRecovery,
+        WalRecord::ResetRecoveryAttempt { .. } => WalKindTag::Reset,
         WalRecord::SessionTerminate => WalKindTag::Terminate,
     })
 }

@@ -69,7 +69,19 @@ fn post_decision_loss_supersedes_and_recovers() {
     assert!(invariants::check(&c).is_empty());
     // open the superseding recovery at epoch+1 → progress restored
     let base_epoch = c.epoch();
-    c.step(ProceedStartSuperseding);
+    // **M4·0b — superseding now WRITES ITS `BEGIN_RECOVERY` RECORD, which the model always did**
+    // (`CoordStartSuperseding` is `Wal([t |-> "BEGIN", ...])` ∧ the transition). The code used to
+    // advance the epoch, tell nobody, and record nothing — so a crash in the superseding window
+    // left §6.5 with no BEGIN to classify from. This step is that record becoming durable.
+    let effs = c.step(ProceedStartSuperseding);
+    assert!(
+        matches!(effs[..], [hydra_state::Effect::WriteWal { .. }]),
+        "supersession writes BEGIN_RECOVERY before it transitions"
+    );
+    assert_eq!(c.state(), CoordState::RecoveryStartedPending, "written, awaiting fdatasync");
+    c.step(WalDurable(hydra_state::coordinator::WalKindTag::BeginRecovery));
+    assert_eq!(c.state(), CoordState::RecoveryStarted);
+    c.step(ProceedSendBeginRecovery);
     assert_eq!(c.state(), CoordState::Reconstructing);
     assert_eq!(c.epoch(), base_epoch + 1, "superseding recovery is at epoch+1");
     assert!(!c.completed(), "predecessor's COMPLETE does not leak into the new epoch");
@@ -105,6 +117,9 @@ fn f_unservable_crash_in_superseding_window_restarts_to_superseding() {
     // and the superseding recovery still opens cleanly at epoch+1 after the restart
     let base = c.epoch();
     let effs = c.step(ProceedStartSuperseding);
+    assert!(no_finalize(&effs));
+    c.step(WalDurable(hydra_state::coordinator::WalKindTag::BeginRecovery));
+    let effs = c.step(ProceedSendBeginRecovery);
     assert_eq!(c.state(), CoordState::Reconstructing);
     assert_eq!(c.epoch(), base + 1);
     assert!(!c.completed(), "predecessor COMPLETE does not leak past supersession");

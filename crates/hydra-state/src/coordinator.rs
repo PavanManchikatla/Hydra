@@ -30,11 +30,27 @@ pub enum WalKindTag {
     Unservable,
     /// `SESSION_TERMINATE`, on the same footing (spec §1.2).
     Terminate,
+    /// `BEGIN_RECOVERY` (M4·0b). §6.5's classifier reads this record, so it must be durable
+    /// before the message goes out — the same WAL-before-wire discipline as the intent.
+    BeginRecovery,
+    /// `RESET_RECOVERY_ATTEMPT` (M4·0b; audit M13's sender half).
+    Reset,
 }
 
 /// Coordinator activation state (subset of TLA+ `cState` for the transition-core slice).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CoordState {
+    /// `BEGIN_RECOVERY` written, awaiting its fdatasync (M4·0b).
+    RecoveryStartedPending,
+    /// `RESET_RECOVERY_ATTEMPT` written, awaiting its fdatasync (M4·0b).
+    ResetPending,
+    /// `SESSION_TERMINATE` written, awaiting its fdatasync (M4·0b).
+    TerminatePending,
+    /// **M4·0b — `BEGIN_RECOVERY` is durable and not yet sent** (TLA+ `RECOVERY_STARTED`).
+    ///
+    /// The state a coordinator is in between deciding to recover and telling anyone. It is a real
+    /// crash window and §6.5 classifies it from the durable `BEGIN` record.
+    RecoveryStarted,
     /// Recovery/reconstruction in progress (stages catching up); INITIAL starts here.
     Reconstructing,
     /// All stages `FROZEN_READY`; ready to attempt activation.
@@ -103,6 +119,17 @@ pub enum CoordEvent {
     ProceedRecordUnservable,
     /// §6.7 step 3: open the superseding recovery at epoch+1.
     ProceedStartSuperseding,
+    /// **M4·0b — begin a semantic recovery** (TLA+ `CoordBeginRecovery`): a participant was lost
+    /// while the session was serviceable. Writes the durable `BEGIN_RECOVERY` record.
+    ProceedBeginRecovery { truncate_to: i64 },
+    /// **M4·0b — send the `BEGIN_RECOVERY`** the record already committed to (TLA+
+    /// `SendBeginRecovery`). Separate from the write, because that is where the crash window is.
+    ProceedSendBeginRecovery,
+    /// **M4·0b — restart the reconstruction attempt** (spec §6.4; TLA+ `CoordResetAttempt`).
+    ProceedResetAttempt { truncate_to: i64 },
+    /// **M4·0b — terminate the session** (spec §1.2/§11): the `SESSION_TERMINATE` path, which had a
+    /// durable record and a `WalKindTag` and nothing that ever emitted one.
+    ProceedTerminate,
     Crash,
     Restart,
 }
@@ -128,6 +155,10 @@ pub struct Coordinator {
 
     /// Durable coordinator WAL (the coordinator's persistent truth).
     wal: Vec<WalRecord>,
+    /// The recovery whose `BEGIN` record is in flight (M4·0b).
+    pending_recovery: Option<(Epoch, Epoch, i64)>,
+    /// The reset whose record is in flight (M4·0b).
+    pending_reset: Option<(Epoch, RecoveryId, RecoveryId, i64)>,
     /// Per-(session, epoch) monotonic counter owned by the SM, feeding effect ids (WAL-FORMAT §4).
     monotonic_seq: u64,
 }
@@ -149,6 +180,8 @@ impl Coordinator {
             finalized: BTreeSet::new(),
             lost: BTreeSet::new(),
             next_completion_id: 1,
+            pending_recovery: None,
+            pending_reset: None,
             wal: Vec::new(),
             monotonic_seq: 0,
         }
@@ -160,6 +193,11 @@ impl Coordinator {
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
+    /// The reconstruction attempt this coordinator is on (spec §6.4; M4·0b).
+    pub fn recovery_id(&self) -> crate::RecoveryId {
+        self.recovery_id
+    }
+
     pub fn attempt(&self) -> crate::AttemptId {
         self.attempt
     }
@@ -228,6 +266,20 @@ impl Coordinator {
                     && !self.lost.is_empty()
             }
             ProceedStartSuperseding => self.state == CoordState::Superseding,
+            // TLA+ `CoordBeginRecovery`: serviceable, and a participant is lost — a reason to
+            // recover. The guard is the model's, not an invention here.
+            ProceedBeginRecovery { .. } => self.state == CoordState::Serviceable && !self.lost.is_empty(),
+            ProceedSendBeginRecovery => self.state == CoordState::RecoveryStarted,
+            // TLA+ `CoordResetAttempt`: only before the decision is durable. After it, §6.7 governs
+            // and a reset is forbidden — the same boundary I25 draws for aborts.
+            ProceedResetAttempt { .. } => {
+                !self.completed()
+                    && matches!(
+                        self.state,
+                        CoordState::Reconstructing | CoordState::ReadyAll | CoordState::IntentDurable | CoordState::Committing
+                    )
+            }
+            ProceedTerminate => !matches!(self.state, CoordState::Terminal),
             // M6: while the UNSERVABLE record is in flight the coordinator is committed to the
             // decision but must not act on it, exactly like IntentPending/CompletePending.
             // external events: deliverable in any live (non-crashed/terminal) state
@@ -370,16 +422,61 @@ impl Coordinator {
             ProceedStartSuperseding => {
                 // §6.7 step 3: open a superseding recovery at epoch+1 (base = completed epoch),
                 // restoring an enabled transition (I22). Reachable survivors take Case A normally.
-                self.epoch += 1;
-                self.recovery_id = 0;
-                self.attempt = 0;
-                self.kind = ActivationKind::Recovery;
-                self.tuple = None;
-                self.committed.clear();
-                self.finalized.clear();
-                self.lost.clear();
+                //
+                // **M4·0b — this now WRITES THE `BEGIN_RECOVERY` RECORD, which the model always
+                // did** (`CoordStartSuperseding` is `Wal([t |-> "BEGIN", ...])` ∧ the transition).
+                // The code advanced the epoch and told nobody and recorded nothing, so a crash in
+                // the superseding window left §6.5 with no `BEGIN` to classify from — the code was
+                // weaker than the model it mirrors, in the one place I22 depends on.
+                let id = self.next_effect_id(EffectKind::WriteWal);
+                let (base, target) = (self.epoch, self.epoch + 1);
+                self.pending_recovery = Some((base, target, 0));
+                self.state = CoordState::RecoveryStartedPending;
+                vec![Effect::WriteWal {
+                    id,
+                    record: WalRecord::BeginRecovery { base, target, recovery_id: 0, truncate_to: 0 },
+                }]
+            }
+            ProceedBeginRecovery { truncate_to } => {
+                // TLA+ `CoordBeginRecovery`. WAL-before-wire: the record is written here and the
+                // message is sent by `ProceedSendBeginRecovery`, **after** `WalDurable` — so a
+                // crash between them leaves a durable BEGIN that §6.5 classifies, which is the
+                // entire reason the record exists.
+                let id = self.next_effect_id(EffectKind::WriteWal);
+                let (base, target) = (self.epoch, self.epoch + 1);
+                self.state = CoordState::RecoveryStartedPending;
+                self.pending_recovery = Some((base, target, truncate_to));
+                vec![Effect::WriteWal {
+                    id,
+                    record: WalRecord::BeginRecovery { base, target, recovery_id: 0, truncate_to },
+                }]
+            }
+            ProceedSendBeginRecovery => {
+                let id = self.next_effect_id(EffectKind::SendMsg);
+                let (base, target, truncate_to) = self.pending_recovery.expect("RECOVERY_STARTED implies a pending recovery");
                 self.state = CoordState::Reconstructing;
-                Vec::new()
+                vec![Effect::Send {
+                    id,
+                    msg: ControlMsg::BeginRecovery { base, target, recovery_id: self.recovery_id, truncate_to },
+                }]
+            }
+            ProceedResetAttempt { truncate_to } => {
+                // TLA+ `CoordResetAttempt`: WAL *and* wire in one action in the model, which is
+                // sound there because the model's `Wal` is atomically durable. Here the record is
+                // written and the send follows on `WalDurable`, for the same reason as the intent.
+                let id = self.next_effect_id(EffectKind::WriteWal);
+                let (old_r, new_r) = (self.recovery_id, self.recovery_id + 1);
+                self.pending_reset = Some((self.epoch, old_r, new_r, truncate_to));
+                self.state = CoordState::ResetPending;
+                vec![Effect::WriteWal {
+                    id,
+                    record: WalRecord::ResetRecoveryAttempt { target: self.epoch, old_recovery_id: old_r, new_recovery_id: new_r, truncate_to },
+                }]
+            }
+            ProceedTerminate => {
+                let id = self.next_effect_id(EffectKind::WriteWal);
+                self.state = CoordState::TerminatePending;
+                vec![Effect::WriteWal { id, record: WalRecord::SessionTerminate }]
             }
             Crash => {
                 self.state = CoordState::Crashed;
@@ -437,7 +534,41 @@ impl Coordinator {
                     self.state = CoordState::Superseding;
                 }
             }
+            WalKindTag::BeginRecovery => {
+                if self.state == CoordState::RecoveryStartedPending {
+                    let (_base, target, _t) = self.pending_recovery.expect("pending recovery");
+                    // The model's post-state, applied only once the record is durable.
+                    self.epoch = target;
+                    self.recovery_id = 0;
+                    self.attempt = 0;
+                    self.kind = ActivationKind::Recovery;
+                    self.tuple = None;
+                    self.committed.clear();
+                    self.finalized.clear();
+                    self.lost.clear();
+                    self.wal.push(WalRecord::BeginRecovery { base: target - 1, target, recovery_id: 0, truncate_to: _t });
+                    self.state = CoordState::RecoveryStarted;
+                }
+            }
+            WalKindTag::Reset => {
+                if self.state == CoordState::ResetPending {
+                    let (target, old_r, new_r, truncate_to) = self.pending_reset.expect("pending reset");
+                    self.recovery_id = new_r;
+                    self.attempt = 0;
+                    self.committed.clear();
+                    self.finalized.clear();
+                    self.wal.push(WalRecord::ResetRecoveryAttempt { target, old_recovery_id: old_r, new_recovery_id: new_r, truncate_to });
+                    self.state = CoordState::Reconstructing;
+                    // The RESET message follows the durable record (spec §6.4).
+                    let id = self.next_effect_id(EffectKind::SendMsg);
+                    return vec![Effect::Send {
+                        id,
+                        msg: ControlMsg::ResetRecoveryAttempt { target, new_recovery_id: new_r, truncate_to },
+                    }];
+                }
+            }
             WalKindTag::Terminate => {
+                self.wal.push(WalRecord::SessionTerminate);
                 // `SESSION_TERMINATE` is durable-then-terminal for the same reason (spec §1.2).
                 //
                 // **Stated honestly: nothing in this SM emits that record yet** — the tag exists
