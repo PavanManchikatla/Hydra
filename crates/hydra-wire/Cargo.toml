@@ -1,0 +1,18 @@
+[package]
+name = "hydra-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The Hydra wire codec: hydra-proto `Frame` (fence + Body union, spec §4) <-> native types, plus the F1 fence identity check. Shared by every peer that speaks the protocol."
+
+# **Why this is its own crate (M4·0).** The codec lived in `hydra-worker`, and `hydra-worker`
+# depends on `hydra-coordinator` (a one-way edge). So the coordinator could not encode or decode a
+# single frame without a dependency cycle — which is a large part of why the activation transaction
+# ended up hand-rolled in test drivers instead of driven by `hydra_state::Coordinator`. A shared
+# codec is the precondition for the coordinator being a real peer.
+[dependencies]
+hydra-proto = { path = "../hydra-proto" }
+hydra-state = { path = "../hydra-state" }
+flatbuffers.workspace = true
+thiserror.workspace = true

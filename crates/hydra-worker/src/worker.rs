@@ -384,10 +384,15 @@ impl Worker {
                 self.on_install_sampler_checkpoint(view.epoch, checkpoint_id, &snapshot)
             }
             Msg::CommitActivation(t) => Ok(self.step_control(StageEvent::RecvCommit { tuple: t })),
-            Msg::FinalizeActivation { attempt } => {
+            Msg::FinalizeActivation { attempt, completion_id, complete_record_hash } => {
                 // Audit H2: the epoch travels to the SM, which checks it (the TLA+ action always
                 // did). `view.epoch` is the frame's own claim, checked against the stage's.
-                Ok(self.step_control(StageEvent::RecvFinalize { epoch: view.epoch, attempt }))
+                Ok(self.step_control(StageEvent::RecvFinalize {
+                    epoch: view.epoch,
+                    attempt,
+                    completion_id,
+                    complete_record_hash,
+                }))
             }
             Msg::ActivationCommitAbort { aborted_attempt } => Ok(self.step_control(StageEvent::RecvAbort { attempt: aborted_attempt })),
             Msg::BeginRecovery { base, target, recovery_id, truncate_to } => {

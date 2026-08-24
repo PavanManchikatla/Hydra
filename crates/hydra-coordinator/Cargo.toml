@@ -11,6 +11,11 @@ hydra-proto = { path = "../hydra-proto" }
 hydra-wal = { path = "../hydra-wal" }
 hydra-state = { path = "../hydra-state" }
 hydra-tokenizer = { path = "../hydra-tokenizer" }
+# M4·0: the coordinator becomes a real peer — it speaks the wire codec and opens mTLS links to
+# stages. Both edges point DOWN (hydra-wire and hydra-transport know nothing of the coordinator),
+# so hydra-worker -> hydra-coordinator stays the only one-way edge between the two binaries.
+hydra-wire = { path = "../hydra-wire" }
+hydra-transport = { path = "../hydra-transport" }
 flatbuffers.workspace = true
 blake3.workspace = true
 thiserror.workspace = true

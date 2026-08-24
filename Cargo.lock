@@ -384,7 +384,9 @@ dependencies = [
  "hydra-proto",
  "hydra-state",
  "hydra-tokenizer",
+ "hydra-transport",
  "hydra-wal",
+ "hydra-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -490,6 +492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-wire"
+version = "0.10.2"
+dependencies = [
+ "flatbuffers",
+ "hydra-proto",
+ "hydra-state",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hydra-worker"
 version = "0.10.2"
 dependencies = [
@@ -504,6 +516,7 @@ dependencies = [
  "hydra-state",
  "hydra-tokenizer",
  "hydra-transport",
+ "hydra-wire",
  "libc",
  "rustls",
  "tempfile",

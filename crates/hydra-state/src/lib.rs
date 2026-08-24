@@ -116,6 +116,28 @@ pub struct ActivationTuple {
 }
 
 impl ActivationTuple {
+    /// **Audit H2 — the completion evidence, computed identically on both sides.**
+    ///
+    /// `FINALIZE_ACTIVATION` carries `complete_record_hash`, and a stage that cannot compare it to
+    /// anything is accepting a finalize on the coordinator's say-so. The value is a hash of **the
+    /// tuple itself**, so a stage checks it against the tuple it is already PREACTIVE on: no second
+    /// source of truth, and no need for the stage to hold the coordinator's WAL. It answers
+    /// exactly one question — *"is this finalize about the activation I committed to?"* — which is
+    /// the question the dropped field existed to answer.
+    ///
+    /// It lives here, in `hydra-state`, rather than in either peer, because the two sides must
+    /// compute the same function and a duplicated definition is a divergence waiting to happen.
+    pub fn completion_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"hydra.activation.completion.v1");
+        h.update(&self.epoch.to_le_bytes());
+        h.update(&self.recovery_id.to_le_bytes());
+        h.update(&self.attempt.to_le_bytes());
+        h.update(&[self.kind as u8]);
+        h.update(&self.sampler_checkpoint_id.to_le_bytes());
+        *h.finalize().as_bytes()
+    }
+
     /// The `(epoch, recovery_id, attempt)` identity used by I25.
     pub fn attempt_key(&self) -> (Epoch, RecoveryId, AttemptId) {
         (self.epoch, self.recovery_id, self.attempt)

@@ -139,7 +139,7 @@ pub enum Msg {
     // --- control plane (maps 1:1 to StageEvent) ---
     CommitActivation(ActivationTuple),
     ActivationCommitted(ActivationTuple),
-    FinalizeActivation { attempt: AttemptId },
+    FinalizeActivation { attempt: AttemptId, completion_id: u64, complete_record_hash: [u8; 32] },
     ActivationFinalized,
     ActivationCommitAbort { aborted_attempt: AttemptId },
     BeginRecovery { base: Epoch, target: Epoch, recovery_id: RecoveryId, truncate_to: i64 },
@@ -421,7 +421,17 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         }
         Body::FinalizeActivation => {
             let f = frame.body_as_finalize_activation().ok_or(WireError::Malformed("FinalizeActivation".into()))?;
-            Ok(Msg::FinalizeActivation { attempt: f.tuple().activation_attempt_id() })
+            // **Audit H2 — the completion evidence is no longer dropped at decode.**
+            //
+            // `completion_id` and `complete_record_hash` were parsed and discarded, so a stage
+            // checked only `state == Preactive && attempt == self.attempt`. They are carried now
+            // because there is finally something to compare them against: the M4·0 coordinator
+            // writes an `ACTIVATION_COMPLETE` record and finalizes with the hash it committed.
+            Ok(Msg::FinalizeActivation {
+                attempt: f.tuple().activation_attempt_id(),
+                completion_id: f.completion_id(),
+                complete_record_hash: fixed::<32>(f.complete_record_hash(), "complete_record_hash")?,
+            })
         }
         Body::ActivationFinalized => Ok(Msg::ActivationFinalized),
         Body::ActivationCommitAbort => {
@@ -708,6 +718,54 @@ pub fn encode_finalize_activation(fence: &SessionFence, t: &ActivationTuple, sta
     finish_frame(&mut fbb, fence, proto::Body::FinalizeActivation, body.as_union_value())
 }
 
+/// **Audit H2 — `FINALIZE_ACTIVATION` carrying its completion evidence.**
+///
+/// [`encode_finalize_activation`] writes `completion_id = 0` and a zero `complete_record_hash`,
+/// which was harmless only because **nothing produced real ones**: there was no coordinator writing
+/// an `ACTIVATION_COMPLETE` record for them to refer to, so the stage had nothing to compare them
+/// against and dropped them at decode. With the M4·0 driver both exist, and this is the encoder
+/// that carries them.
+pub fn encode_finalize_activation_with_evidence(
+    fence: &SessionFence,
+    t: &ActivationTuple,
+    stage_generation: u64,
+    completion_id: u64,
+    complete_record_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(
+        &mut fbb,
+        fence,
+        FenceView { epoch: t.epoch, recovery_id: t.recovery_id, activation_attempt_id: t.attempt, stage_generation },
+    );
+    let tuple = build_tuple(&mut fbb, t, stage_generation);
+    let hash = fbb.create_vector(complete_record_hash);
+    let body = proto::FinalizeActivation::create(
+        &mut fbb,
+        &proto::FinalizeActivationArgs { completion_id, tuple: Some(tuple), complete_record_hash: Some(hash) },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::FinalizeActivation, body.as_union_value())
+}
+
+/// `ACTIVATION_COMMIT_ABORT` (spec §6.6 reversal): PREACTIVE stages return to `FROZEN_READY` and
+/// activation retries at `attempt + 1`, same `recovery_id` (I21).
+pub fn encode_activation_commit_abort(fence: &SessionFence, aborted_attempt: AttemptId) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let f = build_fence(
+        &mut fbb,
+        fence,
+        FenceView { epoch: 0, recovery_id: 0, activation_attempt_id: aborted_attempt, stage_generation: 0 },
+    );
+    let body = proto::ActivationCommitAbort::create(
+        &mut fbb,
+        &proto::ActivationCommitAbortArgs {
+            aborted_attempt_id: aborted_attempt,
+            next_attempt_id: aborted_attempt.saturating_add(1),
+        },
+    );
+    finish_frame(&mut fbb, f, proto::Body::ActivationCommitAbort, body.as_union_value())
+}
+
 pub fn encode_activation_finalized(fence: &SessionFence, epoch: Epoch, attempt: AttemptId) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id: 0, activation_attempt_id: attempt, stage_generation: 0 });
@@ -832,7 +890,7 @@ pub fn encode_error(fence: &SessionFence, epoch: Epoch, attempt: AttemptId, code
 
 // ----------------------------- f32 <-> bytes (little-endian, host==host over the wire) -----------------------------
 
-pub(crate) fn f32_to_bytes_le(v: &[f32]) -> Vec<u8> {
+pub fn f32_to_bytes_le(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for &x in v {
         out.extend_from_slice(&x.to_le_bytes());
@@ -848,7 +906,7 @@ pub(crate) fn f32_to_bytes_le(v: &[f32]) -> Vec<u8> {
 /// call sites* — and that is exactly the argument the audit says not to accept on its own: a
 /// function that truncates is a function that will truncate for the next caller. It now returns
 /// `None` instead, and the boundary decode turns that into a `Shape` refusal.
-pub(crate) fn bytes_to_f32_le(b: &[u8]) -> Option<Vec<f32>> {
+pub fn bytes_to_f32_le(b: &[u8]) -> Option<Vec<f32>> {
     if b.len() % 4 != 0 {
         return None;
     }

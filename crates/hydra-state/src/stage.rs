@@ -6,7 +6,7 @@
 //! This slice covers the activation side (`FROZEN_READY → PREACTIVE → ACTIVE_FINAL`, abort back
 //! to `FROZEN_READY`, idempotent COMMIT replay). Recovery Cases A/B/B′/C and reset land next.
 
-use crate::{ActivationTuple, AttemptId, Epoch, RecoveryId, StageRank};
+use crate::{ActivationKind, ActivationTuple, AttemptId, Epoch, RecoveryId, StageRank};
 
 /// Per-stage activation state (TLA+ `stState`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,7 +37,8 @@ pub enum StageEvent {
     /// `FINALIZE_ACTIVATION` for `attempt` **in `epoch`** (audit H2 — the epoch is checked; the
     /// TLA+ action `StageRecvFinalizeAt` has always required `m.tgt = stEpoch[s]` and the code did
     /// not, so the implementation was strictly weaker than the model it mirrors).
-    RecvFinalize { epoch: Epoch, attempt: AttemptId },
+    /// **Audit H2, second half:** the completion **evidence** travels too, and is checked.
+    RecvFinalize { epoch: Epoch, attempt: AttemptId, completion_id: u64, complete_record_hash: [u8; 32] },
     /// `ACTIVATION_COMMIT_ABORT` for `attempt`.
     RecvAbort { attempt: AttemptId },
     /// Shard loss: LOST + new stage generation.
@@ -76,6 +77,12 @@ pub struct Stage {
     final_evidence: bool,
     /// Applied/KV frontier for this shard (spec §2.3; abstract position).
     applied: i64,
+    /// The kind and checkpoint of the tuple this stage is PREACTIVE on, kept so the completion
+    /// evidence can be recomputed when the finalize arrives (audit H2).
+    tuple_kind: ActivationKind,
+    tuple_checkpoint: crate::CheckpointId,
+    /// The `completion_id` adopted at finalize (spec §6.6 step 4).
+    completion_id: u64,
     /// Set if a Case-B replay ever saw `applied > truncate_to` — a fatal I11/I23 violation
     /// (the CaseBPure detector; Mut2's label-only reset trips this).
     caseb_violated: bool,
@@ -92,6 +99,9 @@ impl Stage {
             gen: 1,
             attempt: 0,
             highest_attempt: 0,
+            tuple_kind: ActivationKind::Initial,
+            tuple_checkpoint: 0,
+            completion_id: 0,
             final_evidence: false,
             applied: 0,
             caseb_violated: false,
@@ -109,6 +119,9 @@ impl Stage {
             gen: 1,
             attempt: 0,
             highest_attempt: 0,
+            tuple_kind: ActivationKind::Initial,
+            tuple_checkpoint: 0,
+            completion_id: 0,
             final_evidence: false,
             applied,
             caseb_violated: false,
@@ -139,6 +152,10 @@ impl Stage {
     }
     pub fn generation(&self) -> u64 {
         self.gen
+    }
+    /// The `completion_id` adopted at finalize (spec §6.6 step 4; audit H2).
+    pub fn completion_id(&self) -> u64 {
+        self.completion_id
     }
     pub fn holds_final_evidence(&self) -> bool {
         self.final_evidence
@@ -279,6 +296,8 @@ impl Stage {
                 match self.state {
                     FrozenReady => {
                         self.state = Preactive;
+                        self.tuple_kind = tuple.kind;
+                        self.tuple_checkpoint = tuple.sampler_checkpoint_id;
                         self.attempt = tuple.attempt;
                         self.highest_attempt = self.highest_attempt.max(tuple.attempt);
                     }
@@ -287,6 +306,8 @@ impl Stage {
                     }
                     Preactive => {
                         // a different (fence-passing, i.e. ≥) attempt supersedes the reconstruction
+                        self.tuple_kind = tuple.kind;
+                        self.tuple_checkpoint = tuple.sampler_checkpoint_id;
                         self.attempt = tuple.attempt;
                         self.highest_attempt = self.highest_attempt.max(tuple.attempt);
                     }
@@ -299,7 +320,7 @@ impl Stage {
                     attempt: tuple.attempt,
                 }]
             }
-            RecvFinalize { epoch, attempt } => {
+            RecvFinalize { epoch, attempt, completion_id, complete_record_hash } => {
                 // **Audit H2 — the epoch check the model always had.** `StageRecvFinalizeAt`
                 // requires `m.tgt = stEpoch[s]`; the code checked only `state == Preactive &&
                 // attempt == self.attempt`. Post-C2 a *forged* finalize is closed by the role
@@ -312,11 +333,37 @@ impl Stage {
                 if epoch != self.epoch {
                     return Vec::new();
                 }
+                // **Audit H2's OTHER half — the evidence is now CHECKED, not merely carried.**
+                //
+                // `completion_id` and `complete_record_hash` were dropped at decode because
+                // nothing produced real ones: there was no coordinator writing an
+                // `ACTIVATION_COMPLETE` record for them to refer to. With M4·0's driver both
+                // exist, and the hash is derived from the **tuple** — which this stage is already
+                // PREACTIVE on — so it can be recomputed here and compared. No second source of
+                // truth, and the stage does not need the coordinator's WAL.
+                //
+                // It answers one question: *"is this finalize about the activation I committed
+                // to?"* The epoch check above catches a stale finalize from another epoch; this
+                // catches one that matches on epoch and attempt but names a different tuple.
+                let expected = ActivationTuple {
+                    kind: self.tuple_kind,
+                    epoch: self.epoch,
+                    recovery_id: self.recovery_id,
+                    attempt: self.attempt,
+                    sampler_checkpoint_id: self.tuple_checkpoint,
+                }
+                .completion_hash();
+                // A zero hash is the pre-H2 encoder's output. Accepting it keeps a mixed-version
+                // cluster working through the rollout: a stated compatibility allowance, not an
+                // oversight, and the one line to delete when v1 ships.
+                let evidence_ok = complete_record_hash == expected || complete_record_hash == [0u8; 32];
                 if self.state == Preactive
                     && (cfg!(feature = "mutation_no_attempt_fence") || attempt == self.attempt)
+                    && evidence_ok
                 {
                     self.state = ActiveFinal;
                     self.final_evidence = true;
+                    self.completion_id = completion_id;
                     return vec![StageEffect::Finalized { rank: self.rank, attempt }];
                 }
                 Vec::new()

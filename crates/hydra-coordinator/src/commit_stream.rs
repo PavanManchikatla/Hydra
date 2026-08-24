@@ -72,7 +72,7 @@ pub struct WalFenceCtx {
     pub activation_attempt_id: u32,
 }
 
-fn build_fence<'a>(fbb: &mut FlatBufferBuilder<'a>, f: &WalFenceCtx) -> flatbuffers::WIPOffset<wal::WalFence<'a>> {
+pub(crate) fn build_fence<'a>(fbb: &mut FlatBufferBuilder<'a>, f: &WalFenceCtx) -> flatbuffers::WIPOffset<wal::WalFence<'a>> {
     let cluster_id = Some(fbb.create_vector(&f.cluster_id));
     let session_id = Some(fbb.create_vector(&f.session_id));
     let model_instance_id = Some(fbb.create_vector(&f.model_instance_id));

@@ -21,7 +21,10 @@ pub mod retain;
 pub mod sampler;
 pub mod shard;
 pub mod telemetry;
-pub mod wire;
+/// The wire codec, now shared (`hydra-wire`). Re-exported under its historical path so every
+/// `hydra_worker::wire::…` call site keeps working: the move was to let the **coordinator** speak
+/// the protocol without a dependency cycle, not to rename anything (M4·0).
+pub use hydra_wire as wire;
 pub mod worker;
 
 pub use bootstrap::Bootstrap;

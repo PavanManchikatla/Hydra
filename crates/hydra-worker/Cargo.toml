@@ -17,6 +17,7 @@ path = "src/bin/hydra-local-pair.rs"
 [dependencies]
 hydra-proto = { path = "../hydra-proto" }
 hydra-state = { path = "../hydra-state" }
+hydra-wire = { path = "../hydra-wire" }
 hydra-transport = { path = "../hydra-transport" }
 hydra-engine-sys = { path = "../hydra-engine-sys" }
 # Audit H6: O_NOFOLLOW on the shard open, and (dev, ino) identity across the two opens.
