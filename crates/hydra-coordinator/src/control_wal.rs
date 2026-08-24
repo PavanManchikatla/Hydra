@@ -43,9 +43,10 @@ impl ControlWal {
 
     /// Reopen after a restart, discarding any partial tail durably, and return the records that
     /// survived — the input to §6.5's classification.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<(ControlWal, Vec<WalRecord>), ControlWalError> {
+    pub fn open(path: impl AsRef<std::path::Path>, cluster_id: &[u8; 16], session_id: &[u8; 16]) -> Result<(ControlWal, Vec<WalRecord>), ControlWalError> {
         let path = path.as_ref();
-        let scan = hydra_wal::reader::WalScan::open(path)?;
+        // Audit M8: a control log for another session must not classify this one's restart.
+        let scan = hydra_wal::reader::WalScan::open_for_session(path, cluster_id, session_id)?;
         let mut records = Vec::new();
         for r in &scan.records {
             if let Some(rec) = decode_control_record(r.record_type, &r.payload) {
@@ -85,7 +86,8 @@ fn encode_control_record(fence: &WalFenceCtx, record: &WalRecord) -> (u16, Vec<u
         WalRecord::ActivationComplete { tuple, completion_id } => {
             let f = build_fence(&mut fbb, fence);
             // The tuple hash is the completion evidence a stage will be asked to match (audit H2).
-            let hash = tuple_hash(tuple);
+            // ONE definition, in `hydra-state`, computed by both peers (audit H2).
+            let hash = tuple.completion_hash();
             let th = fbb.create_vector(&hash);
             let rec = wal::ActivationCompleteRec::create(
                 &mut fbb,
@@ -164,22 +166,6 @@ fn decode_control_record(rt: u16, payload: &[u8]) -> Option<WalRecord> {
         rec_type::SESSION_TERMINATE => Some(WalRecord::SessionTerminate),
         _ => None,
     }
-}
-
-/// **Audit H2 — the completion evidence a stage is asked to match.**
-///
-/// A `FINALIZE_ACTIVATION` carries `completion_id` and `complete_record_hash`; a stage that cannot
-/// compare them to anything is accepting a finalize on the coordinator's say-so. This is the value
-/// the coordinator commits to when it writes `ACTIVATION_COMPLETE`, so the two sides are comparing
-/// the same thing rather than each computing their own.
-pub fn tuple_hash(t: &ActivationTuple) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(&t.epoch.to_le_bytes());
-    h.update(&t.recovery_id.to_le_bytes());
-    h.update(&t.attempt.to_le_bytes());
-    h.update(&[t.kind as u8]);
-    h.update(&t.sampler_checkpoint_id.to_le_bytes());
-    *h.finalize().as_bytes()
 }
 
 fn build_tuple<'a>(fbb: &mut FlatBufferBuilder<'a>, t: &ActivationTuple) -> flatbuffers::WIPOffset<hydra_proto::proto::ActivationTuple<'a>> {

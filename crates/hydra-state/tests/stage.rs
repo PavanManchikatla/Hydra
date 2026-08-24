@@ -172,3 +172,52 @@ fn mut3_stale_commit_regression_is_caught_by_checker() {
         "mutation parity: checker must catch Mut3's fence regression; got {v:?}"
     );
 }
+
+/// **Audit H2 — a finalize whose evidence names a DIFFERENT activation is refused.**
+///
+/// # Why this test exists specifically to bound the rollout allowance
+///
+/// `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` lets an all-zero hash through, so a mixed-version cluster
+/// can finish a rollout. The risk in any such allowance is that it quietly widens: someone reads
+/// "the hash is not always checked" and concludes the check is advisory. It is not. A **non-zero**
+/// hash that does not match the tuple this stage is PREACTIVE on is refused, and the stage stays
+/// PREACTIVE rather than becoming serviceable on evidence about some other activation.
+///
+/// The case is a legitimate coordinator's **stale** finalize — matching epoch, matching attempt,
+/// different tuple — which is exactly what the dropped fields left open.
+#[test]
+fn a_finalize_whose_evidence_names_a_different_activation_is_refused() {
+    use hydra_state::stage::ACCEPT_LEGACY_ZERO_COMPLETION_HASH;
+    use hydra_state::{ActivationKind, ActivationTuple};
+
+    let mut s = Stage::frozen_ready(0, 0, 0);
+    let tuple = ActivationTuple { kind: ActivationKind::Initial, epoch: 0, recovery_id: 0, attempt: 1, sampler_checkpoint_id: 7 };
+    step_ok(&mut s, RecvCommit { tuple: tuple.clone() });
+    assert_eq!(s.state(), StageState::Preactive);
+
+    // Evidence for a DIFFERENT activation: same epoch, same attempt, different checkpoint — so the
+    // attempt fence and the epoch check both pass and only the evidence can catch it.
+    let other = ActivationTuple { sampler_checkpoint_id: 9, ..tuple.clone() };
+    let wrong = other.completion_hash();
+    assert_ne!(wrong, tuple.completion_hash(), "the fixture must actually differ, or this proves nothing");
+
+    let effects = s.step(RecvFinalize { epoch: 0, attempt: 1, completion_id: 5, complete_record_hash: wrong });
+    assert!(effects.is_empty(), "a finalize carrying another activation's evidence must not finalize this one");
+    assert_eq!(s.state(), StageState::Preactive, "and the stage stays PREACTIVE — never serviceable on foreign evidence");
+    assert!(!s.holds_final_evidence());
+
+    // The matching evidence finalizes.
+    let effects = s.step(RecvFinalize { epoch: 0, attempt: 1, completion_id: 5, complete_record_hash: tuple.completion_hash() });
+    assert_eq!(effects.len(), 1, "the correct evidence finalizes");
+    assert_eq!(s.state(), StageState::ActiveFinal);
+    assert_eq!(s.completion_id(), 5, "and the completion id is adopted (spec §6.6 step 4)");
+
+    // The allowance is exactly one value, and it is dated. Asserted as a runtime comparison so the
+    // compiler does not fold it away: when the constant goes `false` this test fails and tells the
+    // next reader to delete the §8 v1-blocking row and this block together.
+    assert_eq!(
+        ACCEPT_LEGACY_ZERO_COMPLETION_HASH,
+        std::hint::black_box(true),
+        "the zero-hash rollout allowance is now off — delete the §8 v1-blocking row and this assertion"
+    );
+}

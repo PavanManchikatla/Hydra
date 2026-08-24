@@ -91,6 +91,34 @@ pub struct SessionFence {
 
 impl SessionFence {
     /// A deterministic test/dev identity derived from a single seed byte (no RNG in this crate).
+    /// **Audit M12 — a session identity minted from a CSPRNG, by the coordinator, at birth.**
+    ///
+    /// [`Self::dev`] fills every identity vector from **one byte**, and epoch and `recovery_id`
+    /// start at 0 and increment predictably — so the F1 fence tuple had *zero* secrecy and a frame
+    /// captured across a restart still matched. That was tolerable only while nothing minted real
+    /// sessions; M4·0's coordinator does, and this is what it uses.
+    ///
+    /// F1 is a **misrouting** check, not an authentication one (§7.35), so an unguessable session
+    /// id is not what keeps an attacker out — C2's role binding is. What it buys is that a frame
+    /// from a *previous* session, or from a different session on the same cluster, cannot be
+    /// replayed into this one by coincidence, which is precisely the accident class the honest-
+    /// worker assumption does not excuse.
+    pub fn mint(cluster_id: [u8; CLUSTER_ID_LEN], manifest_hash: [u8; HASH_LEN], model_instance_id: [u8; MODEL_INSTANCE_ID_LEN]) -> Self {
+        let mut session_id = [0u8; SESSION_ID_LEN];
+        // `ring`'s system CSPRNG — the same source the cluster's key material comes from, rather
+        // than a second opinion about what randomness is.
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut session_id)
+            .expect("the system CSPRNG must be available to mint a session");
+        SessionFence { cluster_id, manifest_hash, model_instance_id, session_id }
+    }
+
+    /// **A DEV fence: every field derived from one seed byte. Never mint a real session with this.**
+    ///
+    /// Kept because the whole test corpus is built on it and a deterministic fence is what makes a
+    /// byte-identical replay assertable. Audit M12's *"no `dev()` outside `cfg(test)`"* is not
+    /// achievable while `pair.rs` and the demo binaries use it as their session identity, so the
+    /// boundary is drawn where it can actually be enforced: `hydra-coordinator`'s binary mints with
+    /// [`Self::mint`], and §8 tracks retiring the remaining `dev()` call sites.
     pub fn dev(seed: u8) -> Self {
         SessionFence {
             cluster_id: [seed; CLUSTER_ID_LEN],

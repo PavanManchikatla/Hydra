@@ -169,7 +169,7 @@ fn reopening_restores_every_watermark_and_continues_the_commit_chain() {
         (cs.generation_durable_pos(), cs.committed_sampler_checkpoint_id(), cs.prefill_stable_pos(), cs.last_commit_id(), cs.durable_len())
     }; // the coordinator process dies here
 
-    let mut re = CommitStream::open(&path).expect("reopen");
+    let mut re = CommitStream::open(&path, &[7u8; 16], &[1u8; 16]).expect("reopen");
     assert_eq!(re.generation_durable_pos(), durable_pos, "generation_durable_pos must be restored — otherwise every durable position looks un-emitted and the emit-after-commit gate re-opens");
     assert_eq!(re.committed_sampler_checkpoint_id(), ckpt_id, "the committed checkpoint id must be restored — recovery installs it");
     assert_eq!(re.prefill_stable_pos(), stable_pos, "prefill_stable_pos must be restored — otherwise a chunk that moves the input frontier BACKWARDS is accepted");
@@ -214,7 +214,7 @@ fn reopening_discards_a_partial_tail_durably_and_appends_after_it() {
     }
     assert!(std::fs::metadata(&path).unwrap().len() > durable_len, "the partial tail really is on disk");
 
-    let mut re = CommitStream::open(&path).expect("reopen over a torn tail");
+    let mut re = CommitStream::open(&path, &[7u8; 16], &[1u8; 16]).expect("reopen over a torn tail");
     assert_eq!(re.generation_durable_pos(), 0, "the durable prefix is what counts");
     assert_eq!(
         std::fs::metadata(&path).unwrap().len(),
@@ -247,5 +247,35 @@ fn reopening_refuses_a_log_with_mid_stream_damage() {
     bytes[mid] ^= 0xFF;
     std::fs::write(&path, &bytes).unwrap();
 
-    assert!(CommitStream::open(&path).is_err(), "a damaged ledger must refuse to reopen, not resume from a guess");
+    assert!(CommitStream::open(&path, &[7u8; 16], &[1u8; 16]).is_err(), "a damaged ledger must refuse to reopen, not resume from a guess");
+}
+
+/// **Audit M8 — a ledger from another session is refused, not replayed.**
+///
+/// # Standing rule 19: the oracle
+///
+/// Every test opened the file it had just written, so the header's `cluster_id` and
+/// `session_scope` always matched by construction. Under that driver "compares the header" and
+/// "ignores the header" are the same function — the fields had been written since M0 and read by
+/// nothing. Pointing a coordinator at another session's file replayed it without a murmur: the
+/// records are structurally valid, the checksums pass, and the ledger that comes back is somebody
+/// else's generation.
+#[test]
+fn a_ledger_belonging_to_another_session_is_refused_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("commits.wal");
+    {
+        let mut cs = CommitStream::create(&path, [7u8; 16], [1u8; 16]).expect("create");
+        cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial");
+    }
+
+    // The right session opens it.
+    assert!(CommitStream::open(&path, &[7u8; 16], &[1u8; 16]).is_ok(), "control: the owning session opens its own ledger");
+
+    // A different session must not.
+    let foreign = CommitStream::open(&path, &[7u8; 16], &[0xEEu8; 16]);
+    assert!(foreign.is_err(), "another session's ledger must be refused, not replayed as this session's history");
+
+    // And a different cluster must not, which is the case a copied data directory produces.
+    assert!(CommitStream::open(&path, &[0xEEu8; 16], &[1u8; 16]).is_err(), "another cluster's ledger must be refused");
 }

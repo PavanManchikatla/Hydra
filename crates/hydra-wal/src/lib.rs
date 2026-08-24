@@ -49,6 +49,12 @@ pub enum WalError {
     #[error("unknown CRITICAL record type {record_type} at offset {offset}; refusing to open")]
     UnknownCriticalRecord { record_type: u16, offset: u64 },
 
+    /// **Audit M8.** The log's header names a different cluster or session than the caller
+    /// expects. The ids have been in the header since M0 and were never compared, so a config
+    /// pointing at another session's file replayed it silently.
+    #[error("this log belongs to a different session: {what} mismatch (audit M8)")]
+    ForeignLog { what: &'static str },
+
     /// **Audit H9.** An earlier append failed mid-write or mid-`fdatasync`, so an unknown prefix
     /// of a record may be on disk. Every later append is refused: writing a valid record behind a
     /// partial one manufactures the mid-stream corruption the reader (H8) refuses to open.

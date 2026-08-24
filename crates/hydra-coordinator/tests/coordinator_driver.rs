@@ -53,7 +53,7 @@ impl StageLink for RecordingLink {
     fn rank(&self) -> AuthenticatedRank {
         self.rank
     }
-    fn send(&mut self, frame: Vec<u8>) -> Result<(), DriverError> {
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), DriverError> {
         self.sent.lock().unwrap().push(frame);
         Ok(())
     }
@@ -91,31 +91,31 @@ fn rank(r: u16) -> AuthenticatedRank {
 ///
 /// The control, and it is not a formality: every assertion below about a *partial* transaction is
 /// only meaningful if the whole one works.
-#[test]
-fn the_activation_transaction_runs_through_the_real_state_machine() {
+#[tokio::test]
+async fn the_activation_transaction_runs_through_the_real_state_machine() {
     let mut h = harness(2);
 
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    let intent = h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    let intent = h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
     assert_eq!(intent.wal_records, vec!["INTENT"], "WAL-before-wire: the intent is durable first");
     assert_eq!(h.driver.state(), CoordState::IntentDurable, "and the SM advanced on the durability, not the write");
 
-    let commit = h.driver.step(CoordEvent::ProceedSendCommit).unwrap();
+    let commit = h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
     assert_eq!(commit.frames_sent, 2, "COMMIT_ACTIVATION goes to every stage");
 
     // Acks arrive keyed on the AUTHENTICATED rank — the wire carries none (audit H4).
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).await.unwrap();
 
-    let complete = h.driver.step(CoordEvent::ProceedWriteComplete).unwrap();
+    let complete = h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert_eq!(complete.wal_records, vec!["COMPLETE"], "the irrevocable decision is durable");
 
-    let finalize = h.driver.step(CoordEvent::ProceedSendFinalize).unwrap();
+    let finalize = h.driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
     assert_eq!(finalize.frames_sent, 2);
 
-    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageFinalized { rank: rank(1), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::ProceedBecomeServiceable).unwrap();
+    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageFinalized { rank: rank(1), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::ProceedBecomeServiceable).await.unwrap();
     assert_eq!(h.driver.state(), CoordState::Serviceable, "and only now may the data plane serve (I16/I20)");
 }
 
@@ -123,13 +123,13 @@ fn the_activation_transaction_runs_through_the_real_state_machine() {
 ///
 /// On a real disk the record may or may not have landed. The classification must be driven by what
 /// the log actually holds, and this is the only place in the repository that can produce the state.
-#[test]
-fn a_crash_between_writing_the_intent_and_its_durability_is_classified_from_the_log() {
+#[tokio::test]
+async fn a_crash_between_writing_the_intent_and_its_durability_is_classified_from_the_log() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
 
     // The write happens; the acknowledgement does not.
-    let out = h.driver.step_without_acknowledging_durability(CoordEvent::ProceedWriteIntent).unwrap();
+    let out = h.driver.step_without_acknowledging_durability(CoordEvent::ProceedWriteIntent).await.unwrap();
     assert_eq!(out.wal_records, vec!["INTENT"]);
     assert_eq!(
         h.driver.state(),
@@ -141,7 +141,7 @@ fn a_crash_between_writing_the_intent_and_its_durability_is_classified_from_the_
 
     // What a restarting coordinator reads.
     drop(h.driver);
-    let (_wal, records) = ControlWal::open(&h.path).expect("reopen the control log");
+    let (_wal, records) = ControlWal::open(&h.path, &[7u8; 16], &[1u8; 16]).expect("reopen the control log");
     assert_eq!(records.len(), 1, "the intent is on disk, so a restart sees an activation in flight");
 }
 
@@ -149,19 +149,19 @@ fn a_crash_between_writing_the_intent_and_its_durability_is_classified_from_the_
 ///
 /// The gap TLC-1 exploited: decided-but-not-told. The coordinator must resume the *same* attempt
 /// rather than starting a new one, or two attempts exist for one intent.
-#[test]
-fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_resumes_the_same_attempt() {
+#[tokio::test]
+async fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_resumes_the_same_attempt() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
     assert_eq!(h.driver.state(), CoordState::IntentDurable);
     let attempt_before = h.driver.coordinator().attempt();
     for buf in &h.sent {
         assert!(buf.lock().unwrap().is_empty(), "no frame left the coordinator before the record was durable");
     }
 
-    h.driver.step(CoordEvent::Crash).unwrap();
-    let after = h.driver.step(CoordEvent::Restart).unwrap();
+    h.driver.step(CoordEvent::Crash).await.unwrap();
+    let after = h.driver.step(CoordEvent::Restart).await.unwrap();
     assert_eq!(
         h.driver.state(),
         CoordState::IntentDurable,
@@ -175,23 +175,23 @@ fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_resumes_the
 ///
 /// This is the last moment an abort is legal. One step later it is forbidden forever (I25), and
 /// the two states are one `fdatasync` apart.
-#[test]
-fn a_crash_before_the_complete_record_is_durable_leaves_the_decision_abandonable() {
+#[tokio::test]
+async fn a_crash_before_the_complete_record_is_durable_leaves_the_decision_abandonable() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
-    h.driver.step(CoordEvent::ProceedSendCommit).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).await.unwrap();
 
     // Write COMPLETE, do not acknowledge it.
-    let out = h.driver.step_without_acknowledging_durability(CoordEvent::ProceedWriteComplete).unwrap();
+    let out = h.driver.step_without_acknowledging_durability(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert_eq!(out.wal_records, vec!["COMPLETE"]);
     assert_eq!(h.driver.state(), CoordState::CompletePending);
     assert_eq!(out.frames_sent, 0, "no FINALIZE may precede the durable decision");
 
-    h.driver.step(CoordEvent::Crash).unwrap();
-    h.driver.step(CoordEvent::Restart).unwrap();
+    h.driver.step(CoordEvent::Crash).await.unwrap();
+    h.driver.step(CoordEvent::Restart).await.unwrap();
     assert_ne!(
         h.driver.state(),
         CoordState::Serviceable,
@@ -203,19 +203,19 @@ fn a_crash_before_the_complete_record_is_durable_leaves_the_decision_abandonable
 ///
 /// The restart must re-enter finalization and must never abort. This is the I25 boundary, and it
 /// is the reason the COMPLETE record exists at all.
-#[test]
-fn a_crash_after_the_complete_record_is_durable_re_enters_finalization_and_never_aborts() {
+#[tokio::test]
+async fn a_crash_after_the_complete_record_is_durable_re_enters_finalization_and_never_aborts() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
-    h.driver.step(CoordEvent::ProceedSendCommit).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteComplete).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert_eq!(h.driver.state(), CoordState::ActivationComplete);
 
-    h.driver.step(CoordEvent::Crash).unwrap();
-    h.driver.step(CoordEvent::Restart).unwrap();
+    h.driver.step(CoordEvent::Crash).await.unwrap();
+    h.driver.step(CoordEvent::Restart).await.unwrap();
     assert_eq!(
         h.driver.state(),
         CoordState::ActivationComplete,
@@ -223,14 +223,14 @@ fn a_crash_after_the_complete_record_is_durable_re_enters_finalization_and_never
     );
 
     // And the record is on disk for a *different process* to classify from.
-    let (_wal, records) = ControlWal::open(&h.path).expect("reopen");
+    let (_wal, records) = ControlWal::open(&h.path, &[7u8; 16], &[1u8; 16]).expect("reopen");
     assert_eq!(records.len(), 2, "INTENT + COMPLETE survive the restart");
 
     // Finalization completes normally afterwards.
-    h.driver.step(CoordEvent::ProceedSendFinalize).unwrap();
-    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageFinalized { rank: rank(1), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::ProceedBecomeServiceable).unwrap();
+    h.driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
+    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageFinalized { rank: rank(1), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::ProceedBecomeServiceable).await.unwrap();
     assert_eq!(h.driver.state(), CoordState::Serviceable);
 }
 
@@ -239,26 +239,26 @@ fn a_crash_after_the_complete_record_is_durable_re_enters_finalization_and_never
 /// A participant is lost after the durable decision. The recourse is `ACTIVATION_UNSERVABLE` and a
 /// superseding recovery; a restart in that window must resume SUPERSEDING and must never re-enter
 /// finalization, which would serve under the incomplete configuration.
-#[test]
-fn a_crash_in_the_superseding_window_resumes_superseding_and_never_re_finalizes() {
+#[tokio::test]
+async fn a_crash_in_the_superseding_window_resumes_superseding_and_never_re_finalizes() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
-    h.driver.step(CoordEvent::ProceedSendCommit).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteComplete).unwrap();
-    h.driver.step(CoordEvent::ProceedSendFinalize).unwrap();
-    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendFinalize).await.unwrap();
+    h.driver.step(CoordEvent::StageFinalized { rank: rank(0), attempt: 1 }).await.unwrap();
     // Stage 1 is lost after the decision.
-    h.driver.step(CoordEvent::StageLost { rank: rank(1) }).unwrap();
+    h.driver.step(CoordEvent::StageLost { rank: rank(1) }).await.unwrap();
 
-    let out = h.driver.step(CoordEvent::ProceedRecordUnservable).unwrap();
+    let out = h.driver.step(CoordEvent::ProceedRecordUnservable).await.unwrap();
     assert_eq!(out.wal_records, vec!["UNSERVABLE"], "the fact is made durable (M6)");
     assert_eq!(h.driver.state(), CoordState::Superseding);
 
-    h.driver.step(CoordEvent::Crash).unwrap();
-    let after = h.driver.step(CoordEvent::Restart).unwrap();
+    h.driver.step(CoordEvent::Crash).await.unwrap();
+    let after = h.driver.step(CoordEvent::Restart).await.unwrap();
     assert_eq!(
         h.driver.state(),
         CoordState::Superseding,
@@ -267,7 +267,7 @@ fn a_crash_in_the_superseding_window_resumes_superseding_and_never_re_finalizes(
     );
     assert_eq!(after.frames_sent, 0, "and no FINALIZE is emitted on the way");
 
-    let (_wal, records) = ControlWal::open(&h.path).expect("reopen");
+    let (_wal, records) = ControlWal::open(&h.path, &[7u8; 16], &[1u8; 16]).expect("reopen");
     assert_eq!(records.len(), 3, "INTENT + COMPLETE + UNSERVABLE are all on disk");
 }
 
@@ -277,18 +277,18 @@ fn a_crash_in_the_superseding_window_resumes_superseding_and_never_re_finalizes(
 /// because no production coordinator driver existed to inherit the defect. This is that driver,
 /// and the rank it counts comes from the link — the peer's authenticated identity — so two acks
 /// from the *same* stage cannot complete a two-stage quorum.
-#[test]
-fn two_acks_from_the_same_authenticated_stage_are_not_a_quorum() {
+#[tokio::test]
+async fn two_acks_from_the_same_authenticated_stage_are_not_a_quorum() {
     let mut h = harness(2);
-    h.driver.step(CoordEvent::StagesReconstructed).unwrap();
-    h.driver.step(CoordEvent::ProceedWriteIntent).unwrap();
-    h.driver.step(CoordEvent::ProceedSendCommit).unwrap();
+    h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
+    h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
+    h.driver.step(CoordEvent::ProceedSendCommit).await.unwrap();
 
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(0), attempt: 1 }).await.unwrap();
 
     // Writing COMPLETE is not enabled: the SM has one ack, not two.
-    let out = h.driver.step(CoordEvent::ProceedWriteComplete).unwrap();
+    let out = h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert!(
         out.wal_records.is_empty(),
         "one stage acking twice is one ack. If this ever writes COMPLETE, a single compromised or \
@@ -297,7 +297,7 @@ fn two_acks_from_the_same_authenticated_stage_are_not_a_quorum() {
     assert_eq!(h.driver.state(), CoordState::Committing);
 
     // The real second stage acks, and the transaction proceeds.
-    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).unwrap();
-    let out = h.driver.step(CoordEvent::ProceedWriteComplete).unwrap();
+    h.driver.step(CoordEvent::StageCommitted { rank: rank(1), attempt: 1 }).await.unwrap();
+    let out = h.driver.step(CoordEvent::ProceedWriteComplete).await.unwrap();
     assert_eq!(out.wal_records, vec!["COMPLETE"], "control: two DISTINCT stages are a quorum");
 }

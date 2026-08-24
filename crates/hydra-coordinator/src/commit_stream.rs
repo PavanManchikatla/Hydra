@@ -182,9 +182,10 @@ impl CommitStream {
     /// then truncates to that boundary **and `fdatasync`s the truncation** before this returns, so
     /// a second crash cannot resurrect the discarded bytes. The discard is a durable act, not a
     /// bookkeeping one.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<CommitStream, CommitError> {
+    pub fn open(path: impl AsRef<std::path::Path>, cluster_id: &[u8; 16], session_id: &[u8; 16]) -> Result<CommitStream, CommitError> {
         let path = path.as_ref();
-        let scan = hydra_wal::reader::WalScan::open(path)?;
+        // Audit M8: this ledger must be THIS session's, and the header has always said whose it is.
+        let scan = hydra_wal::reader::WalScan::open_for_session(path, cluster_id, session_id)?;
 
         let mut generation_durable_pos: i64 = -1;
         let mut prefill_stable_pos: i64 = -1;

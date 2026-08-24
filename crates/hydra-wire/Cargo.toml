@@ -16,3 +16,5 @@ hydra-proto = { path = "../hydra-proto" }
 hydra-state = { path = "../hydra-state" }
 flatbuffers.workspace = true
 thiserror.workspace = true
+# Audit M12: session ids are minted from the system CSPRNG, not derived from a seed byte.
+ring = "0.17"

@@ -86,6 +86,24 @@ pub fn server_config_with_ca(
         .with_single_cert(id.cert_chain.clone(), id.key())?)
 }
 
+/// **Audit H21 — server-side TLS for the CLIENT-FACING API.**
+///
+/// The cluster's own links are mutually authenticated, and the OpenAI-compatible API is not one of
+/// them: a browser or an SDK does not hold a cluster certificate, and requiring one would make the
+/// API unusable rather than secure. So this presents the coordinator's identity and **does not ask
+/// the client for a certificate** — the client's credential is the bearer token, and the TLS is
+/// there so that token and the user's prompts are not on the wire in cleartext.
+///
+/// **Stated plainly, because it is the part an operator has to act on:** the cluster CA is
+/// self-signed at pairing, so a client must be told to trust it (`--cacert`, or the platform trust
+/// store). That is a real setup step, and it is the price of not shipping a plaintext API.
+pub fn api_server_config(id: &DeviceIdentity) -> Result<ServerConfig, TransportError> {
+    ensure_provider();
+    Ok(ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(id.cert_chain.clone(), id.key())?)
+}
+
 /// Client config trusting `ca_cert` for the server cert and presenting `id`'s chain for mTLS —
 /// built from a CA **certificate only** (no CA key).
 pub fn client_config_with_ca(

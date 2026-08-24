@@ -115,6 +115,30 @@ fn tail_is_bounded(bytes: &[u8], pos: usize) -> bool {
 }
 
 impl WalScan {
+    /// **Audit M8 — open a log and prove it belongs to this session.**
+    ///
+    /// The file header has carried `cluster_id` and `session_scope` since M0, and **nothing ever
+    /// compared them.** So pointing a coordinator's config at another session's file replayed it
+    /// without a murmur: the records are structurally valid, the checksums pass, and the ledger
+    /// that comes back is somebody else's generation. A zero `session_scope` means a multi-session
+    /// file (WAL-FORMAT §1) and matches anything, which is the documented wildcard rather than a
+    /// loophole.
+    ///
+    /// This is a *misrouting* check, not an authentication one: the BLAKE3 record tags are unkeyed,
+    /// so a determined local writer can forge a header. It is stated that way in the checklist. It
+    /// catches the accident — the wrong path in a config, a stale file left in a directory — which
+    /// is the failure that actually happens.
+    pub fn open_for_session(path: impl AsRef<Path>, cluster_id: &[u8; 16], session_id: &[u8; 16]) -> Result<WalScan, WalError> {
+        let scan = Self::open(path)?;
+        if &scan.header.cluster_id != cluster_id {
+            return Err(WalError::ForeignLog { what: "cluster_id" });
+        }
+        if scan.header.session_scope != [0u8; 16] && &scan.header.session_scope != session_id {
+            return Err(WalError::ForeignLog { what: "session_scope" });
+        }
+        Ok(scan)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<WalScan, WalError> {
         let bytes = std::fs::read(path)?;
         Self::from_bytes(&bytes)

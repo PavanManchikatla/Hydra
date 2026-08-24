@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "The coordinator: durable commit stream (hydra-wal on a real disk file), token ledger, group commit (spec §3), and (later sub-slices) the OpenAI/SSE surface + D1 recovery orchestration. Emit-after-commit governs everything."
 
+[[bin]]
+name = "hydra-coordinator"
+path = "src/bin/hydra-coordinator.rs"
+
 [dependencies]
 hydra-proto = { path = "../hydra-proto" }
 hydra-wal = { path = "../hydra-wal" }
@@ -21,6 +25,13 @@ blake3.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 axum = "0.7"
+# M4·0 / audit H21: the API is served over the cluster's own rustls material, so the one link
+# carrying user prompts and the bearer token is not plaintext. axum::serve has no TLS, so the
+# accept loop wraps each connection itself and hands it to hyper.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+tower-service = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 futures-core = "0.3"
 
 [dev-dependencies]

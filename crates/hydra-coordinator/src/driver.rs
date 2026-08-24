@@ -40,7 +40,7 @@ use hydra_state::{AuthenticatedRank, ControlMsg, Effect, StageRank, WalRecord};
 use hydra_wire::SessionFence;
 
 use crate::commit_stream::WalFenceCtx;
-use crate::control_wal::{tuple_hash, ControlWal, ControlWalError};
+use crate::control_wal::{ControlWal, ControlWalError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -60,7 +60,10 @@ pub trait StageLink {
     /// role, never read from a frame (audit H4).
     fn rank(&self) -> AuthenticatedRank;
     /// Send one already-encoded frame.
-    fn send(&mut self, frame: Vec<u8>) -> Result<(), DriverError>;
+    ///
+    /// Async because the production link is a real mTLS `Conn`. The trait is used generically
+    /// (never as `dyn`), so `async fn` in a trait is exactly right here.
+    fn send(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), DriverError>> + Send;
 }
 
 /// What the driver did, for the caller (and for tests) to observe. Deliberately a record of
@@ -102,53 +105,59 @@ impl<L: StageLink> ActivationDriver<L> {
     /// state a machine is in when it dies between the write and the acknowledgement. §6.5's
     /// classification is defined for that state and, until this driver existed, **nothing could
     /// produce it** (rule 19).
-    pub fn step(&mut self, event: CoordEvent) -> Result<Executed, DriverError> {
+    pub async fn step(&mut self, event: CoordEvent) -> Result<Executed, DriverError> {
         let effects = self.coord.step(event);
-        self.execute(effects, true)
+        self.execute(effects, true).await
     }
 
     /// [`Self::step`], but the WAL write is left **un-acknowledged**: the record is durable on disk
     /// and the SM has not been told. Models a crash in the write→`WalDurable` window.
-    pub fn step_without_acknowledging_durability(&mut self, event: CoordEvent) -> Result<Executed, DriverError> {
+    pub async fn step_without_acknowledging_durability(&mut self, event: CoordEvent) -> Result<Executed, DriverError> {
         let effects = self.coord.step(event);
-        self.execute(effects, false)
+        self.execute(effects, false).await
     }
 
-    fn execute(&mut self, effects: Vec<Effect>, acknowledge: bool) -> Result<Executed, DriverError> {
+    /// Execute effects, and the effects those produce, until the SM is quiet.
+    ///
+    /// A **worklist**, not recursion: feeding `WalDurable` back can itself yield effects, and an
+    /// async recursive function would need boxing at every level for no benefit. The loop also
+    /// makes the ordering explicit, which matters — every WAL write in a batch is made durable
+    /// before any of the resulting events is fed back.
+    async fn execute(&mut self, effects: Vec<Effect>, acknowledge: bool) -> Result<Executed, DriverError> {
         let mut out = Executed::default();
-        let mut durable_tags = Vec::new();
-        for eff in effects {
-            match eff {
-                Effect::WriteWal { record, .. } => {
-                    // WAL-before-wire: durable when `append` returns.
-                    self.wal.append(&self.wal_fence, &record)?;
-                    out.wal_records.push(label(&record));
-                    if let Some(tag) = tag_of(&record) {
-                        durable_tags.push(tag);
+        let mut queue = std::collections::VecDeque::from(effects);
+        loop {
+            let mut durable_tags = Vec::new();
+            while let Some(eff) = queue.pop_front() {
+                match eff {
+                    Effect::WriteWal { record, .. } => {
+                        // WAL-before-wire: durable when `append` returns.
+                        self.wal.append(&self.wal_fence, &record)?;
+                        out.wal_records.push(label(&record));
+                        if let Some(tag) = tag_of(&record) {
+                            durable_tags.push(tag);
+                        }
                     }
-                }
-                Effect::Send { msg, .. } => {
-                    let frame = self.encode(&msg);
-                    // A control message goes to every stage: the SM decides WHAT is sent, the
-                    // driver only decides that "the stages" means every link it holds.
-                    for link in self.links.values_mut() {
-                        link.send(frame.clone())?;
-                        out.frames_sent += 1;
+                    Effect::Send { msg, .. } => {
+                        let frame = self.encode(&msg);
+                        // A control message goes to every stage: the SM decides WHAT is sent; the
+                        // driver only decides that "the stages" means every link it holds.
+                        for link in self.links.values_mut() {
+                            link.send(frame.clone()).await?;
+                            out.frames_sent += 1;
+                        }
                     }
                 }
             }
-        }
-        if acknowledge {
+            if !acknowledge || durable_tags.is_empty() {
+                return Ok(out);
+            }
             for tag in durable_tags {
                 // Feeding this is what "the write is durable" MEANS to the SM. It happens after the
                 // fdatasync above returned, never before.
-                let more = self.coord.step(CoordEvent::WalDurable(tag));
-                let nested = self.execute(more, acknowledge)?;
-                out.wal_records.extend(nested.wal_records);
-                out.frames_sent += nested.frames_sent;
+                queue.extend(self.coord.step(CoordEvent::WalDurable(tag)));
             }
         }
-        Ok(out)
     }
 
     fn encode(&self, msg: &ControlMsg) -> Vec<u8> {
@@ -162,17 +171,30 @@ impl<L: StageLink> ActivationDriver<L> {
                 // `ACTIVATION_COMPLETE` record for them to refer to. There is now, and the hash is
                 // the one committed to that record, so both sides compare the same value rather
                 // than each computing its own.
-                hydra_wire::encode_finalize_activation_with_evidence(&self.fence, tuple, 0, *completion_id, &tuple_hash(tuple))
+                hydra_wire::encode_finalize_activation_with_evidence(&self.fence, tuple, 0, *completion_id, &tuple.completion_hash())
             }
             ControlMsg::ActivationCommitAbort { attempt, .. } => hydra_wire::encode_activation_commit_abort(&self.fence, *attempt),
         }
+    }
+
+    /// Receive one frame from the link belonging to `rank`.
+    ///
+    /// Paired with [`Self::on_frame`] so the rank a reply is attributed to is **the rank of the
+    /// link it arrived on** — the driver never has an opportunity to read one out of the frame,
+    /// which is the whole of audit H4.
+    pub async fn recv_from(&mut self, rank: AuthenticatedRank) -> Result<Vec<u8>, DriverError>
+    where
+        L: Receivable,
+    {
+        let link = self.links.get_mut(&rank.rank()).ok_or(DriverError::NoLink(rank.rank()))?;
+        link.recv().await
     }
 
     /// Feed an inbound frame from a **specific, authenticated** peer.
     ///
     /// The `rank` argument is an [`AuthenticatedRank`], which only `hydra-transport` can mint from
     /// a certificate role — so a caller cannot pass a rank a frame claimed (audit H4).
-    pub fn on_frame(&mut self, rank: AuthenticatedRank, payload: &[u8]) -> Result<Executed, DriverError> {
+    pub async fn on_frame(&mut self, rank: AuthenticatedRank, payload: &[u8]) -> Result<Executed, DriverError> {
         let (_view, msg) = hydra_wire::decode(payload, &self.fence).map_err(|e| DriverError::Wire(e.to_string()))?;
         let event = match msg {
             hydra_wire::Msg::ActivationCommitted(t) => Some(CoordEvent::StageCommitted { rank, attempt: t.attempt }),
@@ -183,9 +205,52 @@ impl<L: StageLink> ActivationDriver<L> {
             _ => None,
         };
         match event {
-            Some(e) => self.step(e),
+            Some(e) => self.step(e).await,
             None => Ok(Executed::default()),
         }
+    }
+}
+
+/// A link that can also be read from. Separate from [`StageLink`] because a test double may only
+/// need to record what it was sent, and requiring a `recv` it will never serve would be a trait
+/// bound describing the test rather than the protocol.
+pub trait Receivable {
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>, DriverError>> + Send;
+}
+
+/// **The production link: a real mTLS connection to one stage.**
+///
+/// The rank is supplied at construction from the peer's **authenticated** role — the caller gets it
+/// from `BoundPeer::authenticated_rank()` or from the role it dialled — and never from a frame
+/// (audit H4). `ACTIVATION_COMMITTED` carries no rank on the wire at all, so a coordinator that
+/// read one from a frame would be counting a number the sender chose.
+pub struct MtlsStageLink {
+    rank: AuthenticatedRank,
+    conn: hydra_transport::tcp_mtls::ClientConn,
+}
+
+impl MtlsStageLink {
+    pub fn new(rank: AuthenticatedRank, conn: hydra_transport::tcp_mtls::ClientConn) -> Self {
+        MtlsStageLink { rank, conn }
+    }
+
+}
+
+impl Receivable for MtlsStageLink {
+    /// Receive one frame from this stage. The caller pairs it with [`MtlsStageLink::rank`] when
+    /// feeding the driver, which is the only way a rank enters the ack set.
+    async fn recv(&mut self) -> Result<Vec<u8>, DriverError> {
+        let frame = self.conn.recv().await.map_err(|e| DriverError::Transport(e.to_string()))?;
+        Ok(frame.payload)
+    }
+}
+
+impl StageLink for MtlsStageLink {
+    fn rank(&self) -> AuthenticatedRank {
+        self.rank
+    }
+    async fn send(&mut self, frame: Vec<u8>) -> Result<(), DriverError> {
+        self.conn.send(0, &frame).await.map_err(|e| DriverError::Transport(e.to_string()))
     }
 }
 

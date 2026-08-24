@@ -387,10 +387,14 @@ dependencies = [
  "hydra-transport",
  "hydra-wal",
  "hydra-wire",
+ "hyper",
+ "hyper-util",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tower",
+ "tower-service",
 ]
 
 [[package]]
@@ -498,6 +502,7 @@ dependencies = [
  "flatbuffers",
  "hydra-proto",
  "hydra-state",
+ "ring",
  "thiserror 2.0.18",
 ]
 

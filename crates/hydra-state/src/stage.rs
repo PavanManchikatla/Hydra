@@ -8,6 +8,20 @@
 
 use crate::{ActivationKind, ActivationTuple, AttemptId, Epoch, RecoveryId, StageRank};
 
+/// **⛔ V1-BLOCKING ROLLOUT ALLOWANCE — set this to `false` before v1 ships (§8).**
+///
+/// A pre-H2 encoder writes `complete_record_hash = [0; 32]`, because the field was populated with
+/// zeros and dropped at decode. Accepting that value lets a mixed-version cluster finish a rollout
+/// without a flag day. **While it is `true`, an all-zero hash is a valid finalize from any peer the
+/// role gate admits — which is most of what H2 closed**, so this is a dated allowance and not a
+/// design choice.
+///
+/// It is a **named constant rather than a comment** so that deleting it is a one-line change with a
+/// compiler-visible effect, and so the §8 row that tracks it points at something real.
+/// `stage.rs::a_finalize_whose_evidence_names_a_different_activation_is_refused` asserts that a
+/// **non-zero** mismatch is refused, so this cannot widen into "any hash passes".
+pub const ACCEPT_LEGACY_ZERO_COMPLETION_HASH: bool = true;
+
 /// Per-stage activation state (TLA+ `stState`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageState {
@@ -353,10 +367,8 @@ impl Stage {
                     sampler_checkpoint_id: self.tuple_checkpoint,
                 }
                 .completion_hash();
-                // A zero hash is the pre-H2 encoder's output. Accepting it keeps a mixed-version
-                // cluster working through the rollout: a stated compatibility allowance, not an
-                // oversight, and the one line to delete when v1 ships.
-                let evidence_ok = complete_record_hash == expected || complete_record_hash == [0u8; 32];
+                let evidence_ok = complete_record_hash == expected
+                    || (ACCEPT_LEGACY_ZERO_COMPLETION_HASH && complete_record_hash == [0u8; 32]);
                 if self.state == Preactive
                     && (cfg!(feature = "mutation_no_attempt_fence") || attempt == self.attempt)
                     && evidence_ok
