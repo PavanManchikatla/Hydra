@@ -19,6 +19,8 @@ hydra-tokenizer = { path = "../hydra-tokenizer" }
 # stages. Both edges point DOWN (hydra-wire and hydra-transport know nothing of the coordinator),
 # so hydra-worker -> hydra-coordinator stays the only one-way edge between the two binaries.
 hydra-wire = { path = "../hydra-wire" }
+# M4·4: the dashboard renders telemetry provenance (Measured / BestEffort / Unavailable).
+hydra-sched = { path = "../hydra-sched" }
 hydra-transport = { path = "../hydra-transport" }
 flatbuffers.workspace = true
 blake3.workspace = true

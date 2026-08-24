@@ -598,3 +598,49 @@ async fn a_panicking_session_does_not_wedge_the_instance() {
          set, so every later client gets 409 until the process restarts (audit H16)"
     );
 }
+
+/// **M4·4 — the dashboard is behind the SAME auth as the generation endpoint.**
+///
+/// It is another client of this surface, not a privileged path. A status page reachable without
+/// the token would be a second, weaker front door to a user's session state — and it is exactly
+/// the sort of endpoint that gets added "just for debugging" and then forgotten.
+#[tokio::test]
+async fn the_dashboard_requires_the_same_bearer_token_as_the_api() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+
+    // No token: refused, and nothing about the session leaks in the body.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/dashboard")
+        .header("host", "127.0.0.1:0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a status page is not a public page");
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!body.contains("durable"), "a refusal must not leak watermarks: {body}");
+    assert!(!body.contains("<table"), "nor render the page anyway");
+
+    // A wrong token is refused too — the check is the real one, not a presence check.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/dashboard")
+        .header("host", "127.0.0.1:0")
+        .header("authorization", "Bearer not-the-right-token-at-all")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // With the token: the page renders, and says it is read-only.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/dashboard")
+        .header("host", "127.0.0.1:0")
+        .header("authorization", AUTH_HEADER_VALUE.as_str())
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(body.contains("Read-only"), "and it states the v1 constraint in the UI");
+}

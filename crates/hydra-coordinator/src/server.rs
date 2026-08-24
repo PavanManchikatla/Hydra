@@ -119,6 +119,13 @@ fn prune_finished(reg: &mut Registry) {
 
 #[derive(Default)]
 struct Registry {
+    /// M4·4: the last telemetry sample from each stage, for the dashboard. Empty until a heartbeat
+    /// arrives — and the page renders that emptiness as such.
+    telemetry: Vec<hydra_sched::telemetry::TelemetrySample>,
+    last_durable_pos: i64,
+    last_prefill_pos: i64,
+    last_checkpoint_id: u64,
+    coordinator_state: String,
     by_idempotency: HashMap<String, String>, // Idempotency-Key -> session_id
     sessions: HashMap<String, Arc<Mutex<SessionState>>>,
     seq: u64,
@@ -293,13 +300,54 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Build the dashboard's view of the world (M4·4).
+    ///
+    /// Reads only what the coordinator actually holds. Stage telemetry arrives on heartbeats; when
+    /// none has been received the page says **"no stage telemetry received"** rather than showing
+    /// an empty-but-healthy-looking table, because those are different facts.
+    pub fn render_dashboard(&self) -> crate::dashboard::Dashboard {
+        let reg = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let session = reg.active_session().map(|id| crate::dashboard::SessionView {
+            session_id_prefix: id.chars().take(16).collect(),
+            generation_durable_pos: reg.last_durable_pos,
+            prefill_stable_pos: reg.last_prefill_pos,
+            committed_sampler_checkpoint_id: reg.last_checkpoint_id,
+            coordinator_state: reg.coordinator_state.clone(),
+        });
+        crate::dashboard::Dashboard {
+            session,
+            stages: reg.telemetry.iter().map(crate::dashboard::StageView::from_sample).collect(),
+        }
+    }
+
     pub fn new(make_session: Arc<dyn Fn() -> Session + Send + Sync>, gen_fn: GenFn, auth: ApiAuth) -> AppState {
         AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session, auth }
     }
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/v1/chat/completions", post(chat_completions)).with_state(state)
+    Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        // **M4·4 — the dashboard is another CLIENT of this surface, not a privileged path.**
+        // Same router, same `ApiAuth`, same TLS. A status page reachable without the token would
+        // be a second, weaker front door to a user's session state.
+        .route("/dashboard", axum::routing::get(dashboard))
+        .with_state(state)
+}
+
+/// The read-only dashboard (M4·4). Behind the same bearer token and the same Host/Origin checks as
+/// the generation endpoint — the auth check is the first thing it does, before it reads any state.
+async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    if let Err((status, code, message)) = state.auth.check(&headers) {
+        return (
+            status,
+            [("content-type", "application/json")],
+            format!("{{\"error\":{{\"code\":\"{code}\",\"message\":\"{message}\"}}}}"),
+        )
+            .into_response();
+    }
+    let page = state.render_dashboard();
+    (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], page.to_html()).into_response()
 }
 
 /// Extract a minimal prompt from the request body — the string after the last `"content":"` up to

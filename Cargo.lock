@@ -394,6 +394,7 @@ dependencies = [
  "futures-core",
  "http-body-util",
  "hydra-proto",
+ "hydra-sched",
  "hydra-state",
  "hydra-tokenizer",
  "hydra-transport",

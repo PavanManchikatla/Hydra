@@ -11,6 +11,7 @@
 pub mod boundary_store;
 pub mod commit_stream;
 pub mod control_wal;
+pub mod dashboard;
 pub mod driver;
 pub mod serve_tls;
 pub mod event_log;
