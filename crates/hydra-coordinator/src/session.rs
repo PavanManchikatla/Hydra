@@ -145,10 +145,25 @@ impl Session {
         if self.buffer_full() {
             return Ok(CommitOutcome::Paused);
         }
-        let batch = self.group.take().unwrap();
+        // **Audit M7 — RETAIN-OR-FAIL (I9). The batch is not removed until its record is durable.**
+        //
+        // This read `self.group.take()`, which drains the buffer *before* the append. When the
+        // append then failed — `ENOSPC`, EIO, a stalled `fdatasync` — the `?` returned with the
+        // batch **already discarded**: tokens S_P had sampled, that no durable record mentioned,
+        // and that the next group's `first_pos` skipped straight past. The error was reported, so
+        // it did not look like silent corruption; what was silent was the **hole it left in the
+        // ledger**, and `recovery::read` replays that ledger by position order, so every later
+        // token shifts one place.
+        //
+        // I9 says a session fails *explicitly* rather than losing committed output. `peek` +
+        // `confirm` is that: on failure the group is exactly where it was, and the caller may
+        // retry it or fail the session — but cannot lose it by accident.
+        let batch = self.group.peek().expect("non-empty: checked above");
         // The DURABLE write. If it fails/stalls, we return the error and NOTHING is emitted — the
         // gate is enforced by this ordering (event append happens only past this line).
         self.commit.append_generation_commit(&self.fence, batch.first_pos, batch.last_pos, &batch.tokens, &batch.snapshot)?;
+        // Durable. Only now does the group leave the buffer.
+        self.group.confirm();
 
         // Durable now. Derive the event text from the just-durable tokens via the persistent detok.
         let mut text = String::new();

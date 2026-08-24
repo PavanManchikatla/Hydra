@@ -31,6 +31,11 @@ pub enum CommitError {
     /// retry the first forever and mistake the second for bad luck.
     #[error("commit stream poisoned by an earlier failed append; nothing further may be written ({why})")]
     Poisoned { why: String },
+    /// **Audit M7.** A `GENERATION_COMMIT` that does not continue the durable output sequence, or
+    /// whose token entries are not dense. Refused before the disk: recovery replays this ledger by
+    /// position, so a hole shifts every later token and nothing reports it.
+    #[error("{what}: got {got}, expected {expected} (audit M7 — the generation ledger must be contiguous)")]
+    NonContiguous { what: &'static str, got: i64, expected: i64 },
     /// **Audit M5.** A sampled `token_id` outside `[0, n_vocab)` was refused before it could be
     /// buffered for a durable `GENERATION_COMMIT`. Nothing was written.
     #[error("token_id {token_id} at output_pos {output_pos} is outside the vocabulary (n_vocab {n_vocab}); refused before durability (audit M5)")]
@@ -265,6 +270,19 @@ impl CommitStream {
         self.poisoned.is_some()
     }
 
+    /// **Is this stream still writable at all?** (audit H9, ordered before audit M7's checks.)
+    ///
+    /// A poisoned stream's on-disk tail is *unknown*, which means `generation_durable_pos` no
+    /// longer reliably describes the file — so reasoning about **contiguity** against it would be
+    /// reasoning from a number we do not trust. "This stream is dead" is the stronger and more
+    /// useful answer, and it must be the one the caller gets.
+    fn ensure_writable(&self) -> Result<(), CommitError> {
+        match &self.poisoned {
+            Some(why) => Err(CommitError::Poisoned { why: why.clone() }),
+            None => Ok(()),
+        }
+    }
+
     /// The single append path. **Every** durable write in this type goes through here, so the H9
     /// poisoning cannot be forgotten at one call site: a new record type gets the check by
     /// construction rather than by review.
@@ -292,6 +310,8 @@ impl CommitStream {
         initial_checkpoint: &[u8],
         durability_mode: u8,
     ) -> Result<(), CommitError> {
+        // H9 before M7: a dead stream is a stronger fact than a mis-ordered position.
+        self.ensure_writable()?;
         let mut fbb = FlatBufferBuilder::new();
         let fence_off = build_fence(&mut fbb, fence);
         let tokenizer_hash = Some(fbb.create_vector(&admission.tokenizer_hash));
@@ -333,6 +353,8 @@ impl CommitStream {
         tokens: &[(i64, u32)],
         checkpoint: &[u8],
     ) -> Result<u64, CommitError> {
+        // H9 before M7: a dead stream is a stronger fact than a mis-ordered position.
+        self.ensure_writable()?;
         let commit_id = self.next_commit_id;
         let mut fbb = FlatBufferBuilder::new();
         let fence_off = build_fence(&mut fbb, fence);
@@ -362,6 +384,44 @@ impl CommitStream {
 
         // I19 on write: one record or nothing (spec §2.6a). Validated BEFORE the durable append.
         validate_generation_commit_i19(payload).map_err(CommitError::I19)?;
+
+        // **Audit M7 — the generation ledger must be CONTIGUOUS, and it was never checked.**
+        //
+        // `generation_durable_pos` advanced to whatever `last_output_pos` a record carried, so a
+        // group that started anywhere at all was accepted. Two ways that happens without malice:
+        // a **failed commit dropped its batch** (fixed above) and the next group began past the
+        // hole; or a retry re-committed a range already on disk. Either leaves a ledger whose
+        // positions are not a dense sequence — and `recovery::read` rebuilds `generated_tokens`
+        // by *position order*, then replays them as the token history, so a hole silently shifts
+        // every later token one place and the "byte-identical to an uninterrupted run" property
+        // is false with nothing reporting it.
+        //
+        // The rule is exact: a group must begin at `generation_durable_pos + 1`, and its entries
+        // must be dense and ascending within the group. Both are refused **before** the disk.
+        if first_output_pos != self.generation_durable_pos + 1 {
+            return Err(CommitError::NonContiguous {
+                what: "GENERATION_COMMIT first_output_pos",
+                got: first_output_pos,
+                expected: self.generation_durable_pos + 1,
+            });
+        }
+        for (i, (pos, _)) in tokens.iter().enumerate() {
+            let want = first_output_pos + i as i64;
+            if *pos != want {
+                return Err(CommitError::NonContiguous {
+                    what: "GENERATION_COMMIT token entry",
+                    got: *pos,
+                    expected: want,
+                });
+            }
+        }
+        if tokens.last().map(|(p, _)| *p) != Some(last_output_pos) {
+            return Err(CommitError::NonContiguous {
+                what: "GENERATION_COMMIT last_output_pos vs its entries",
+                got: last_output_pos,
+                expected: tokens.last().map(|(p, _)| *p).unwrap_or(first_output_pos),
+            });
+        }
 
         self.durable_append(rec_type::GENERATION_COMMIT, payload)?;
         // Durable now (append fdatasync'd) — only now advance the watermarks.
@@ -397,6 +457,8 @@ impl CommitStream {
         last_input_pos: i64,
         boundary_durable_through: &[i64],
     ) -> Result<u64, CommitError> {
+        // H9 before M7: a dead stream is a stronger fact than a mis-ordered position.
+        self.ensure_writable()?;
         if last_input_pos < first_input_pos {
             return Err(CommitError::I19(format!(
                 "INPUT_CHUNK_COMMIT: inverted chunk [{first_input_pos}, {last_input_pos}]"
@@ -477,8 +539,42 @@ impl GroupCommitter {
         self.entries.len() >= self.k
     }
 
+    /// **Audit M7 — look at the group WITHOUT draining it, so a failed commit does not lose it.**
+    ///
+    /// [`Self::take`] hands the entries out and clears the buffer in one step, which is correct
+    /// only if the append that follows always succeeds. It does not: a `fdatasync` can fail
+    /// (`ENOSPC`, EIO), and the caller's `?` then returns with the batch **already gone** — tokens
+    /// S_P sampled, that no record on disk mentions, and that the next group's `first_pos` skips
+    /// straight past. **I9 says a session fails explicitly rather than silently losing committed
+    /// output**; dropping the batch is the silent branch.
+    ///
+    /// The pair is `peek` → append → [`Self::confirm`]: the buffer is cleared **only after** the
+    /// durable write returns, so a failure leaves the group exactly where it was and the caller may
+    /// retry it or fail the session — but it cannot lose it by accident.
+    pub fn peek(&self) -> Option<GroupBatch> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(GroupBatch {
+            first_pos: self.first_pos.expect("first_pos is set whenever entries is non-empty"),
+            last_pos: self.entries.last().expect("non-empty").0,
+            tokens: self.entries.clone(),
+            snapshot: self.last_snapshot.clone(),
+        })
+    }
+
+    /// Clear the group that [`Self::peek`] returned, **after** its record is durable (audit M7).
+    pub fn confirm(&mut self) {
+        self.first_pos = None;
+        self.entries.clear();
+        self.last_snapshot.clear();
+    }
+
     /// Drain the buffered group: `(first_pos, last_pos, tokens, snapshot(last_pos))`, or `None` if
     /// empty.
+    ///
+    /// **Prefer [`Self::peek`] + [`Self::confirm`] on any path where the append can fail** (audit
+    /// M7). This remains for callers that are not writing to a disk.
     pub fn take(&mut self) -> Option<GroupBatch> {
         if self.entries.is_empty() {
             return None;

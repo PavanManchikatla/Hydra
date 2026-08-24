@@ -157,6 +157,13 @@ pub enum Msg {
     InstallSamplerCheckpoint { checkpoint_id: u64, snapshot: Vec<u8> },
     /// `SAMPLER_CHECKPOINT_INSTALLED{checkpoint_id, resulting_state_digest, sampled_output_pos}`.
     SamplerCheckpointInstalled { checkpoint_id: u64, sampled_output_pos: i64, resulting_state_digest: Vec<u8> },
+    /// `RESET_RECOVERY_ATTEMPT{target, old_recovery_id, new_recovery_id, truncate_to}` (I23).
+    ///
+    /// **Audit M13 (the auditor's second half).** This body had **no decode arm at all**, so an
+    /// inbound reset fell through to `UnsupportedBody` and the documented recovery reversal —
+    /// spec §6.4's *reconstruction-invalidating failure* path — was **unreachable over the wire**.
+    /// The stage SM has implemented `RecvReset` since M1 and nothing could deliver it.
+    ResetRecoveryAttempt { target: Epoch, new_recovery_id: RecoveryId, truncate_to: i64 },
     /// `ERR_*` (e.g. `ERR_FENCED` from an F2 rejection, `ERR_CHECKPOINT_MISMATCH` from sampler drift).
     Err { code: u16 },
 }
@@ -354,7 +361,11 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
                 no_sample: f.policy() == proto::SamplePolicy::NO_SAMPLE,
                 n_positions: f.n_positions(),
                 n_embd,
-                activations: bytes_to_f32_le(t.data().bytes()),
+                activations: bytes_to_f32_le(t.data().bytes()).ok_or(WireError::Shape {
+                    what: "tensor bytes are not a whole number of f32 words",
+                    expected: 0,
+                    got: (t.data().bytes().len() % 4) as u64,
+                })?,
             })
         }
         Body::AppliedAck => {
@@ -377,7 +388,11 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
                 chunk_id: b.chunk_id(),
                 n_positions: b.n_positions(),
                 n_embd,
-                activations: bytes_to_f32_le(t.data().bytes()),
+                activations: bytes_to_f32_le(t.data().bytes()).ok_or(WireError::Shape {
+                    what: "tensor bytes are not a whole number of f32 words",
+                    expected: 0,
+                    got: (t.data().bytes().len() % 4) as u64,
+                })?,
             })
         }
         Body::DurabilityAck => {
@@ -412,6 +427,14 @@ fn decode_body(frame: &proto::Frame<'_>, view: FenceView) -> Result<Msg, WireErr
         Body::ActivationCommitAbort => {
             let a = frame.body_as_activation_commit_abort().ok_or(WireError::Malformed("ActivationCommitAbort".into()))?;
             Ok(Msg::ActivationCommitAbort { aborted_attempt: a.aborted_attempt_id() })
+        }
+        Body::ResetRecoveryAttempt => {
+            let r = frame.body_as_reset_recovery_attempt().ok_or(WireError::Malformed("ResetRecoveryAttempt".into()))?;
+            Ok(Msg::ResetRecoveryAttempt {
+                target: r.target_epoch(),
+                new_recovery_id: r.new_recovery_id(),
+                truncate_to: r.truncate_to_input_pos(),
+            })
         }
         Body::BeginRecovery => {
             let b = frame.body_as_begin_recovery().ok_or(WireError::Malformed("BeginRecovery".into()))?;
@@ -702,6 +725,34 @@ pub fn encode_begin_recovery(fence: &SessionFence, base: Epoch, target: Epoch, r
     finish_frame(&mut fbb, fence, proto::Body::BeginRecovery, body.as_union_value())
 }
 
+/// `RESET_RECOVERY_ATTEMPT` (audit M13): the reconstruction-invalidating restart, spec §6.4.
+pub fn encode_reset_recovery_attempt(
+    fence: &SessionFence,
+    target: Epoch,
+    old_recovery_id: RecoveryId,
+    new_recovery_id: RecoveryId,
+    truncate_to: i64,
+    committed_sampler_checkpoint_id: u64,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let fence = build_fence(
+        &mut fbb,
+        fence,
+        FenceView { epoch: target, recovery_id: new_recovery_id, activation_attempt_id: 0, stage_generation: 0 },
+    );
+    let body = proto::ResetRecoveryAttempt::create(
+        &mut fbb,
+        &proto::ResetRecoveryAttemptArgs {
+            target_epoch: target,
+            old_recovery_id,
+            new_recovery_id,
+            truncate_to_input_pos: truncate_to,
+            committed_sampler_checkpoint_id,
+        },
+    );
+    finish_frame(&mut fbb, fence, proto::Body::ResetRecoveryAttempt, body.as_union_value())
+}
+
 pub fn encode_recovery_ack(fence: &SessionFence, epoch: Epoch, recovery_id: RecoveryId, applied_input_pos: i64) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::new();
     let fence = build_fence(&mut fbb, fence, FenceView { epoch, recovery_id, activation_attempt_id: 0, stage_generation: 0 });
@@ -789,6 +840,17 @@ pub(crate) fn f32_to_bytes_le(v: &[f32]) -> Vec<u8> {
     out
 }
 
-pub(crate) fn bytes_to_f32_le(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+/// **Audit M11 — reject, never truncate.**
+///
+/// `chunks_exact(4)` silently drops a trailing partial word, which violates the project's stated
+/// rule for every other wire quantity. Since C3 the boundary bodies prove `data.len() ==
+/// n_positions × 4 × n_embd` before this is reached, so a partial word is unreachable *from those
+/// call sites* — and that is exactly the argument the audit says not to accept on its own: a
+/// function that truncates is a function that will truncate for the next caller. It now returns
+/// `None` instead, and the boundary decode turns that into a `Shape` refusal.
+pub(crate) fn bytes_to_f32_le(b: &[u8]) -> Option<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    Some(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }

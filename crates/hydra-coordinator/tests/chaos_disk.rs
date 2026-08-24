@@ -358,3 +358,158 @@ fn poisoning_is_caused_by_the_failure_and_not_by_the_check() {
     assert!(matches!(poisoned, Err(hydra_coordinator::CommitError::Poisoned { .. })), "got {poisoned:?}");
     assert_eq!(bad.generation_durable_pos(), 0, "the watermark stands where the last DURABLE record left it");
 }
+
+// ---------------------------------------------------------------------------------------------
+// **Audit M7 (the auditor's, not the directive's) — retain-or-fail on commit error, per I9.**
+//
+// # Standing rule 20, and why this test did not exist
+//
+// The Wave-2 directive said only "M7 (contiguity)". I implemented contiguity on the **boundary
+// store**. The auditor's M7 is `GENERATION_COMMIT` contiguity, and its fix text names the part
+// that actually loses data: *"retain or fail (I9) on commit error"*. The mistake was mine and it
+// was undetectable from the directive alone, because the directive was the only text in the repo.
+// Standing rule 20 now requires reconciling against the auditor's own words before calling
+// anything closed.
+//
+// # What the defect was
+//
+// `Session::commit_group` called `group.take()` — which **drains the buffer** — and then appended.
+// On failure the `?` returned with the batch already gone: tokens S_P had sampled, that no durable
+// record mentioned, and that the next group's `first_pos` skipped straight past. The error was
+// reported, so it did not look like silent corruption. What was silent was the **hole**, and
+// `recovery::read` replays the ledger by position, so every later token shifts one place and the
+// recovered stream is a different generation from the one the client already saw.
+// ---------------------------------------------------------------------------------------------
+
+/// A sink that always succeeds (each integration test file is its own crate, so the helpers in
+/// `session_http.rs` are not visible here).
+#[derive(Default)]
+struct AlwaysOk {
+    len: u64,
+}
+impl Durability for AlwaysOk {
+    fn append(&mut self, _rt: u16, _fl: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError> {
+        self.len += payload.len() as u64;
+        Ok(self.len)
+    }
+    fn durable_len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// One byte per token id, and a vocabulary big enough that M5 is not what refuses anything here.
+struct BytePieces;
+impl hydra_coordinator::PieceSource for BytePieces {
+    fn piece(&self, token: u32) -> Vec<u8> {
+        vec![token as u8]
+    }
+    fn n_vocab(&self) -> u32 {
+        1 << 20
+    }
+}
+
+/// A sink that fails exactly once, then works. The transient case — `ENOSPC` on a full disk that
+/// the operator then clears — which is precisely when losing the batch is least excusable.
+struct FailsOnce {
+    fail_at: usize,
+    seen: usize,
+    len: u64,
+}
+
+impl Durability for FailsOnce {
+    fn append(&mut self, _rt: u16, _fl: u16, payload: &[u8]) -> Result<u64, hydra_wal::WalError> {
+        self.seen += 1;
+        if self.seen == self.fail_at {
+            return Err(hydra_wal::WalError::Io(std::io::Error::other("injected transient failure")));
+        }
+        self.len += payload.len() as u64;
+        Ok(self.len)
+    }
+    fn durable_len(&self) -> u64 {
+        self.len
+    }
+}
+
+#[test]
+fn a_failed_commit_retains_the_batch_instead_of_discarding_sampled_tokens() {
+    use hydra_coordinator::{CommitOutcome, SampledToken, Session};
+
+    // Append #1 is the INITIAL_COMMIT; the sink is set to fail on append #2, the group commit.
+    let mut cs = CommitStream::with_durability(Box::new(FailsOnce { fail_at: 2, seen: 0, len: 0 }));
+    cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).expect("initial commit");
+    let mut s = Session::new(cs, wal_fence(), Box::new(BytePieces), 2, 1_000_000);
+
+    // Two tokens buffered; the group-commit append is #2, which fails.
+    s.push_sampled(SampledToken { output_pos: 0, token_id: b'a' as u32, snapshot: snapshot(1, 0, 0) }).unwrap();
+    s.push_sampled(SampledToken { output_pos: 1, token_id: b'b' as u32, snapshot: snapshot(1, 1, 1) }).unwrap();
+    assert_eq!(s.buffered(), 2);
+
+    let err = s.try_commit_by_count();
+    assert!(err.is_err(), "the failure must be reported");
+    assert_eq!(s.durable_pos(), -1, "and nothing became durable");
+
+    // THE ASSERTION: the sampled tokens are still buffered. Before the fix they were gone, and the
+    // next group would have started at position 2, leaving 0 and 1 in no record anywhere.
+    assert_eq!(
+        s.buffered(),
+        2,
+        "a failed commit must RETAIN the batch (I9): these are tokens S_P already sampled, and \
+         discarding them leaves a permanent hole that recovery replays as a shifted generation"
+    );
+
+    // **How M7 and H9 compose, which is the interesting part.** The retry is REFUSED, and that is
+    // correct: H9 poisoned the stream because the failed append may have left a partial record, so
+    // the on-disk tail is unknown and appending again would manufacture mid-stream corruption. The
+    // two fixes say different things and both are needed — *the tokens are not discarded* (M7) and
+    // *this file is not written to again* (H9).
+    let retry = s.try_commit_by_count();
+    assert!(
+        matches!(retry, Err(hydra_coordinator::CommitError::Poisoned { .. })),
+        "the retry must be refused on a poisoned stream, not appended behind a partial record: {retry:?}"
+    );
+    assert_eq!(
+        s.buffered(),
+        2,
+        "and the batch is STILL retained after the refusal — a refused retry must not lose the          tokens either. Recovery is reopen-then-recommit (`CommitStream::open` discards the partial          tail durably and restores the watermarks), covered in commit_stream.rs."
+    );
+    assert_eq!(s.durable_pos(), -1, "nothing became durable at any point");
+    let _ = CommitOutcome::Nothing; // the enum is used above via matches!
+}
+
+/// **M7 — the ledger must be contiguous, checked before the disk.**
+///
+/// A group that does not continue the durable sequence is refused, and a group whose token entries
+/// are not dense is refused. Both are the shape a dropped batch leaves.
+#[test]
+fn a_generation_commit_that_does_not_continue_the_sequence_is_refused() {
+    use hydra_coordinator::CommitError;
+
+    let mut cs = CommitStream::with_durability(Box::new(AlwaysOk::default()));
+    cs.append_initial_commit(&wal_fence(), &admission(), &snapshot(1, -1, -1), 1).unwrap();
+
+    // A gap: the first group starts at 1 while the durable frontier is -1.
+    let err = cs.append_generation_commit(&wal_fence(), 1, 1, &[(1, 7)], &snapshot(1, 1, 1));
+    assert!(
+        matches!(err, Err(CommitError::NonContiguous { got: 1, expected: 0, .. })),
+        "a group past the frontier must be refused: {err:?}"
+    );
+
+    cs.append_generation_commit(&wal_fence(), 0, 0, &[(0, 7)], &snapshot(1, 0, 0)).expect("position 0 commits");
+
+    // A replay of an already-durable position.
+    assert!(matches!(
+        cs.append_generation_commit(&wal_fence(), 0, 0, &[(0, 7)], &snapshot(1, 0, 0)),
+        Err(CommitError::NonContiguous { .. })
+    ));
+
+    // Non-dense entries within an otherwise well-placed group (1, then 3).
+    let err = cs.append_generation_commit(&wal_fence(), 1, 3, &[(1, 7), (3, 9)], &snapshot(1, 3, 3));
+    assert!(
+        matches!(err, Err(CommitError::NonContiguous { what: "GENERATION_COMMIT token entry", got: 3, expected: 2 })),
+        "a hole inside the group must be refused too: {err:?}"
+    );
+
+    // Control: the next dense group commits.
+    cs.append_generation_commit(&wal_fence(), 1, 2, &[(1, 7), (2, 8)], &snapshot(1, 2, 2)).expect("dense group commits");
+    assert_eq!(cs.generation_durable_pos(), 2);
+}

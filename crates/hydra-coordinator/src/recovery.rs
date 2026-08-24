@@ -32,6 +32,14 @@ pub enum RecoveryError {
     I19(u64, String),
     #[error("output position {0} committed twice (a retry appended a duplicate)")]
     DuplicatePosition(i64),
+    /// **Audit M7.** The durable ledger's output positions are not dense — the shape a dropped
+    /// commit batch leaves. Replaying it would shift every later token one place.
+    #[error("ledger gap: expected output position {expected}, found {found} (audit M7)")]
+    Gap { expected: i64, found: i64 },
+    /// **Audit M7.** Records appear out of position order. Records are appended in order, so this
+    /// is a damaged ledger — and sorting it before checking would have hidden exactly that.
+    #[error("ledger out of order: {found} follows {previous} (audit M7)")]
+    OutOfOrder { previous: i64, found: i64 },
     #[error("malformed {0} record: {1}")]
     Malformed(&'static str, String),
 }
@@ -118,6 +126,33 @@ pub fn read(path: impl AsRef<std::path::Path>) -> Result<RecoveryState, Recovery
     }
 
     let prompt_tokens = prompt_tokens.ok_or(RecoveryError::NoInitial)?;
+
+    // **Audit M7 — monotonicity is checked BEFORE the sort, and gaps are refused.**
+    //
+    // The sort came first, which quietly repaired the very disorder that would have been evidence:
+    // records are appended in order, so a ledger whose positions arrive out of order is a damaged
+    // ledger, and sorting it makes it *look* fine. `DuplicatePosition` still fired (the `seen` set
+    // is order-independent), but a **gap** — the shape a dropped commit batch leaves — was
+    // invisible to both the sort and the set.
+    //
+    // A gap matters because the tokens below are replayed as the session's history: a missing
+    // position shifts every later token one place, and the recovered stream is then silently a
+    // different generation from the one the client already saw.
+    for w in generated_tokens.windows(2) {
+        if w[1].0 <= w[0].0 {
+            return Err(RecoveryError::OutOfOrder { previous: w[0].0, found: w[1].0 });
+        }
+    }
+    if let Some(&(first, _)) = generated_tokens.first() {
+        if first != 0 {
+            return Err(RecoveryError::Gap { expected: 0, found: first });
+        }
+        for w in generated_tokens.windows(2) {
+            if w[1].0 != w[0].0 + 1 {
+                return Err(RecoveryError::Gap { expected: w[0].0 + 1, found: w[1].0 });
+            }
+        }
+    }
     generated_tokens.sort_by_key(|&(pos, _)| pos);
     let (last_checkpoint, checkpoint_id) = last_checkpoint
         .or(initial_checkpoint)

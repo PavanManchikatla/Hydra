@@ -111,18 +111,102 @@ fn recovery_state_reconstructs_from_the_durable_ledger_and_is_i19_no_double() {
     assert!(stats.positions_strictly_increasing);
 }
 
+/// Build a `GENERATION_COMMIT` payload directly, bypassing `CommitStream`'s guards.
+///
+/// **Audit M7 changed what this test has to do.** It used to create the overlapping record through
+/// the public API, because nothing stopped it. The write side now refuses a group that does not
+/// continue the durable sequence, so the damaged ledger can no longer be built that way — which is
+/// the fix working. The read-side guard still matters, and now for its real reason: **the file is
+/// what a DIFFERENT process, or an older build, recovers from.** So the corrupt ledger is
+/// constructed below the API, the way one would actually arrive on disk.
+fn raw_generation_commit(first: i64, last: i64, positions: &[(i64, u32)], ckpt_pos: i64) -> Vec<u8> {
+    let mut b = FlatBufferBuilder::new();
+    let cluster = b.create_vector(&[1u8; 16]);
+    let sid = b.create_vector(&[2u8; 16]);
+    let mid = b.create_vector(&[0u8; 16]);
+    let mh = b.create_vector(&[3u8; 32]);
+    let fence = wal::WalFence::create(
+        &mut b,
+        &wal::WalFenceArgs {
+            cluster_id: Some(cluster),
+            session_id: Some(sid),
+            model_instance_id: Some(mid),
+            manifest_hash: Some(mh),
+            session_epoch: 0,
+            recovery_id: 0,
+            activation_attempt_id: 0,
+        },
+    );
+    let rng_key = b.create_vector(&[0u8; 8]);
+    let grammar = b.create_vector::<u8>(&[]);
+    let penalty = b.create_vector::<u8>(&[]);
+    let cfg = b.create_vector(&[7u8; 32]);
+    let sum = b.create_vector(&[9u8; 32]);
+    let ckpt = wal::SamplerCheckpointRec::create(
+        &mut b,
+        &wal::SamplerCheckpointRecArgs {
+            checkpoint_id: 1,
+            rng_key: Some(rng_key),
+            rng_counter: 42,
+            generated_through_output_pos: ckpt_pos,
+            serialized_grammar_state: Some(grammar),
+            serialized_penalty_state: Some(penalty),
+            sampled_output_pos: ckpt_pos,
+            sampling_config_hash: Some(cfg),
+            state_checksum: Some(sum),
+        },
+    );
+    let entries: Vec<_> = positions
+        .iter()
+        .map(|&(pos, tok)| {
+            wal::TokenEntry::create(
+                &mut b,
+                &wal::TokenEntryArgs {
+                    absolute_position: pos,
+                    token_id: tok,
+                    origin: hydra_proto::proto::TokenOrigin::GENERATED,
+                    message_segment_id: 0,
+                    rng_checkpoint_counter: 0,
+                },
+            )
+        })
+        .collect();
+    let tokens = b.create_vector(&entries);
+    let entries_ck = b.create_vector(&[7u8; 32]);
+    let gc = wal::GenerationCommit::create(
+        &mut b,
+        &wal::GenerationCommitArgs {
+            fence: Some(fence),
+            commit_id: last as u64,
+            previous_commit_id: 0,
+            first_output_pos: first,
+            last_output_pos: last,
+            tokens: Some(tokens),
+            checkpoint: Some(ckpt),
+            entries_checksum: Some(entries_ck),
+        },
+    );
+    b.finish(gc, None);
+    b.finished_data().to_vec()
+}
+
 #[test]
 fn a_position_committed_twice_is_rejected_on_read() {
     // A retry that re-appends an already-committed position is the failure `read` must catch — the
-    // durable-truth half of "no position twice". CommitStream's per-record I19 does not forbid it
-    // across records, so this is a real guard, not a tautology.
+    // durable-truth half of "no position twice".
     let path = temp_path("double");
     let mut cs = CommitStream::create(&path, [1; 16], [2; 16]).unwrap();
     cs.append_initial_commit(&wal_fence(), &admission(&[10, 20]), &snapshot(1, -1), 1).unwrap();
     cs.append_generation_commit(&wal_fence(), 0, 2, &[(0, 100), (1, 101), (2, 102)], &snapshot(1, 2)).unwrap();
-    // A "retry" whose group overlaps position 2 (duplicate) — each record is individually I19-valid.
-    cs.append_generation_commit(&wal_fence(), 2, 4, &[(2, 102), (3, 103), (4, 104)], &snapshot(1, 4)).unwrap();
+    let durable_len = cs.durable_len();
     drop(cs);
+
+    // The overlapping record, appended below the API (see `raw_generation_commit`).
+    {
+        let mut w = hydra_wal::writer::WalWriter::open_append(&path, durable_len).unwrap();
+        let payload = raw_generation_commit(2, 4, &[(2, 102), (3, 103), (4, 104)], 4);
+        w.append(hydra_wal::record::rec_type::GENERATION_COMMIT, 0, &payload).unwrap();
+    }
 
     match recovery::read(&path) {
         Err(RecoveryError::DuplicatePosition(2)) => {}

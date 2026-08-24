@@ -426,6 +426,33 @@ impl Worker {
                 }
                 Ok(effects.into_iter().filter_map(|eff| self.encode_effect(eff)).collect())
             }
+            Msg::ResetRecoveryAttempt { target, new_recovery_id, truncate_to } => {
+                // **Audit M13.** The stage SM has implemented `RecvReset` since M1; nothing could
+                // deliver it, because the body had no decode arm. Spec §6.4's
+                // reconstruction-invalidating restart is now reachable over the wire.
+                //
+                // The engine KV is truncated to match the SM's `applied`, exactly as the Case-A
+                // BEGIN_RECOVERY path does — a reset that moved the control-plane frontier without
+                // moving the KV would leave the stage claiming a position its cache cannot serve.
+                let effects = self.stage.step(StageEvent::RecvReset { target, new_recovery_id, truncate_to });
+                if effects.iter().any(|e| matches!(e, StageEffect::ResetAck { .. })) {
+                    if let Some(eng) = self.engine.as_mut() {
+                        let keep = truncate_to.saturating_add(1).max(0);
+                        let keep = i32::try_from(keep).map_err(|_| WorkerError::PreFfi {
+                            what: "RESET_RECOVERY_ATTEMPT truncate_to",
+                            value: truncate_to,
+                            bound: i32::MAX as i64,
+                        })?;
+                        eng.ctx.kv_truncate(keep)?;
+                    }
+                    self.sampled_ring.clear();
+                    // M9's data-plane frontier moves with the truncation too, or the stage would
+                    // refuse the replayed positions as duplicates of work it no longer holds.
+                    self.applied_frontier = truncate_to;
+                    self.last_apply = None;
+                }
+                Ok(effects.into_iter().filter_map(|eff| self.encode_effect(eff)).collect())
+            }
             Msg::CatchUpContext { goal_input_pos } => self.catch_up(goal_input_pos),
             // Acks / errors / SAMPLED are coordinator-inbound; a worker never receives them. The
             // durability-plane acks (DURABILITY_ACK / COMMIT_ACK / COMMIT_SYNC) are consumed by the

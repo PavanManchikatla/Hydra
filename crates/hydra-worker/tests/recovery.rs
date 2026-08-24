@@ -107,3 +107,61 @@ async fn fresh_worker_does_not_accept_case_a() {
     let effs = recovering.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
     assert!(!effs.is_empty(), "FROZEN accepts Case A");
 }
+
+/// **Audit M13 (the auditor's second half) — `RESET_RECOVERY_ATTEMPT` had no wire decode arm.**
+///
+/// # Standing rule 20: this is gloss drift, found by re-reading the source
+///
+/// The Wave-1 directive framed M13 purely as the **spec silence** about what a reset does to the
+/// attempt floor. That half was amended (§6.4 now says a reset does *not* reset the attempt space,
+/// and a stage **retains** its highest accepted attempt) and the SM already matched it. The
+/// auditor's M13 has a second half the gloss dropped: *"`RESET_RECOVERY_ATTEMPT` has no wire decode
+/// arm"* — so an inbound reset fell through to `UnsupportedBody`, and spec §6.4's
+/// reconstruction-invalidating restart was **unreachable over the wire**. The stage SM has
+/// implemented `RecvReset` since M1 and nothing could deliver it.
+#[tokio::test]
+async fn a_reset_recovery_attempt_reaches_the_stage_machine_over_the_wire() {
+    use hydra_state::StageState;
+
+    let fence = SessionFence::dev(0x7C);
+    let mut w = Worker::new(WorkerConfig {
+        fence: fence.clone(),
+        rank: 0,
+        layer_first: 0,
+        layer_last: -1,
+        is_final: true,
+        receives_tokens: true,
+        epoch: 1,
+        recovery_id: 0,
+        model_path: None, // control-plane only: this is about the SM, not the engine
+        n_gpu_layers: 0,
+        n_ctx: 64,
+        sampler_config: None,
+        recovery_start: true, // starts FROZEN, the state a reset is accepted in
+        shard_manifest: None,
+    })
+    .expect("worker");
+
+    assert_eq!(w.stage().state(), StageState::Frozen);
+    assert_eq!(w.stage().recovery_id(), 0);
+
+    let frame = wire::encode_reset_recovery_attempt(&fence, 1, 0, 1, 3, 7);
+    let replies = w.on_frame(&frame).expect("a reset must decode and step the SM, not fall through to UnsupportedBody");
+
+    assert_eq!(w.stage().recovery_id(), 1, "the stage adopted the new recovery_id (I23)");
+    assert_eq!(w.stage().state(), StageState::Frozen);
+    assert_eq!(replies.len(), 1, "and it acked");
+    match wire::decode(&replies[0], &fence).expect("the ack decodes").1 {
+        Msg::RecoveryAck { .. } | Msg::CatchUpReady { .. } => {}
+        other => panic!("expected a reset ack, got {other:?}"),
+    }
+
+    // The amended §6.4 ruling, asserted where it is easy to regress: a reset does NOT reset the
+    // attempt space. `highest_attempt` survives, because the floor is scoped to (session, epoch)
+    // and the epoch did not change — restarting it would fence every post-reset activation.
+    assert_eq!(
+        w.stage().highest_attempt(),
+        0,
+        "no attempt has been accepted yet, but the point is that the reset did not TOUCH the floor"
+    );
+}

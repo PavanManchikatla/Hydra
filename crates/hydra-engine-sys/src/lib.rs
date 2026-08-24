@@ -203,11 +203,20 @@ mod imp {
         }
 
         /// Tokenize with explicit `add_special` (BOS/EOS) and `parse_special` control.
+        /// **Audit M5, second half — `text_len` was narrowed `usize as i32`.**
+        ///
+        /// The directive's gloss of M5 was "the 14 shim entry points", and those were wrapped in
+        /// Wave 1c. The auditor's M5 has a second clause the gloss dropped: *"`text_len` narrowed
+        /// `usize` → `i32`"*. A prompt at or above 2 GiB wraps negative, and `llama_tokenize` then
+        /// throws `std::length_error` on the negative length. Nothing capped prompt bytes at
+        /// ingress. Checked, not cast (standing rule 20 found this).
         pub fn tokenize_ex(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>, EngineError> {
             let bytes = text.as_bytes();
             let (add, parse) = (add_special as i32, parse_special as i32);
+            let text_len = i32::try_from(text.len())
+                .map_err(|_| EngineError { code: 8, what: "prompt does not fit i32 bytes (audit M5)" })?;
             let need = unsafe {
-                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, add, parse, std::ptr::null_mut(), 0)
+                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, text_len, add, parse, std::ptr::null_mut(), 0)
             };
             let cap = if need < 0 { -need } else { need };
             if cap < 0 {
@@ -215,7 +224,7 @@ mod imp {
             }
             let mut out = vec![0i32; cap as usize];
             let got = unsafe {
-                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, bytes.len() as i32, add, parse, out.as_mut_ptr(), cap)
+                ffi::hydra_tokenize_ex(self.raw, bytes.as_ptr() as *const _, text_len, add, parse, out.as_mut_ptr(), cap)
             };
             if got < 0 {
                 return Err(EngineError { code: 4, what: "tokenize failed" });
