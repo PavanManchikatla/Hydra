@@ -1,0 +1,34 @@
+# Hydra stage worker (Linux, systemd).
+#
+#   sudo cp hydra-worker.service /etc/systemd/system/
+#   sudo systemctl enable --now hydra-worker
+#
+# The worker is provisioned by a bootstrap blob written at pairing. That file contains this
+# device's PRIVATE KEY: it is written 0600 into a 0700 directory and must stay that way.
+
+[Unit]
+Description=Hydra stage worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hydra
+Group=hydra
+ExecStart=/usr/local/bin/hydra-worker /var/lib/hydra/worker.boot
+Restart=on-failure
+RestartSec=5
+
+UMask=0077
+StateDirectory=hydra
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hydra
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

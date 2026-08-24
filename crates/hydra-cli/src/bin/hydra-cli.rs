@@ -22,6 +22,8 @@ fn main() -> Result<(), String> {
             let mut session = hydra_cli::PairingSession::open().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {out}: {e}"))?;
             write_private(&std::path::Path::new(&out).join("cluster-ca.der"), &session.ca_cert_der())?;
+            // The PEM is what a client passes to `--cacert`. Public material, so world-readable.
+            write_public(&std::path::Path::new(&out).join("cluster-ca.pem"), session.ca_cert_pem().as_bytes())?;
 
             // The coordinator provisions itself first: it is a peer, and the CA is persisted
             // coordinator-locally so a later re-pair is possible (M4·2).
@@ -63,6 +65,16 @@ fn main() -> Result<(), String> {
         }
         _ => Err("usage: hydra-cli <pair|status> ...".into()),
     }
+}
+
+/// Write a file anyone may read — for the CA **certificate**, which is a public trust anchor. A
+/// trust anchor nobody can read is not a trust anchor.
+fn write_public(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Write a file only this user can read (audit H17's lesson, applied where it is being written).

@@ -156,3 +156,44 @@ fn certificates_have_bounded_lifetimes_and_the_ca_is_path_length_constrained() {
     assert!(bc.value.ca, "the CA must be a CA");
     assert_eq!(bc.value.path_len_constraint, Some(0), "the CA must be path-length constrained to 0 (audit M3)");
 }
+
+/// **M4·3 — the API certificate must name the addresses clients actually dial.**
+///
+/// # Found by running the quickstart, not by reading it
+///
+/// `ClusterCa::issue` produces a certificate whose only SAN is `DNS:<device-name>`. That is right
+/// for cluster peers, which dial each other by device name, and **wrong for the client API**: a
+/// person runs `curl https://127.0.0.1:8443`, and a certificate for `coordinator` says nothing
+/// about `127.0.0.1`. The documented quickstart failed at its last step with *"no alternative
+/// certificate subject name matches target host name"*.
+///
+/// The oracle that missed it is worth naming: every transport test dials **by device name**,
+/// because that is how cluster peers connect. Under that driver a certificate with a DNS-only SAN
+/// and one with IP SANs are indistinguishable — the client API is the only caller that dials an
+/// address, and it had no test.
+#[test]
+fn the_api_certificate_names_the_addresses_clients_dial() {
+    let ca = ClusterCa::new().unwrap();
+    let sans = ["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let id = ca.issue_api("coordinator", &sans).expect("issue api cert");
+
+    let der = id.cert_chain[0].clone();
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der).expect("parses");
+    let ext = parsed.subject_alternative_name().expect("SAN present").expect("SAN value");
+    let rendered: Vec<String> = ext.value.general_names.iter().map(|g| format!("{g:?}")).collect();
+    let joined = rendered.join(" ");
+
+    // rfc5280 renders an IP SAN as raw octets, so match on that rather than on a dotted string —
+    // `IPAddress([127, 0, 0, 1])`, not `"127.0.0.1"`.
+    assert!(joined.contains("IPAddress([127, 0, 0, 1])"), "the loopback address a first run dials must be a SAN: {joined}");
+    assert!(joined.contains("localhost"), "and the name people type: {joined}");
+    assert!(joined.contains("coordinator"), "the device name is still there for cluster peers: {joined}");
+
+    // The control: a plain `issue` is DNS-only, which is correct for a peer and is why the API
+    // needed its own constructor rather than a change to this one.
+    let peer = ca.issue("worker-s1").expect("issue peer cert");
+    let (_, p2) = x509_parser::parse_x509_certificate(&peer.cert_chain[0]).expect("parses");
+    let ext2 = p2.subject_alternative_name().expect("SAN").expect("value");
+    let joined2: String = ext2.value.general_names.iter().map(|g| format!("{g:?}")).collect::<Vec<_>>().join(" ");
+    assert!(!joined2.contains("IPAddress"), "a peer certificate does not need, and should not carry, IP SANs: {joined2}");
+}

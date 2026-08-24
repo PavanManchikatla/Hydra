@@ -103,6 +103,11 @@ impl PairingSession {
     }
 
     /// The CA certificate a device must trust. **The CA *key* has no accessor, here or anywhere.**
+    /// The CA certificate as PEM — the form `curl --cacert` and most SDKs accept.
+    pub fn ca_cert_pem(&self) -> String {
+        self.ca.ca_cert_pem()
+    }
+
     pub fn ca_cert_der(&self) -> Vec<u8> {
         self.ca.ca_cert_der().to_vec()
     }

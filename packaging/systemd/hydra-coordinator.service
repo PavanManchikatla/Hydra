@@ -1,0 +1,49 @@
+# Hydra coordinator (Linux, systemd).
+#
+# Install:
+#   sudo cp hydra-coordinator.service /etc/systemd/system/
+#   sudo systemctl edit hydra-coordinator      # set HYDRA_API_TOKEN, see below
+#   sudo systemctl enable --now hydra-coordinator
+#
+# The API token is NOT in this file on purpose. Put it in an override with mode 0600:
+#   [Service]
+#   Environment=HYDRA_API_TOKEN=...
+# so it is not world-readable in /etc/systemd/system.
+
+[Unit]
+Description=Hydra coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hydra
+Group=hydra
+ExecStart=/usr/local/bin/hydra-coordinator --api-addr 127.0.0.1:8443 --data-dir /var/lib/hydra
+Restart=on-failure
+RestartSec=5
+
+# The coordinator holds the cluster CA private key and the session ledger. Everything below is
+# about keeping those where they belong.
+UMask=0077
+StateDirectory=hydra
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hydra
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# ^ the inference engine JITs on some backends; denying W^X breaks it. Left off deliberately and
+#   noted rather than silently omitted.
+
+# Loopback by default. Binding to a LAN address is a decision, not a default: the API carries the
+# bearer token and user prompts, and it refuses a wildcard bind outright.
+[Install]
+WantedBy=multi-user.target

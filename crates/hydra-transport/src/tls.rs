@@ -178,6 +178,14 @@ impl ClusterCa {
         let mut c = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(dir.join("cluster-ca.der"))?;
         c.write_all(self.ca_cert.der())?;
         c.sync_all()?;
+        // **And a PEM, because that is what clients actually consume.** `curl --cacert` refuses a
+        // DER file outright (`error setting certificate file`), and so do most SDKs. Writing only
+        // the DER made the documented quickstart fail at its last step — found by running it.
+        // The CA certificate is public, so this one is 0644: a trust anchor nobody can read is not
+        // a trust anchor.
+        let mut p = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(dir.join("cluster-ca.pem"))?;
+        p.write_all(self.ca_cert.pem().as_bytes())?;
+        p.sync_all()?;
         Ok(())
     }
 
@@ -198,16 +206,41 @@ impl ClusterCa {
         Ok(ClusterCa { ca_cert, ca_key })
     }
 
+    /// The CA certificate as PEM (the form clients consume).
+    pub fn ca_cert_pem(&self) -> String {
+        self.ca_cert.pem()
+    }
+
     /// The CA's own certificate (the trust anchor to distribute at pairing).
     pub fn ca_cert_der(&self) -> CertificateDer<'static> {
         self.ca_cert.der().clone()
     }
 
+    /// **Issue the coordinator's API certificate, with SANs for the addresses clients dial.**
+    ///
+    /// [`Self::issue`] gives a certificate whose only SAN is `DNS:<name>` — right for cluster
+    /// peers, which dial each other by device name, and **wrong for the client API**, which people
+    /// reach at `127.0.0.1` or a LAN address. Found by running the documented quickstart: TLS
+    /// failed with *"no alternative certificate subject name matches target host name"*, because a
+    /// certificate for `coordinator` says nothing about `127.0.0.1`.
+    ///
+    /// `extra_sans` are the names and IPs this endpoint will be reached at. `rcgen` turns anything
+    /// that parses as an IP address into an IP SAN and everything else into a DNS SAN.
+    pub fn issue_api(&self, name: &str, extra_sans: &[String]) -> Result<DeviceIdentity, TransportError> {
+        let mut sans: Vec<String> = vec![name.to_string()];
+        sans.extend(extra_sans.iter().cloned());
+        self.issue_with_sans(name, sans)
+    }
+
     /// Issue a device identity with `name` as its DNS SAN + CN, usable for both client and
     /// server auth.
     pub fn issue(&self, name: &str) -> Result<DeviceIdentity, TransportError> {
+        self.issue_with_sans(name, vec![name.to_string()])
+    }
+
+    fn issue_with_sans(&self, name: &str, sans: Vec<String>) -> Result<DeviceIdentity, TransportError> {
         let key = KeyPair::generate().map_err(cert_err)?;
-        let mut params = CertificateParams::new(vec![name.to_string()]).map_err(cert_err)?;
+        let mut params = CertificateParams::new(sans).map_err(cert_err)?;
         params.distinguished_name.push(DnType::CommonName, name);
         // **Audit M3 — leaves expire.** `rcgen`'s defaults are 1975 → 4096, so a device key leaked
         // through H17's 0644 bootstrap file stayed valid **forever**, and with no CRL and no

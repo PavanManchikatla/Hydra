@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hydra coordinator (macOS, launchd).
+
+    cp com.hydra.coordinator.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.hydra.coordinator.plist
+
+  HYDRA_API_TOKEN is deliberately absent: put it in the keychain or a 0600 env file and reference
+  it, rather than committing a secret to a plist that is world-readable by default.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hydra.coordinator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/hydra-coordinator</string>
+    <string>--api-addr</string><string>127.0.0.1:8443</string>
+    <string>--data-dir</string><string>/usr/local/var/hydra</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardErrorPath</key><string>/usr/local/var/log/hydra-coordinator.err</string>
+  <key>StandardOutPath</key><string>/usr/local/var/log/hydra-coordinator.out</string>
+</dict>
+</plist>

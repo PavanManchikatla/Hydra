@@ -57,10 +57,21 @@ fn main() -> Result<(), String> {
     // real material, because a coordinator that silently invents its own trust anchor is exactly
     // the C1 shape (a self-attestation presented as verification).
     let dev = args.iter().any(|a| a == "--dev");
-    let boot_path = if dev { String::from("--dev") } else {
-        flag("--ca-cert").ok_or(
-            "supply --ca-cert/--cert/--key (DER), or --dev for a throwaway single-machine identity.              A coordinator does not invent its own trust anchor (audit C1's shape)",
-        )?
+    // **The normal path: use the material `hydra-cli pair` wrote.**
+    //
+    // Found by RUNNING the documented quickstart: `--dev` mints its OWN throwaway CA, unrelated to
+    // the one pairing just created — so a client trusting the paired CA could not connect and the
+    // quickstart's last step failed. A coordinator started after pairing must use the paired
+    // cluster's identity, or the pairing meant nothing.
+    let boot_path = if let Some(dir) = flag("--pairing-dir") {
+        dir
+    } else if dev {
+        String::from("--dev")
+    } else {
+        return Err("supply --pairing-dir <dir> (what `hydra-cli pair --out <dir>` wrote), or --dev \
+                    for a throwaway single-machine identity. A coordinator does not invent its own \
+                    trust anchor (audit C1's shape)"
+            .into());
     };
 
     // The API token is REQUIRED and must be non-empty (audit H15). Reading it from the environment
@@ -68,7 +79,7 @@ fn main() -> Result<(), String> {
     let token = std::env::var("HYDRA_API_TOKEN")
         .map_err(|_| "HYDRA_API_TOKEN must be set: the API requires a bearer token even on a trusted LAN (audit H15)".to_string())?;
 
-    let boot = identity_from_flags(&boot_path, flag("--ca-cert"), flag("--cert"), flag("--key"))?;
+    let boot = identity_from_flags(&boot_path, api_addr)?;
 
     // **Audit M12 — the session identity is minted here, from the system CSPRNG.**
     let fence = hydra_wire::SessionFence::mint(boot.cluster_id, boot.manifest_hash, boot.model_instance_id);
@@ -148,27 +159,31 @@ struct Boot {
 /// anything else**, which is why it has to be asked for by name. Otherwise the DER files are read
 /// as given. The cluster/manifest/model ids are dev constants in this seam; they become the paired
 /// cluster's real values in M4·2.
-fn identity_from_flags(
-    mode: &str,
-    ca_cert: Option<String>,
-    cert: Option<String>,
-    key: Option<String>,
-) -> Result<Boot, String> {
+fn identity_from_flags(mode: &str, api_addr: SocketAddr) -> Result<Boot, String> {
+    // The API certificate must name the addresses clients dial, not just the device. Loopback is
+    // always included because that is where a first run happens; the bind address is included
+    // because that is where everyone else reaches it.
+    let sans: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        api_addr.ip().to_string(),
+    ];
     let identity = if mode == "--dev" {
         eprintln!("hydra-coordinator: --dev — minting a THROWAWAY cluster CA. Never use this off one machine.");
+        eprintln!("hydra-coordinator: a client cannot pre-trust this CA; pair first and use --pairing-dir for anything real.");
         let ca = hydra_transport::ClusterCa::new().map_err(|e| format!("dev ca: {e}"))?;
-        ca.issue("coordinator").map_err(|e| format!("dev identity: {e}"))?
+        ca.issue_api("coordinator", &sans).map_err(|e| format!("dev identity: {e}"))?
     } else {
-        let (Some(_ca), Some(cert), Some(key)) = (ca_cert, cert, key) else {
-            return Err("--ca-cert, --cert and --key must all be supplied together".into());
-        };
-        let cert_der = std::fs::read(&cert).map_err(|e| format!("read {cert}: {e}"))?;
-        let key_der = std::fs::read(&key).map_err(|e| format!("read {key}: {e}"))?;
-        hydra_transport::DeviceIdentity::from_der(
-            "coordinator".to_string(),
-            vec![hydra_transport::CertificateDer::from(cert_der)],
-            key_der,
-        )
+        // Load the CA this cluster was paired with and issue this run's leaf from it. The leaf is
+        // short-lived by design (audit M3); the CA certificate is stable, so a client that trusted
+        // it once keeps trusting the cluster across restarts.
+        let dir = std::path::Path::new(mode).join("coordinator");
+        let ca = hydra_transport::ClusterCa::load_private(&dir).map_err(|e| {
+            format!("load the paired cluster CA from {}: {e}. Run `hydra-cli pair --out <dir>` first", dir.display())
+        })?;
+        eprintln!("hydra-coordinator: using the paired cluster CA from {}", dir.display());
+        ca.issue_api("coordinator", &sans).map_err(|e| format!("issue coordinator identity: {e}"))?
     };
     Ok(Boot {
         cluster_id: [0x11; 16],
