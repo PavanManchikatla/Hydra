@@ -70,11 +70,29 @@ fn main() {
     // whole run; `--replay` restores it.
     std::panic::set_hook(Box::new(|_| {}));
 
-    let per_target = Duration::from_secs_f64(seconds / targets.len() as f64);
+    // **Unavailable targets are reported, not run, and never share the budget.**
+    // Giving a no-op target 1/8th of the CPU-seconds spent them on nothing while the receipt
+    // counted them toward the 24-CPU-hour DoD. The runnable targets now split the whole budget,
+    // so a leg's cpu_seconds is time spent on parsers that were actually driven.
+    let (runnable, unavailable): (Vec<hydra_fuzz::Target>, Vec<hydra_fuzz::Target>) =
+        targets.iter().copied().partition(|t| t.unavailable_reason().is_none());
+
+    for t in &unavailable {
+        // Printed with the same shape as a real result so the log is greppable, but the verdict is
+        // UNAVAILABLE — never GREEN. A receipt that quotes this line states a gap; one that quoted
+        // the old GREEN stated a guarantee that did not exist.
+        println!(
+            "target={} seed={seed} iterations=0 cpu_seconds=0.0 crashes=0 verdict=UNAVAILABLE reason={:?}",
+            t.name(),
+            t.unavailable_reason().unwrap()
+        );
+    }
+
+    let per_target = Duration::from_secs_f64(seconds / runnable.len().max(1) as f64);
     let mut total_crashes = 0usize;
     let mut total_cpu = 0.0f64;
 
-    for t in &targets {
+    for t in &runnable {
         let start = Instant::now();
         let mut iterations = 0u64;
         let mut crashes: Vec<hydra_fuzz::Crash> = Vec::new();
@@ -117,9 +135,12 @@ fn main() {
         );
     }
 
+    // `targets=` counts what was actually DRIVEN; `unavailable=` names the rest explicitly, so the
+    // summary can never imply coverage it does not have by omitting the difference.
     println!(
-        "FUZZ SUMMARY targets={} cpu_seconds={total_cpu:.1} crashes={total_crashes} verdict={}",
-        targets.len(),
+        "FUZZ SUMMARY targets={} unavailable={} cpu_seconds={total_cpu:.1} crashes={total_crashes} verdict={}",
+        runnable.len(),
+        unavailable.len(),
         if total_crashes == 0 { "GREEN" } else { "RED" }
     );
     // Restore the hook before exiting so any later panic is visible.

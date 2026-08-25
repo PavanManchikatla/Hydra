@@ -107,14 +107,31 @@ jobs:
           # status is UNAVAILABLE, not green, and the receipts must say which parser they protect.
           for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
+            # A REQUIRED target must have been DRIVEN, not merely mentioned. Until 2026-08-24 the
+            # driver printed verdict=GREEN for a target it had skipped entirely, so "reported" and
+            # "ran" were not the same claim and nothing here could tell them apart.
+            grep -qE "^target=$t .*verdict=UNAVAILABLE" "$LOG" && {
+              echo "verdict=INCONCLUSIVE (required target $t reported UNAVAILABLE — it was not driven)"; exit 1; }
           done
+          # `vendored-gguf` is EXPECTED to be unavailable here (audit L1). Assert that it says so
+          # rather than trusting it to: if it ever prints GREEN in CI, either the engine got built
+          # (good — promote it to the required list) or the target went back to claiming a green it
+          # did not earn (the §7.62 defect). Both need a human, so both stop the run.
+          if grep -qE "^target=vendored-gguf .*verdict=GREEN" "$LOG"; then
+            echo "verdict=INCONCLUSIVE (vendored-gguf reported GREEN in CI, where the engine is not built —"
+            echo "  either L1 is fixed and this target should be REQUIRED, or it is claiming an unearned green)"
+            exit 1
+          fi
           if grep -qE '^CRASH ' "$LOG"; then
             echo "verdict=RED (parser crash — replay coordinates are in the CRASH lines above)"
             exit 1
           fi
           grep '^FUZZ SUMMARY' "$LOG" | grep -q 'verdict=GREEN' || {
             echo "verdict=RED (summary is not GREEN)"; exit 1; }
+          # The summary now carries `unavailable=N`, so the quoted line states its own gap.
           echo "verdict=GREEN ($(grep '^FUZZ SUMMARY' "$LOG"))"
+          echo "--- coverage note for the receipt (Wave-3 directive: say which parser is protected) ---"
+          grep -E "^target=.*verdict=UNAVAILABLE" "$LOG" || echo "(every configured target was driven)"
 
       - name: Upload the shard log (the receipt's raw source)
         if: always()

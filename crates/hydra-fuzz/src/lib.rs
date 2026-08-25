@@ -161,6 +161,33 @@ impl Target {
     pub fn parse(name: &str) -> Option<Target> {
         Target::ALL.into_iter().find(|t| t.name() == name)
     }
+
+    /// **Why this target cannot do its job in THIS build, if it cannot.**
+    ///
+    /// A target structurally unable to exercise the parser it names must **say so**, not report
+    /// `verdict=GREEN`. `vendored-gguf` exists to drive `gguf_init_from_file` inside llama.cpp;
+    /// when the engine is stubbed it runs the **hardened Rust** parser (which the `gguf` target
+    /// already covers) and then does nothing — yet the driver counted its iterations and printed
+    /// GREEN, because the verdict was "no crashes" and a no-op never crashes.
+    ///
+    /// **In CI that green was structural**: audit L1 means CI never builds the real engine, so
+    /// every fuzz leg ever run printed `target=vendored-gguf ... verdict=GREEN` for ~100M
+    /// iterations of a parser it never called, and spent an eighth of the CPU-hour budget doing
+    /// it. PROJECT_STATE said its CI status is "unavailable, never green" — but the LOG said
+    /// GREEN, and rule 16 makes the log the thing a receipt quotes. The record's intent was
+    /// right; the code did not implement it.
+    ///
+    /// §7.31 in the evidence layer — *a test whose name promises more than its assertion is worse
+    /// than no test, because it terminates inquiry* — and rule 19's blind oracle: it could not
+    /// produce the failure it guards.
+    pub fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Target::VendoredGguf if !hydra_engine_sys::ENGINE_AVAILABLE => Some(
+                "engine not linked (audit L1): gguf_init_from_file is never invoked, so this target proves nothing",
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// A case that crashed, carrying everything needed to replay it.
