@@ -455,8 +455,12 @@ pub async fn time_generation_pipeline(
     prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
     let mut per_token = Vec::with_capacity(n_steps);
-    let mut input_pos = prompt_tokens.len() as i64;
+    // DERIVED from `step`, not carried in a mutable counter. The two were always equal, but as a
+    // counter the equality was an invariant somebody had to maintain — one early `continue` and the
+    // position silently desynchronises from the step. As an expression it cannot drift.
+    let first_input_pos = prompt_tokens.len() as i64;
     for step in 0..n_steps {
+        let input_pos = first_input_pos + step as i64;
         let t0 = std::time::Instant::now();
 
         c2.send(0, &wire::encode_sample_next(fence, 0, step as i64, &cfg_hash, INITIAL_CHECKPOINT_ID))
@@ -475,7 +479,6 @@ pub async fn time_generation_pipeline(
         let boundary = expect_fwd(&mut c1, fence, input_pos).await?;
         c2.send(0, &wire::encode_fwd(fence, 0, input_pos, false, &boundary)).await.map_err(|e| format!("feedback s2: {e}"))?;
         expect_applied_ack(&mut c2, fence).await?;
-        input_pos += 1;
 
         per_token.push(t0.elapsed());
     }

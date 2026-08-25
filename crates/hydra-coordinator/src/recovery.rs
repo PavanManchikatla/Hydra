@@ -187,7 +187,13 @@ pub fn verify(path: impl AsRef<std::path::Path>) -> Result<CommitStreamStats, Re
     let positions: Vec<i64> = state.generated_tokens.iter().map(|&(p, _)| p).collect();
     let strictly_increasing = positions.windows(2).all(|w| w[0] < w[1]);
     Ok(CommitStreamStats {
-        generation_commits: 0_usize.max(state.last_commit_id as usize),
+        // `last_commit_id` is a `u64`, so the old `0_usize.max(..)` here was a genuine no-op —
+        // and worse, it *read* as a guard against a negative count while guarding nothing. The
+        // hazard it gestured at is real but different: `u64 as usize` TRUNCATES silently on a
+        // 32-bit target. `try_from` is the project's standing answer to an unproven narrowing
+        // (Wave 1c applied it to every network-derived position); this value is read off the disk,
+        // which rule 17 counts as untrusted input for exactly the same reason.
+        generation_commits: usize::try_from(state.last_commit_id).unwrap_or(usize::MAX),
         committed_positions: positions.len(),
         max_position: positions.last().copied().unwrap_or(-1),
         positions_strictly_increasing: strictly_increasing,

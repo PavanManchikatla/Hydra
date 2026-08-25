@@ -260,11 +260,11 @@ fn unsplit_greedy(model: &str, prompt: &[u32], n: usize, n_ctx: i32) -> Vec<u32>
     }
     let argmax = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
     let mut out = Vec::with_capacity(n);
-    let mut pos = prompt.len();
-    for _ in 0..n {
+    // Same as `three_node.rs`: derived, not carried (see the note there).
+    for step in 0..n {
+        let pos = prompt.len() + step;
         out.push(argmax(&ctx.logits(0).expect("logits")));
         ctx.apply_tokens(&[*out.last().unwrap() as i32], pos as i32, None).expect("feedback");
-        pos += 1;
     }
     out
 }

@@ -67,13 +67,14 @@ fn unsplit_greedy(model: &str, prompt: &[u32], n: usize, n_ctx: i32) -> Vec<u32>
         ctx.apply_tokens(&[t as i32], pos as i32, None).expect("prefill");
     }
     let mut out = Vec::with_capacity(n);
-    let mut pos = prompt.len();
-    for _ in 0..n {
+    // `pos` derived from the step rather than carried: it was always `prompt.len() + step`, and in
+    // a GOLDEN generator an invariant that has to be maintained is one that can be broken.
+    for step in 0..n {
+        let pos = prompt.len() + step;
         let logits = ctx.logits(0).expect("logits");
         let tok = argmax(&logits);
         out.push(tok);
         ctx.apply_tokens(&[tok as i32], pos as i32, None).expect("feedback");
-        pos += 1;
     }
     out
 }
