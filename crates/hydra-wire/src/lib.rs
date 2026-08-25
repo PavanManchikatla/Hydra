@@ -730,29 +730,34 @@ pub fn encode_activation_committed(fence: &SessionFence, t: &ActivationTuple, st
     finish_frame(&mut fbb, fence, proto::Body::ActivationCommitted, body.as_union_value())
 }
 
+/// Finalize carrying the tuple's own completion evidence, with `completion_id = 0`.
+///
+/// **⚑ THIS USED TO WRITE `[0; 32]`, AND DELETING THE ROLLOUT ALLOWANCE IS WHAT EXPOSED IT
+/// (M4 gate seam, 2026-08-25).** `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` made an all-zero hash a valid
+/// finalize, so this encoder produced frames the stage accepted **without ever carrying evidence**.
+/// The shipping coordinator (`hydra_coordinator::driver`) was already on
+/// [`encode_finalize_activation_with_evidence`] — but `hydra-worker::pair` and the three
+/// demo/CI binaries (`hydra-wan`, `hydra-2node-ci`, `hydra-3node-kill`) were **not**, so the
+/// allowance was load-bearing for the project's own harnesses, `container-2node` included.
+///
+/// **The §8 row called itself a one-line deletion notice; it was not.** Removing the allowance
+/// without this would have turned the CI verifier red for a reason having nothing to do with
+/// rollout compatibility.
+///
+/// Fixing the encoder rather than its thirteen call sites means **no caller can now emit a finalize
+/// the stage will refuse for want of evidence**. Callers that must name a *specific* durable
+/// `ACTIVATION_COMPLETE` record still use [`encode_finalize_activation_with_evidence`].
 pub fn encode_finalize_activation(fence: &SessionFence, t: &ActivationTuple, stage_generation: u64) -> Vec<u8> {
-    let mut fbb = FlatBufferBuilder::new();
-    let fence = build_fence(
-        &mut fbb,
-        fence,
-        FenceView { epoch: t.epoch, recovery_id: t.recovery_id, activation_attempt_id: t.attempt, stage_generation },
-    );
-    let tuple = build_tuple(&mut fbb, t, stage_generation);
-    let complete_record_hash = fbb.create_vector(&[0u8; HASH_LEN]);
-    let body = proto::FinalizeActivation::create(
-        &mut fbb,
-        &proto::FinalizeActivationArgs { completion_id: 0, tuple: Some(tuple), complete_record_hash: Some(complete_record_hash) },
-    );
-    finish_frame(&mut fbb, fence, proto::Body::FinalizeActivation, body.as_union_value())
+    encode_finalize_activation_with_evidence(fence, t, stage_generation, 0, &t.completion_hash())
 }
 
 /// **Audit H2 — `FINALIZE_ACTIVATION` carrying its completion evidence.**
 ///
-/// [`encode_finalize_activation`] writes `completion_id = 0` and a zero `complete_record_hash`,
-/// which was harmless only because **nothing produced real ones**: there was no coordinator writing
-/// an `ACTIVATION_COMPLETE` record for them to refer to, so the stage had nothing to compare them
-/// against and dropped them at decode. With the M4·0 driver both exist, and this is the encoder
-/// that carries them.
+/// [`encode_finalize_activation`] used to write `completion_id = 0` and a **zero**
+/// `complete_record_hash`, which was harmless only because nothing produced real ones and the
+/// rollout allowance accepted zeros. With the M4·0 driver both exist, and this is the encoder that
+/// carries a **specific** durable `ACTIVATION_COMPLETE` record's id and hash. (As of 2026-08-25 the
+/// plain encoder delegates here with the tuple's own hash, so neither can emit unevidenced frames.)
 pub fn encode_finalize_activation_with_evidence(
     fence: &SessionFence,
     t: &ActivationTuple,

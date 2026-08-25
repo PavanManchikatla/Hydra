@@ -45,7 +45,9 @@ fn preactive_stage_reverts_on_begin_recovery() {
 fn case_b_prime_completed_is_locally_decidable() {
     let mut s = Stage::frozen_ready(0, 1, 0);
     step_ok(&mut s, RecvCommit { tuple: tuple(1, 1) });
-    step_ok(&mut s, RecvFinalize { epoch: 1, attempt: 1, completion_id: 0, complete_record_hash: [0u8; 32] }); // ACTIVE_FINAL with evidence
+    // Real evidence — the comment already said "with evidence" while passing zeros, which the
+    // rollout allowance quietly accepted (same class as `stage.rs`'s happy path; swept per rule 17).
+    step_ok(&mut s, RecvFinalize { epoch: 1, attempt: 1, completion_id: 0, complete_record_hash: tuple(1, 1).completion_hash() }); // ACTIVE_FINAL with evidence
     let e = s.step(RecvBegin { base: 0, target: 1, recovery_id: 0, truncate_to: 0, n_ctx: 64 });
     assert!(matches!(e[0], StageEffect::RecoveryCompleted { target: 1, .. }));
 }

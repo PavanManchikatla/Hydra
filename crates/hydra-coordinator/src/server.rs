@@ -325,6 +325,20 @@ impl AppState {
     }
 }
 
+/// **The maximum accepted request body (§8 pre-release triage, 2026-08-25).**
+///
+/// `axum` already applies a 2 MiB `DefaultBodyLimit` to its `Json` extractor, so the surface was
+/// never actually unbounded — but the §8 item said "no request-size limit", and **an unstated
+/// framework default is not a decision this project made**. It is a number that lives in a
+/// dependency's changelog, invisible in review, and free to move under a version bump. §7.61 is
+/// the precedent: "clippy clean" was true only against a toolchain nobody had named.
+///
+/// So the limit is stated here, owned here, and asserted by
+/// `session_http.rs::a_body_over_the_limit_is_refused_before_it_is_parsed`. **A chat request is
+/// prompts and parameters — 1 MiB is generous for that and small enough that a hostile caller
+/// holding a valid token cannot make the coordinator buffer arbitrary memory.**
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -332,6 +346,11 @@ pub fn router(state: AppState) -> Router {
         // Same router, same `ApiAuth`, same TLS. A status page reachable without the token would
         // be a second, weaker front door to a user's session state.
         .route("/dashboard", axum::routing::get(dashboard))
+        // Applied to the whole router, so a route added later inherits it instead of quietly
+        // opting out of it.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Applied to the whole router, so a route added later inherits it instead of quietly
+        // opting out of it.
         .with_state(state)
 }
 

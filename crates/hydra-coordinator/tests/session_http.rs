@@ -644,3 +644,51 @@ async fn the_dashboard_requires_the_same_bearer_token_as_the_api() {
     let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(body.contains("Read-only"), "and it states the v1 constraint in the UI");
 }
+
+/// **§8 pre-release triage (2026-08-25): the request-body limit is the PROJECT's number, and this
+/// is the oracle that says so.**
+///
+/// The §8 item read *"no rate limiting and no request-size limit — a caller holding a valid token
+/// can submit an arbitrarily large body"*. Half of that was already false: `axum`'s `Json`
+/// extractor carries a 2 MiB `DefaultBodyLimit`. **But nothing in this repo said so, nothing tested
+/// it, and it is a number living in a dependency's changelog** — free to move under a version bump
+/// with no review anywhere. That is §7.61's shape exactly ("clippy clean" was true only against an
+/// unnamed toolchain), and §7.60's ("a fact about the tree living in a second place nobody updates").
+///
+/// So `MAX_REQUEST_BODY_BYTES` is now stated in `server.rs` and applied as a router-wide layer —
+/// router-wide so a route added tomorrow inherits it rather than silently opting out — and this
+/// test is what keeps the constant honest.
+///
+/// **Rule 19 — what this oracle CAN produce:** an over-limit body being refused *before* it is
+/// parsed. **What it cannot see:** how many such requests one caller may send. Rate limiting is a
+/// separate, still-open §8 item, deliberately not conflated with this one.
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_before_it_is_parsed() {
+    let app = make_app(Arc::new(AtomicUsize::new(0)));
+
+    // Just over the limit, and deliberately VALID JSON: if the refusal came from the parser rather
+    // than the limit, this body would have been accepted, and the test would prove nothing.
+    let filler = "x".repeat(hydra_coordinator::MAX_REQUEST_BODY_BYTES + 1);
+    let oversized = format!(
+        r#"{{"model":"m","messages":[{{"role":"user","content":"{filler}"}}]}}"#
+    );
+    assert!(oversized.len() > hydra_coordinator::MAX_REQUEST_BODY_BYTES, "the case must exceed the limit");
+
+    let (status, _body) = post_raw(&app, &with_auth(&[("content-type", "application/json")]), &oversized).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body over MAX_REQUEST_BODY_BYTES must be refused with 413, not buffered and parsed"
+    );
+
+    // The control: the SAME shape, comfortably under the limit, is accepted. Without it, a router
+    // that refused everything would pass the assertion above — the enshrining-control defect of
+    // §7.37 in reverse.
+    let small = r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
+    let (status, _) = post_raw(&app, &with_auth(&[("content-type", "application/json")]), small).await;
+    assert_ne!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a normal-sized request must not be caught by the limit"
+    );
+}

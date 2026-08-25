@@ -31,7 +31,11 @@ fn commit_then_finalize_reaches_active_final() {
     let e = step_ok(&mut s, RecvCommit { tuple: tuple(1) });
     assert_eq!(s.state(), StageState::Preactive);
     assert!(matches!(e[0], StageEffect::Committed { attempt: 1, .. }));
-    let e = step_ok(&mut s, RecvFinalize { epoch: 0, attempt: 1, completion_id: 0, complete_record_hash: [0u8; 32] });
+    // Real evidence, not zeros. Until 2026-08-25 this line passed `[0u8; 32]` and relied on the
+    // rollout allowance — so the project's canonical "activation succeeds" test **never once
+    // supplied genuine completion evidence**, and would have gone on passing had the evidence check
+    // been broken entirely. The deletion of the allowance is what surfaced it.
+    let e = step_ok(&mut s, RecvFinalize { epoch: 0, attempt: 1, completion_id: 0, complete_record_hash: tuple(1).completion_hash() });
     assert_eq!(s.state(), StageState::ActiveFinal);
     assert!(s.holds_final_evidence());
     assert!(matches!(e[0], StageEffect::Finalized { attempt: 1, .. }));
@@ -187,17 +191,21 @@ fn mut3_stale_commit_regression_is_caught_by_checker() {
 ///
 /// # Why this test exists specifically to bound the rollout allowance
 ///
-/// `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` lets an all-zero hash through, so a mixed-version cluster
-/// can finish a rollout. The risk in any such allowance is that it quietly widens: someone reads
-/// "the hash is not always checked" and concludes the check is advisory. It is not. A **non-zero**
-/// hash that does not match the tuple this stage is PREACTIVE on is refused, and the stage stays
-/// PREACTIVE rather than becoming serviceable on evidence about some other activation.
+/// **The rollout allowance is gone as of the M4 gate seam (2026-08-25), and this test is where that
+/// is proven.** `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` used to let an all-zero hash through so a
+/// mixed-version cluster could finish a rollout — which meant an all-zero hash was a valid finalize
+/// from any peer the role gate admits, i.e. most of what H2 closed. Its unblocking condition ("no
+/// peer predates H2") is satisfied now that M4·3 pins a single build, so it was deleted outright.
+///
+/// The test therefore asserts **two** refusals, not one: a **non-zero** hash naming a different
+/// activation (which the allowance never covered), and the **all-zero** hash (which it did). The
+/// second assertion is the one that would have been impossible to write while the constant stood —
+/// rule 19: the oracle now produces the failure the deletion was for.
 ///
 /// The case is a legitimate coordinator's **stale** finalize — matching epoch, matching attempt,
 /// different tuple — which is exactly what the dropped fields left open.
 #[test]
 fn a_finalize_whose_evidence_names_a_different_activation_is_refused() {
-    use hydra_state::stage::ACCEPT_LEGACY_ZERO_COMPLETION_HASH;
     use hydra_state::{ActivationKind, ActivationTuple};
 
     let mut s = Stage::frozen_ready(0, 0, 0);
@@ -228,12 +236,36 @@ fn a_finalize_whose_evidence_names_a_different_activation_is_refused() {
     assert_eq!(s.state(), StageState::ActiveFinal);
     assert_eq!(s.completion_id(), 5, "and the completion id is adopted (spec §6.6 step 4)");
 
-    // The allowance is exactly one value, and it is dated. Asserted as a runtime comparison so the
-    // compiler does not fold it away: when the constant goes `false` this test fails and tells the
-    // next reader to delete the §8 v1-blocking row and this block together.
-    assert_eq!(
-        ACCEPT_LEGACY_ZERO_COMPLETION_HASH,
-        std::hint::black_box(true),
-        "the zero-hash rollout allowance is now off — delete the §8 v1-blocking row and this assertion"
+}
+
+/// **The all-zero `complete_record_hash` is refused (M4 gate seam, 2026-08-25 — the §8 v1-blocker).**
+///
+/// This assertion could not exist before the deletion: `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` made
+/// `[0; 32]` a *valid* finalize, so the exact case H2 was about was the one case the suite was
+/// structurally unable to refuse. That is rule 19's shape — an oracle blinded by a deliberate
+/// allowance — and this test is the driver that closes it.
+#[test]
+fn an_all_zero_completion_hash_is_refused_now_that_the_rollout_allowance_is_gone() {
+    use hydra_state::{ActivationKind, ActivationTuple};
+
+    let mut s = Stage::frozen_ready(0, 0, 0);
+    let tuple = ActivationTuple { kind: ActivationKind::Initial, epoch: 0, recovery_id: 0, attempt: 1, sampler_checkpoint_id: 7 };
+    step_ok(&mut s, RecvCommit { tuple: tuple.clone() });
+    assert_eq!(s.state(), StageState::Preactive);
+
+    // Everything else about this frame is legitimate — right epoch, right attempt — so the ONLY
+    // thing that can refuse it is the evidence check itself.
+    let effects = s.step(RecvFinalize { epoch: 0, attempt: 1, completion_id: 5, complete_record_hash: [0u8; 32] });
+    assert!(
+        matches!(effects[..], [StageEffect::Refused { code: RefusalCode::Fenced, .. }]),
+        "an all-zero completion hash must be refused like any other mismatch: {effects:?}"
     );
+    assert_eq!(s.state(), StageState::Preactive, "and the stage must NOT become serviceable on it");
+    assert!(!s.holds_final_evidence());
+
+    // Control: the correct evidence still finalizes, so the refusal above is about the VALUE and
+    // not about the stage having been left in some unfinalizable state.
+    let effects = s.step(RecvFinalize { epoch: 0, attempt: 1, completion_id: 5, complete_record_hash: tuple.completion_hash() });
+    assert_eq!(effects.len(), 1, "the correct evidence still finalizes");
+    assert_eq!(s.state(), StageState::ActiveFinal);
 }
