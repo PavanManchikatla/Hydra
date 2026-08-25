@@ -58,7 +58,31 @@
 
 > **⏳ IN FLIGHT. Read this before treating any local artifact as a result.**
 >
-> **No local background job is running at close.** Local == remote. The tracked tree is clean
+> **Refreshed 2026-08-25 at session close.** **No local background job is running.** Local == remote
+> at `303f729`. **All CI is green and OBSERVED, not assumed:** `container-2node`
+> `verdict=GREEN` on both arms (plain + `tc netem` jitter) on the commit that deletes the v1
+> blocker; `clean-checkout`, `TLC` and `DST Marathon` green on `HEAD`; fuzz leg 4 banked.
+>
+> **⏸️ THE M4 GATE IS ASSEMBLED AND PAUSED FOR THE OWNER** — `verification/M4-GATE.md`, with
+> `verification/M4-PRERELEASE-TRIAGE.md` beside it. **A fresh session should not resume by starting
+> new milestone work**; the four owner decisions are listed at the end of §0(c). What an agent *can*
+> do meanwhile: the normalise-before-validate sweep, the three rule-19 oracle gaps, and re-running
+> the engine suite at `n_gpu_layers: 99` (the CPU-only-evidence check — cheap, and the gate asks for
+> a ruling on it).
+>
+> **⚑ TOOLCHAIN, because "clippy clean" is a claim about a version (§7.61):** the default here is
+> `rustc 1.93.1`; **CI's stable is `1.98.0` and is stricter**. `1.98.0` is installed as a NAMED,
+> NON-DEFAULT toolchain — run `cargo +1.98.0 clippy --workspace --all-targets -- -D warnings`
+> before pushing. **And full-suite logs MUST separate stdout from stderr** (`> out 2> err`, never
+> `2>&1`): Metal's teardown corrupts `libtest` result lines when merged, silently dropping suites
+> from any count taken off the log.
+>
+> **⚑ THE ENGINE-STUB ARM IS NOW TESTABLE LOCALLY:** `HYDRA_FORCE_ENGINE_STUB=1` builds the
+> clean-checkout configuration in one command. **Use it before pushing anything that touches a
+> crate boundary** — this configuration is what every machine except this one gets, and for 28
+> hours it did not compile (§7.60).
+>
+> *(Prior text:)* **No local background job is running at close.** Local == remote. The tracked tree is clean
 > **except `vendor/llama.cpp`, which is expected to show as dirty and must not be "cleaned"**:
 > `git status` reports `modified content` because the layer-window patch is applied **in place** in
 > the vendored working tree — exactly the seven files listed in (1) of §0(c). Reverting them
