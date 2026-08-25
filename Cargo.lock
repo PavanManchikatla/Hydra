@@ -427,6 +427,7 @@ dependencies = [
  "hydra-modelsvc",
  "hydra-proto",
  "hydra-wal",
+ "hydra-wire",
  "hydra-worker",
 ]
 

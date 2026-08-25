@@ -417,11 +417,29 @@ mod imp {
     pub struct Model;
     pub struct Context<'m>(std::marker::PhantomData<&'m ()>);
 
-    impl Model {
-        pub fn gguf_probe(_path: &str) -> Result<bool, EngineError> {
-            Err(EngineError::unavailable())
-        }
+    // The real arm's `Model` and `Context` own C handles and free them on drop. The stub owns
+    // nothing, but it must still be *substitutable* for the real type, and `Drop` is part of a
+    // type's observable shape: without these, callers' deliberate `drop(ctx)` — the RSS discipline
+    // the shard-load and bit-exact tests depend on — trips `clippy::drop_non_drop` under the stub
+    // and is clean under the real engine. Same class as the `gguf_probe` re-export break: a stub
+    // that differs structurally from what it stands in for fails only on the machines that use it.
+    impl Drop for Model {
+        fn drop(&mut self) {}
+    }
+    impl Drop for Context<'_> {
+        fn drop(&mut self) {}
+    }
 
+    /// Stub twin of the real `imp::gguf_probe`. **It must be a FREE function, exactly as the
+    /// real arm is** — `pub use imp::{gguf_probe, ..}` below resolves against this module, not
+    /// against `Model`. When this lived inside `impl Model` the re-export did not resolve and the
+    /// whole workspace failed to compile on any machine without a built, patched `vendor/llama.cpp`
+    /// — which is every machine except the developer's and is what a clean checkout gets.
+    pub fn gguf_probe(_path: &str) -> Result<bool, EngineError> {
+        Err(EngineError::unavailable())
+    }
+
+    impl Model {
         pub fn load(_path: &str, _n_gpu_layers: i32) -> Result<Model, EngineError> {
             Err(EngineError::unavailable())
         }

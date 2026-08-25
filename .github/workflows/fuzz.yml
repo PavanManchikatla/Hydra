@@ -22,7 +22,11 @@ on:
       - 'crates/hydra-fuzz/**'
       - 'crates/hydra-modelsvc/**'
       - 'crates/hydra-proto/**'
-      - 'crates/hydra-worker/src/wire.rs'
+      # M4·0 extracted the codec out of `hydra-worker/src/wire.rs` into its own crate. This filter
+      # still named the old path, so a wire-codec change stopped triggering the push leg entirely
+      # (the weekly `--target all` leg still covered it, so this was latency, not a hole).
+      - 'crates/hydra-wire/**'
+      - 'crates/hydra-worker/**'
       - '.github/workflows/fuzz.yml'
   workflow_dispatch:
     inputs:

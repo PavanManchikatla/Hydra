@@ -1,0 +1,58 @@
+name: clean-checkout
+
+# **The oracle for the configuration the developer's machine can never compile.**
+#
+# `hydra-engine-sys` has two arms: the real FFI (needs a built, PATCHED `vendor/llama.cpp`) and a
+# stub (`cfg(engine_unavailable)`) that a clean checkout gets. The dev box always has the real one,
+# so `cargo test --workspace` there — 390/0/7, clippy clean — compiles the real arm and ONLY the
+# real arm. The stub arm was compiled exclusively as a side effect of `container-2node` and `fuzz`.
+#
+# On 2026-08-23 that cost 28 hours: `pub use imp::{gguf_probe, ..}` did not resolve under the stub,
+# so a clean checkout did not build AT ALL, and both workflows went red. Their failure read as
+# "the workflow is broken" rather than as "the project does not compile", and nothing named it.
+#
+# This job's ONLY purpose is to name it. It is deliberately not path-filtered: any crate can break
+# the stub arm, so every push is in scope. It runs no engine and needs no submodule — that is the
+# point. Reproduce any failure here locally with:
+#
+#     HYDRA_FORCE_ENGINE_STUB=1 cargo check --workspace --all-targets
+#
+# Rule 16 applies as everywhere: this job's check-mark is not evidence of anything except that the
+# clean-checkout build compiled. It makes NO claim about the engine, which it never builds.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  stub-arm:
+    name: workspace builds with no engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # NO submodule init, deliberately. This is what `git clone` gives a new contributor.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-targets` so tests and benches are compiled too, not just the libs: the break that
+      # motivated this job was in a re-export that only a dependent crate's build surfaced.
+      - name: cargo check (clean checkout, engine absent)
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo clippy (clean checkout, engine absent)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The engine-gated tests skip themselves here (they check `ENGINE_AVAILABLE`); what runs is
+      # every test that does NOT need the engine — which is most of the suite, and none of which
+      # had a CI home before this job existed.
+      - name: cargo test (clean checkout, engine absent)
+        run: cargo test --workspace --locked -- --test-threads=1

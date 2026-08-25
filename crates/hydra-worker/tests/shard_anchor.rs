@@ -62,7 +62,11 @@ fn keys_for(manifest_path: &str, seed: u8) -> SessionFence {
 
 #[tokio::test]
 async fn two_worker_anchor_is_bit_exact_with_shard_loaded_weights() {
-    let (Some(full), Some((s0, s1, manifest))) = (dev_model_path(), shard_set()) else {
+    // Same shape as `single_worker.rs`'s guard: the message named the engine, the guard did not
+    // check it (rule 17 — the class is audited, not just the instance that failed).
+    let (Some(full), Some((s0, s1, manifest)), true) =
+        (dev_model_path(), shard_set(), hydra_engine_sys::ENGINE_AVAILABLE)
+    else {
         eprintln!("SKIP: no engine/model/shards (dev-environment artifacts)");
         return;
     };

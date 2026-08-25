@@ -11,6 +11,34 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Declared FIRST, before any path that emits it. Every `return` below sets
+    // `cfg(engine_unavailable)`, and the patch-missing arm used to return *above* the declaration,
+    // so rustc saw an undeclared cfg on the one path this machine never takes.
+    println!("cargo::rustc-check-cfg=cfg(engine_unavailable)");
+    println!("cargo:rerun-if-env-changed=HYDRA_FORCE_ENGINE_STUB");
+
+    // **Rule 19 — the stub arm needs an oracle that can be RUN.**
+    //
+    // The developer's machine always has a built, patched `vendor/llama.cpp`, so it compiles the
+    // real arm and only the real arm; the stub arm is compiled exclusively by CI, where a break in
+    // it reads as "the workflow is broken" rather than as a named defect. That is how
+    // `pub use imp::{gguf_probe, ..}` failed to resolve for 28 hours across a dozen red runs while
+    // the local suite reported 390/0/7.
+    //
+    // This switch makes the clean-checkout build reproducible in one command:
+    //   HYDRA_FORCE_ENGINE_STUB=1 cargo check --workspace --all-targets
+    // It is opt-in by explicit environment variable and announces itself, so it can never be the
+    // silent cause of a stub build somebody meant to be real.
+    if std::env::var_os("HYDRA_FORCE_ENGINE_STUB").is_some() {
+        println!(
+            "cargo:warning=hydra-engine-sys: HYDRA_FORCE_ENGINE_STUB is set — building the STUB \
+             arm deliberately. This is the clean-checkout build; the FFI reports unavailable at \
+             every call site. Unset it to link the real engine."
+        );
+        println!("cargo:rustc-cfg=engine_unavailable");
+        return;
+    }
+
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendor = manifest.join("../../vendor/llama.cpp");
     let inc_llama = vendor.join("include");
@@ -42,8 +70,6 @@ fn main() {
     }
     let libs_ok = libdir.join("libllama.dylib").exists() || libdir.join("libllama.so").exists();
 
-    // We set cfg(engine_unavailable) ourselves below; declare it so rustc doesn't warn.
-    println!("cargo::rustc-check-cfg=cfg(engine_unavailable)");
     println!("cargo:rerun-if-changed=csrc/hydra_engine.cpp");
     println!("cargo:rerun-if-changed=csrc/hydra_engine.h");
     println!("cargo:rerun-if-changed=build.rs");

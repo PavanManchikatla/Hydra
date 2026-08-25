@@ -21,6 +21,10 @@ rust-version.workspace = true
 hydra-modelsvc = { path = "../hydra-modelsvc" }
 hydra-proto = { path = "../hydra-proto" }
 hydra-worker = { path = "../hydra-worker" }
+# Rule 17 — this dependency list IS the parser register, so a parser reached only TRANSITIVELY is
+# absent from it in the sense that matters. `wire-body` drives `hydra_worker::wire`, which since
+# M4·0 is a re-export of this crate; naming it directly is what makes the register readable.
+hydra-wire = { path = "../hydra-wire" }
 hydra-wal = { path = "../hydra-wal" }
 hydra-coordinator = { path = "../hydra-coordinator" }
 flatbuffers.workspace = true

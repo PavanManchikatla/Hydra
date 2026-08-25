@@ -124,8 +124,13 @@ async fn f1_fence_mismatch_is_rejected_before_action() {
 
 #[tokio::test]
 async fn data_plane_apply_token_echo_over_mtls() {
-    let Some(path) = model_path() else {
-        eprintln!("SKIP: no model — data-plane echo needs the engine + GGUF (dev-environment artifacts)");
+    // The skip guard must test EVERYTHING the message names. It said "the engine + GGUF" and
+    // checked only the GGUF, so on a machine that has the model but a STUBBED engine the worker
+    // failed to load, dropped the connection, and this test panicked on a TLS `UnexpectedEof` —
+    // a protocol-looking failure with a build-configuration cause. Rule 19: a guard that under-
+    // states its own preconditions produces a red test that accuses the wrong layer.
+    let (Some(path), true) = (model_path(), hydra_engine_sys::ENGINE_AVAILABLE) else {
+        eprintln!("SKIP: no engine or no model — data-plane echo needs BOTH (dev-environment artifacts)");
         return;
     };
 
