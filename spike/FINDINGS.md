@@ -37,8 +37,32 @@ same backend**:
 | Metric (Metal, 15 combos) | Result |
 |---|---|
 | F32 split vs Metal-unsplit logits | **0.0 max-abs (bit-exact)**, argmax + top-10 identical, all 15 |
-| KV truncate+replay | exact |
+| KV truncate+replay | ⛔ **NOT EXACT IN AT LEAST ONE CASE — corrected 2026-08-25, see the note below** |
 | FP16 boundary payload cost | 0.003–0.014 max-abs on logits (lower than CPU's 0.03–0.06), argmax stable, top-10 = 10/10 |
+
+> ### ⛔ CORRECTION (2026-08-25) — "KV truncate+replay: exact" does not hold on Metal, and the overstatement cannot be adjudicated
+>
+> Re-running the sweep for the `f280b269` bump validation found Metal **failing** the
+> truncate-and-replay check on the prompt `def fibonacci(n):` (4 tokens, truncate at position 2):
+> **`max_abs=4.059e-04`**, against a check whose bar is *exactness*. It is deterministic — stable
+> across runs, and **byte-identical on the pinned `13f2b28b` and the candidate `f280b269`**, so it is
+> not a regression introduced by any bump. All **15 CPU** combinations remain exact.
+>
+> **Whether the original claim was wrong or merely lucky cannot be determined, because this
+> document records "× 3 prompts" and never says which three.** A sweep whose inputs are unrecorded
+> cannot be re-*run*, only re-*performed with different inputs* — and BLUEPRINT §1.2 makes rerunning
+> it **binding on every submodule bump**. That is the deeper defect here, and it is owed in §8: the
+> prompts belong in the repo so this row means something the next time somebody reads it.
+> The 2026-08-25 prompts **are** named, in `verification/ci-results/submodule-bump-2026-08-25.md`.
+>
+> **Scope, stated no wider than it goes:** 4.059e-04 sits inside the 1e-3 tolerance the DoD uses for
+> split-vs-unsplit and the argmax held, so **no token divergence has been demonstrated**. The
+> engine-gated suite re-run at `n_gpu_layers: 99`
+> (`verification/ci-results/gpu-backend-2026-08-25.md`) found **every** byte-identity assertion that
+> ran to completion passing on Metal, D1 recovery included — so this case is **narrower than anything
+> the product's recovery path exercises in the configurations that could be measured.** It is not
+> thereby excluded, and it is not being explained away: the row above now says *not exact*, because
+> that is what was measured.
 
 The FP16 boundary cost is **~4× lower on Metal than CPU** (0.003–0.014 vs 0.03–0.06) — an
 accumulation-order artifact of Metal's kernels, not a correctness signal; **no action**.

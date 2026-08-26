@@ -24,10 +24,11 @@ appear as quoted `verdict=` lines or receipt files, never as job status.
 
 | # | DoD component | Status | Evidence |
 |---|---|---|---|
-| 1 | **A non-author sets up a 3-machine cluster from the README in < 30 min** | ⏸️ **OPEN — OWNER-SUPPLIED, NOT WAIVABLE** | Protocol: `docs/FRESH-ACCOUNT-TEST.md`. **No non-author has run it.** The README currently claims only that **every command has been executed as written** (rule 23), and **does not claim the 30-minute figure**. This row closes on a dated line in §6 carrying elapsed time and confusion count; each recorded confusion becomes a §8 item. **It is not inferable from the quickstart having been executed by its author** — that is precisely the substitution rule 23 exists to forbid. *(Also: the DoD says three machines, and the project has one. Even a willing non-author cannot fully discharge this row on the hardware that exists.)* |
+| 1 | **A non-author sets up a 3-machine cluster from the README in < 30 min** | ⏸️ **OPEN — SCOPE NARROWED IN WRITING (owner ruling, 2026-08-25). A PARTIAL RUN DOES NOT CLOSE IT.** | Protocol: `docs/FRESH-ACCOUNT-TEST.md`. **No non-author has run it.** The README currently claims only that **every command has been executed as written** (rule 23), and **does not claim the 30-minute figure**. This row closes on a dated line in §6 carrying elapsed time and confusion count; each recorded confusion becomes a §8 item. **It is not inferable from the quickstart having been executed by its author** — that is precisely the substitution rule 23 exists to forbid. **⚑ OWNER RULING 2026-08-25 — the row is split, and the partial half is labelled as partial:** the owner runs `FRESH-ACCOUNT-TEST.md` **on one machine**, and that result is recorded as a **PARTIAL DISCHARGE, explicitly labelled**. **What a one-machine fresh-account run CAN discharge:** the README's build → pair → start → query path, which is **most of the confusion surface** — every command a newcomer types before a second machine exists, and every place the prose can be wrong (rule 23's three quickstart defects all lived here). **What it CANNOT discharge:** the *3-machine* DoD as written — cross-machine pairing over a real LAN, a real placement across heterogeneous hardware, and the end-to-end setup *time* for three machines, which is the number the DoD actually names. **Those remain hardware-contingent.** **The partial run does not close this row**; it narrows it, and the narrowing is recorded here so nobody later reads the partial as the whole. |
 | 2a | **No 0.0.0.0 binds** | ✅ **MET** | `hydra-transport` refuses a wildcard bind without an explicit opt-in; `security_checklist.rs::a_wildcard_bind_is_refused_and_an_explicit_interface_is_not` drives `0.0.0.0:8080`, `[::]:8080`, `0.0.0.0:0` **and** the IPv4-mapped form (`platform_hardening.rs`, §7.45). The one wildcard bind in the tree, `hydra-2node-ci.rs`, is a container-internal CI harness taking the documented opt-in explicitly. |
 | 2b | **API auth enforced** | ✅ **MET** | `ApiAuth::check` runs **before any state is read**, on the generation endpoint *and* the dashboard (M4·4 — the dashboard is another *client* of the surface, not a privileged path; verified live at 401/200). Token length floored by `MIN_API_TOKEN_LEN` (audit H15). **Plus, new 2026-08-25:** `MAX_REQUEST_BODY_BYTES = 1 MiB` applied **router-wide**, with an oracle **verified to discriminate** — remove the layer and a 1 MiB body returns 200, so `axum`'s 2 MiB default would never have caught it. |
 | 3 | **GGUF parser fuzzed 24 CPU-hours without crashes** | ⛔ **NOT MET — 6.150 / 24 CPU-hours** | Receipts: `fuzz-32618764167.md`, `fuzz-32618760313.md`, `fuzz-32795673202.md`, **`fuzz-32801640792.md`**. 0 crashes across **24.4 billion** cases. **The number is 6.150, and the corrections behind it matter:** leg 3 banks **1.750 not 2.000** because `vendored-gguf` spent 0.250 CPU-hours calling **nothing** while printing `verdict=GREEN` (§7.62). **Fixed, and the fix is observed in CI:** leg 4 logs `target=vendored-gguf … iterations=0 cpu_seconds=0.0 … verdict=UNAVAILABLE` and `FUZZ SUMMARY targets=7 unavailable=1`, so its full 900 s/shard went to real parsers. **⚑ And the cadence claim was wrong: no SCHEDULED leg has ever run** — the cron was added 2026-08-23 and every leg to date is dispatch or push. **~9 further legs reach the bar.** This row is a countdown, not a gap; it cannot be accepted away because the DoD names the number. |
+| 4 | **⚑ GPU BACKEND — byte-identity on Metal** (added as a GATE ROW by owner ruling, 2026-08-25) | 🔶 **MET ON EVERYTHING MEASURABLE; TWO RESIDUALS, NEITHER A CORRECTNESS FINDING** | Receipt: **`verification/ci-results/gpu-backend-2026-08-25.md`**, raw table `gpu-sweep-ngl99-2026-08-25.txt`. **88 passed / 5 failed / 5 ignored across 30 engine-gated suites at `n_gpu_layers: 99`.** **Every byte-identity and argmax assertion that ran to completion PASSED on Metal** — `split_vs_unsplit_f32_bit_exact_through_crate_api`, both rule-14 anchors, `direct_worker_to_worker_fwd_is_bit_exact`, shard-loaded weights, chunked prefill, `d1_recovery…byte_identical`, and one three-node recovery path. **None of the 5 failures is an equality assertion**: every one died on `peer closed connection` or `EngineError code 5` with 8–17 **GPU out-of-memory** messages. **Residual 1 — a Metal TEARDOWN abort** (`ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0)`) fires in 9 suites **after** they report `test result: ok`; a Metal worker would abort at shutdown — an operational defect, not a computation one, in upstream code. **Residual 2 — GPU OOM on this 8 GB M2** (`recommendedMaxWorkingSetSize = 5726.63 MB`) prevents the multi-worker recovery suites from running: same class as row 1's hardware limit, **owed not waived**. **Rule 12 on the lever itself:** `MTL0_Mapped model buffer size` appears only at `ngl=99`, and both anomalies are **absent at `ngl=0`** on the same suites. |
 | 3b | **…and which parser** | ⚠️ **NAMED, NOT GREEN** | The 24-hour budget protects the **Rust** parsers. The **vendored** `gguf_init_from_file` — the one a worker actually loads through — is driven only on the dev machine, because **CI never builds the real engine (audit L1)**. Its CI status is **UNAVAILABLE**, and as of §7.62 the log says that word rather than `GREEN`. Composition is the current protection: since §7.43 the worker runs the hardened parser *first*. |
 
 ## (b) M4 build items (BLUEPRINT §3 "Build:")
@@ -85,20 +86,28 @@ appear as quoted `verdict=` lines or receipt files, never as job status.
 
 ## VERDICT — ⏸️ **PENDING THE OWNER**
 
-**The agent does not flip this gate.** Two rows are open, and neither is the agent's to close:
+**The agent does not flip this gate.** After the owner's 2026-08-25 rulings, the remaining path to a
+flip is exactly three things — and none of them is an argument:
 
-* **Row 1** needs a **non-author**, on **three machines**. The project has one machine and one
-  author. It is not waivable and not inferable.
-* **Row 3** needs **~9 more fuzz legs**. The DoD states the number, so no argument closes it —
-  only time. The first *scheduled* leg has not yet been observed to run.
+* **Row 1 — a scoped disposition.** The owner's one-machine fresh-account run gives a **partial
+  discharge, labelled as partial**: it covers the README's build/pair/start/query path, which is most
+  of the confusion surface, and **not** the 3-machine DoD as written. The row stays open with that
+  boundary in writing.
+* **Row 3 — a countdown.** **~9 more fuzz legs**, at 6.150 / 24. The DoD states the number, so no
+  argument closes it, only time. **No *scheduled* leg has yet been observed to complete.**
+* **Row 4 — the new GPU row — is MET on everything measurable**, with two residuals that are not
+  correctness findings: a Metal **teardown** abort (upstream, post-assertion) and **GPU OOM** on an
+  8 GB machine blocking the multi-worker recovery suites. The row closes fully when those suites run
+  on a larger GPU, or is carried as a hardware-contingent annotation like M3's row 15.
 
 **What the agent asserts, and no further:** every M4 build item is delivered; the security checklist
 passes on both of its checkable clauses; the audit's five waves are complete; the one v1-blocking
 allowance is deleted; and every remaining §8 residual has an explicit disposition awaiting
 ratification.
 
-**What the owner is being asked for:** (1) ratify or overrule each proposed ACCEPT in
-`M4-PRERELEASE-TRIAGE.md`; (2) rule on whether the **CPU-only evidence base** is a gate row or an
-accepted limitation; (3) create the `llama.cpp` fork so L1 and the validated bump can land; and
-(4) run `docs/FRESH-ACCOUNT-TEST.md`, or rule on how row 1 is discharged given the hardware that
-exists.
+**All four questions this table originally asked have been answered (2026-08-25):** the ACCEPTs are
+ratified and published verbatim in `docs/RELEASE-NOTES-v1.md`; the CPU-only evidence base became
+**row 4** and has been measured; the fork is the owner's to create, and **the validated bump is held
+until it exists**; and row 1's scope is narrowed above. **Nothing further is owed by the agent at
+this gate** — the remaining work is time (row 3), the owner's fresh-account run (row 1), and hardware
+(row 4's residual 2).

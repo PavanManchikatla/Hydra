@@ -1,0 +1,30 @@
+boundary_durability              exit=0    abort=no   test result: ok. 1 passed; 0 failed; 0 ignored  
+calibration                      exit=0    abort=no   test result: ok. 0 passed; 0 failed; 2 ignored  
+chunked_prefill                  exit=101  abort=yes  test result: ok. 5 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+coordinator_drives_production    exit=0    abort=no   test result: ok. 4 passed; 0 failed; 0 ignored  
+d0_mode                          exit=0    abort=no   test result: ok. 4 passed; 0 failed; 0 ignored  
+d1_recovery                      exit=101  abort=yes  test result: ok. 1 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+d1_two_stage                     exit=101  abort=yes  test result: FAILED. 0 passed; 2 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+digest_cost                      exit=0    abort=no   test result: ok. 0 passed; 0 failed; 1 ignored  
+durable_live                     exit=0    abort=no   test result: ok. 1 passed; 0 failed; 0 ignored  
+forwarding_durable               exit=101  abort=yes  test result: ok. 3 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+idempotency                      exit=101  abort=yes  test result: ok. 5 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+local_pair                       exit=101  abort=yes  test result: ok. 3 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+multiconn                        exit=0    abort=no   test result: ok. 2 passed; 0 failed; 0 ignored  
+pre_ffi                          exit=101  abort=yes  test result: ok. 4 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+protocol_microbench              exit=0    abort=no   test result: ok. 0 passed; 0 failed; 1 ignored  
+recovery                         exit=0    abort=no   test result: ok. 3 passed; 0 failed; 0 ignored  
+relink                           exit=0    abort=no   test result: ok. 2 passed; 0 failed; 0 ignored  
+reserved_hooks                   exit=0    abort=no   test result: ok. 12 passed; 0 failed; 0 ignored  
+sampler_pipeline                 exit=101  abort=yes  test result: FAILED. 3 passed; 1 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+shard_anchor                     exit=101  abort=yes  test result: ok. 12 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+single_worker                    exit=101  abort=yes  test result: ok. 3 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+survivor_reactivate              exit=0    abort=no   test result: ok. 2 passed; 0 failed; 0 ignored  
+three_node                       exit=101  abort=yes  test result: ok. 1 passed; 0 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+three_node_recovery              exit=101  abort=yes  test result: FAILED. 1 passed; 2 failed; 0 ignored  ggml-metal/ggml-metal-device.m:622: GGML_ASSERT([rsets->data
+wire_durability                  exit=0    abort=no   test result: ok. 1 passed; 0 failed; 0 ignored  
+wire_limits                      exit=0    abort=no   test result: ok. 10 passed; 0 failed; 0 ignored  
+bit_exact                        exit=0    abort=no   test result: ok. 1 passed; 0 failed; 0 ignored  
+fixed_decode_cost                exit=0    abort=no   test result: ok. 0 passed; 0 failed; 1 ignored  
+patch_integrity                  exit=0    abort=no   test result: ok. 2 passed; 0 failed; 0 ignored  
+shard_load                       exit=0    abort=no   test result: ok. 2 passed; 0 failed; 0 ignored  

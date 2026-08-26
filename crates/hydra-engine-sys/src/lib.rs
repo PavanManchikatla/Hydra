@@ -138,11 +138,41 @@ mod imp {
         n_vocab: i32,
     }
 
+    /// **`HYDRA_TEST_NGL` — the verification lever the M4 GPU gate row needs (owner-ruled 2026-08-25).**
+    ///
+    /// **Why it exists.** All 31 engine-test configurations in this workspace hard-code
+    /// `n_gpu_layers: 0`, so every byte-identity claim the project makes — the rule-14 anchors, the
+    /// shard anchor, `d1_recovery`, three-node recovery, the M3 calibration — is **CPU-only
+    /// evidence**, and Metal is exercised by nothing in the suite (§7.63). Meanwhile the M−1 sweep
+    /// shows Metal's KV truncate+replay is **not** bit-exact in at least one case. The gate asks
+    /// whether the byte-identity assertions survive on the GPU, and answering it needs a lever.
+    ///
+    /// **Editing the 31 literals was rejected**: it would have to be undone, and a lever that has to
+    /// be reverted is one a future session cannot re-pull. Intercepting at the single load boundary
+    /// covers every caller, binaries included, and leaves **0 (the DoD backend) as the default**.
+    ///
+    /// **It is opt-in by explicit environment variable and announces itself on stderr**, so it can
+    /// never silently be the reason a result differs — the same contract as
+    /// `HYDRA_FORCE_ENGINE_STUB` in `build.rs`.
+    fn effective_ngl(requested: i32) -> i32 {
+        match std::env::var("HYDRA_TEST_NGL").ok().and_then(|v| v.parse::<i32>().ok()) {
+            Some(n) if n != requested => {
+                eprintln!(
+                    "hydra-engine-sys: HYDRA_TEST_NGL={n} overrides n_gpu_layers={requested} \
+                     (verification lever — the default DoD backend is 0/CPU)"
+                );
+                n
+            }
+            Some(n) => n,
+            None => requested,
+        }
+    }
+
     impl Model {
         /// Load a GGUF. `n_gpu_layers` 0 = CPU (deterministic DoD backend), 99 = GPU.
         pub fn load(path: &str, n_gpu_layers: i32) -> Result<Model, EngineError> {
             let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path has NUL" })?;
-            let raw = unsafe { ffi::hydra_model_load(c.as_ptr(), n_gpu_layers) };
+            let raw = unsafe { ffi::hydra_model_load(c.as_ptr(), effective_ngl(n_gpu_layers)) };
             Self::wrap(raw)
         }
 
@@ -164,7 +194,7 @@ mod imp {
         /// is refused by the engine rather than null-dereferencing.
         pub fn load_shard(path: &str, l0: i32, l1: i32, n_gpu_layers: i32) -> Result<Model, EngineError> {
             let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path has NUL" })?;
-            let raw = unsafe { ffi::hydra_model_load_shard(c.as_ptr(), l0, l1, n_gpu_layers) };
+            let raw = unsafe { ffi::hydra_model_load_shard(c.as_ptr(), l0, l1, effective_ngl(n_gpu_layers)) };
             Self::wrap(raw)
         }
 
