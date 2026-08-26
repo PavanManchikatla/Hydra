@@ -43,35 +43,65 @@ fn a_linked_engine_implies_the_layer_window_patch_is_applied() {
 /// must actually describe the files the working tree modifies. A patch that has drifted from the
 /// tree is worse than none: it reads as reproducibility while producing a different engine.
 #[test]
-fn the_committed_patch_file_covers_every_modified_vendored_file() {
+fn the_pinned_submodule_is_exactly_its_base_plus_the_committed_patch() {
     let patch_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spike/llama-cpp-layer-window.patch");
     let patch = match std::fs::read_to_string(patch_path) {
         Ok(p) => p,
-        Err(e) => panic!("the layer-window patch must be committed — it is the only durable record of the change: {e}"),
+        Err(e) => panic!("the layer-window patch must be committed — it is the provenance record: {e}"),
     };
     assert!(!patch.is_empty(), "the patch file is empty");
 
     let repo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/llama.cpp");
-    let out = std::process::Command::new("git").arg("-C").arg(repo).args(["status", "--porcelain"]).output();
-    let Ok(out) = out else {
-        eprintln!("SKIP: git unavailable");
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let Some(head) = git(&["rev-parse", "HEAD"]) else {
+        eprintln!("SKIP: submodule not checked out (CI does not init it)");
         return;
     };
-    let status = String::from_utf8_lossy(&out.stdout);
-    let modified: Vec<&str> = status
-        .lines()
-        .filter(|l| l.starts_with(" M") || l.starts_with("M "))
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .collect();
-    if modified.is_empty() {
-        eprintln!("SKIP: the submodule working tree is clean (a pinned fork, or an unpatched checkout)");
+
+    // **The fork's invariant, and the reason this test was rewritten (2026-08-25, L1 closed).**
+    //
+    // It used to assert that every file MODIFIED IN THE WORKING TREE appeared in the patch file.
+    // That was the right check while the patch was uncommitted working-tree state. The moment the
+    // fork landed, the working tree became clean — so the check found nothing to iterate, took its
+    // `modified.is_empty()` early return, and **reported `ok` while asserting nothing at all.**
+    // A guard that cannot fail is rule 25's shape exactly: the verdict token stopped tracking
+    // anything, and it did so in the L1 guard of all places.
+    //
+    // The post-fork invariant is stronger and stays checkable: **the pin is exactly ONE commit on
+    // top of its upstream base, and that commit's diff IS the committed patch.** That catches a
+    // second commit sneaking onto the fork branch, a hand-edit of the pinned tree, and the patch
+    // file drifting from what is actually pinned — none of which the old form could see.
+    let parents = git(&["rev-list", "--count", "HEAD"]).unwrap_or_default();
+    let base = git(&["rev-parse", "HEAD~1"]).map(|s| s.trim().to_string());
+    let Some(base) = base else {
+        eprintln!("SKIP: shallow submodule checkout — no parent to diff against (count={})", parents.trim());
         return;
-    }
-    for f in &modified {
-        assert!(
-            patch.contains(f),
-            "vendored file {f} is modified in the working tree but does not appear in the committed \
-             patch — the patch has drifted from the tree it claims to describe (audit L1)"
-        );
-    }
+    };
+
+    let Some(diff) = git(&["diff", &format!("{base}..HEAD")]) else {
+        eprintln!("SKIP: could not diff the pinned commit against its base");
+        return;
+    };
+
+    // Compare the SUBSTANCE — added and removed lines — not the headers, which carry index hashes
+    // and context line numbers that legitimately differ between a stored patch and a fresh diff.
+    let substance = |t: &str| -> Vec<String> {
+        t.lines()
+            .filter(|l| (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++") && !l.starts_with("---"))
+            .map(|l| l.to_string())
+            .collect()
+    };
+    let from_pin = substance(&diff);
+    let from_file = substance(&patch);
+    assert!(!from_pin.is_empty(), "the pinned commit changes nothing — the layer window is not in the pin");
+    assert_eq!(
+        from_pin, from_file,
+        "the pinned submodule commit ({}) does not match spike/llama-cpp-layer-window.patch. \
+         The pin is the mechanism and the patch file is its provenance; when they disagree the \
+         record describes an engine nobody is building (audit L1).",
+        head.trim()
+    );
 }
