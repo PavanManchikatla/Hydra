@@ -318,7 +318,7 @@ The gate-evidence-table *format* (a)–(f) is preserved in `verification/M1-GATE
 > the code; that misread cost real time twice this session.
 
 - **Repo:** `/Users/pavanmanchikatla/Documents/hydra` (remote `github.com/PavanManchikatla/Hydra`, branch `main`).
-- **Submodule:** `git submodule update --init` — `vendor/llama.cpp` pinned @ `13f2b28b` (a gitlink, not vendored source).
+- **Submodule:** `git submodule update --init` — `vendor/llama.cpp` pinned @ **`c00bcebf`** on the project's own fork **`PavanManchikatla/llama.cpp`**, branch `hydra-layer-window-f280b26` (a gitlink, not vendored source). **The patch arrives with the checkout; it is no longer applied by hand (L1 closed, §7.66).**
 - **flatc:** `/opt/homebrew/bin/flatc` (25.12.19) — only for `hydra-proto` regen (`scripts/gen-proto.sh`); generated code is committed.
 - **JDK:** `/opt/homebrew/opt/openjdk/bin/java` (OpenJDK 26). **TLC jar** = `verification/tools/tla2tools.jar` (**v1.7.4**, sha256 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`) — **git-ignored; must be re-fetched** from `https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar`.
 - **macOS has no `timeout`** (CI Ubuntu does); concurrent TLC runs need a unique `-metadir`.
@@ -387,7 +387,11 @@ hydra/
 ├── crates/                     # hydra-proto | hydra-wal | hydra-transport | hydra-state | hydra-sim | (M2:) hydra-engine-sys, hydra-worker, hydra-tokenizer, hydra-coordinator | (P2·10:) hydra-modelsvc
 ├── spike/                      # M−1 sources, CMake, llama-cpp-layer-window.patch, FINDINGS.md,
 │                               #   upstream-llama-issue.md, sweep scripts + result logs
-├── vendor/llama.cpp            # PINNED SUBMODULE (13f2b28b) — a pointer, not 200MB of source
+├── vendor/llama.cpp            # PINNED SUBMODULE — the project's OWN FORK,
+│                               #   PavanManchikatla/llama.cpp @ c00bcebf
+│                               #   (branch hydra-layer-window-f280b26): one commit of
+│                               #   layer-window patch on upstream f280b269.
+│                               #   A pointer, not 200MB of source.
 └── scripts/                    # regen-proto.sh, tlc runners
 ```
 
@@ -716,6 +720,36 @@ hydra/
 **Honest performance envelope (report targets, not yet measured on wired LAN):** 70B Q4 ≈ 2–7 tok/s wired desktop+Mac, 1.5–4 over good Wi-Fi; TTFT tens of seconds at 4k prompt; recovery <15 s target (4k ctx, D1). Hydra's value is correctness + running-at-all, not speed.
 
 ## 9. Environment & toolchain facts (agent machine)
+
+> **⚑⚑ THE ENGINE IS A PROJECT-CONTROLLED FORK (2026-08-25 — audit L1 CLOSED, §7.66).**
+>
+> | | |
+> |---|---|
+> | **Submodule URL** | `https://github.com/PavanManchikatla/llama.cpp.git` |
+> | **Branch** | `hydra-layer-window-f280b26` — named so the base is legible from the branch alone |
+> | **Pinned SHA** | **`c00bcebf79cbf95be22aa711d485a287914672c5`** |
+> | **Upstream base it derives from** | **`f280b26983ad0fdb705a0d9ebf0503e76f2899b0`** (`ggml-org/llama.cpp`, 2026-08-25, *"metal : per-device tuned (Q, NE) for flash-attn vec (#26570)"*) |
+> | **Delta from base** | exactly one commit: the layer-window patch (7 files, +130/−6) |
+>
+> **Why this is the L1 fix and not a relocation.** The layer-window patch existed only as an
+> **uncommitted working-tree modification** of the submodule, so a clean checkout silently got stock
+> upstream and every green engine-gated result was evidence about a tree **no clone reproduces**. It is
+> now a **commit at a pinned SHA**; `git status` in `vendor/llama.cpp` is **clean — for the first time
+> in this project's history** — and `spike/llama-cpp-layer-window.patch` is **provenance, not the
+> mechanism**.
+>
+> **⚑ THE MAINTENANCE COST DID NOT DISAPPEAR — IT BECAME VISIBLE, AND THAT IS THE POINT.** A fork is
+> not free: **every future upstream sync requires re-porting the patch onto the new base and re-running
+> the full M−1 sweep before the new SHA may be pinned**, plus the positional-initializer audit on
+> `llama_model_default_params()` (upstream swapped three booleans for the `load_mode` enum *inside* the
+> last bump's range, and that initializer is positional with comment labels — a mis-ordered field
+> assigns silently). **That obligation was always real; before the fork it was carried by one machine's
+> working tree and invisible to everyone else.** The fork converts a **silent** liability into a
+> **scheduled** one. It does not remove it, and this row exists so nobody later reads the fork as
+> having made the problem go away.
+>
+> **Standing consequence:** the project is now responsible for its own engine updates. **An upstream
+> CVE fix does not reach Hydra until somebody performs that sync.**
 
 **⚑ TOOLCHAIN, STATED BECAUSE "CLIPPY CLEAN" IS A CLAIM ABOUT A VERSION (§7.61, 2026-08-24):** the agent's **default** toolchain is **`rustc 1.93.1 (2026-02-11)`**; **CI's `stable` is `rustc 1.98.0 (2026-08-18)`** and is the stricter, authoritative one. **`1.98.0` is installed locally as a NAMED, NON-DEFAULT toolchain** so CI's clippy can be run before pushing (`cargo +1.98.0 clippy --workspace --all-targets -- -D warnings`) **without re-basing the measured test baseline onto a toolchain it was not measured on**. Any lint claim must name which of the two produced it. **⚑⚑ BINDING (owner-ratified 2026-08-25): EVERY FULL-SUITE RECEIPT SEPARATES THE STREAMS AND REPORTS A MANGLED-LINE COUNT.** Run `cargo test … > out 2> err` — **never `2>&1`**. `ggml`'s Metal teardown writes to **stderr** while `libtest` writes results to **stdout**; merged, they interleave and **corrupt the result line itself** — the log literally contained `test result: ggml_metal_free: deallocating`, a suite whose verdict is unreadable, which is how a run summed to **93 suites / 387 passed** when **94** started and `EXIT=0` (§7.61). **The receipt states three numbers, not one:** `running`-line count, readable-result count, and **mangled = the difference**. A receipt reporting a passed-count without its mangled-line count is incomplete, because a silently-dropped suite is indistinguishable from a suite that never ran. **Why this is a rule and not a habit:** the numbers this project quotes into gate tables come out of these logs, so the parser is verification infrastructure under rule 12 — **and it was defeating itself in the very session that wrote rule 12 into a commit message.** Cross-check: `running`-count == readable-count, or the receipt is not quotable. *(A checked summariser that asserts this equality is owed — §8.)*
 
