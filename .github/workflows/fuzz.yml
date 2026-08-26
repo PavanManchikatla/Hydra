@@ -27,6 +27,13 @@ on:
       # (the weekly `--target all` leg still covered it, so this was latency, not a hole).
       - 'crates/hydra-wire/**'
       - 'crates/hydra-worker/**'
+      # **The submodule PIN determines which engine gets built (audit L1 closed 2026-08-25),
+      # so a change to it is the highest-consequence change this repo can carry — and until
+      # now it triggered NOTHING here. Same shape as the fuzz.yml path drift of §7.60: a fact
+      # about the tree living in a second place nobody updated when the first one moved.**
+      - '.gitmodules'
+      - 'vendor/llama.cpp'
+      - 'crates/hydra-engine-sys/**'
       - '.github/workflows/fuzz.yml'
   workflow_dispatch:
     inputs:
