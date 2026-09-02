@@ -88,6 +88,22 @@ fn main() -> Result<(), String> {
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("mkdir {data_dir}: {e}"))?;
     let commits_path = std::path::Path::new(&data_dir).join("commits.wal");
 
+    // **§7.75 (2026-09-02) — an existing ledger is refused BY NAME, not by an OS error.** This
+    // binary does not resume a session: coordinator-restart resume (spec §6.5 in the product
+    // process) is escalated, not implemented — the model carries the coordinator's volatile
+    // variables across a crash (`CoordRestart` leaves `attempt`/`rId`/`recTarget` UNCHANGED) and
+    // the rule that re-derives them from the WAL is a decision the spec does not state. Until it
+    // is ratified, starting over an existing `commits.wal` would either clobber a session or
+    // silently mint a second one beside it; both are refused here, loudly.
+    if commits_path.exists() {
+        return Err(format!(
+            "hydra-coordinator: refusing to start over an existing session ledger at {}: this binary \
+             does not resume a session (coordinator-restart resume is escalated — PROJECT_STATE §7.75). \
+             Choose an empty --data-dir, or move the old ledger aside deliberately.",
+            commits_path.display()
+        ));
+    }
+
     // **Audit M8 — the ledger is bound to this session at creation**, so a later open proves it
     // belongs here rather than replaying somebody else's generation.
     let commit_stream = CommitStream::create(&commits_path, fence.cluster_id, fence.session_id)

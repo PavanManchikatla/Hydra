@@ -60,6 +60,12 @@ pub struct RecoveryState {
     /// The last durable output position (`-1` if nothing generated yet).
     pub generation_durable_pos: i64,
     pub last_commit_id: u64,
+    /// **Audit H10(c), folded 2026-09-02:** the input-side watermark — the last prompt position a
+    /// durable `INPUT_CHUNK_COMMIT` covered (spec §2.4), `-1` if no chunk committed. Until this
+    /// field existed `read` ignored chunk commits entirely, so a caller reconstructing from `read`
+    /// alone would re-apply every prefill chunk after a crash mid-prefill; `CommitStream::open`
+    /// restored the watermark and `read` did not, and a recovery has to be able to ask either.
+    pub prefill_stable_pos: i64,
 }
 
 impl RecoveryState {
@@ -67,6 +73,14 @@ impl RecoveryState {
     /// applying these positions the engine's retained logits predict `generation_durable_pos + 1`.
     pub fn input_frontier(&self) -> i64 {
         self.prompt_tokens.len() as i64 + self.generated_tokens.len() as i64
+    }
+
+    /// **The first prompt position a restart must (re)apply** (H10(c)): everything at or below
+    /// `prefill_stable_pos` is durably committed as applied and is NOT re-applied. `0` when no chunk
+    /// committed. Positions above it — including the whole prompt when prefill never committed —
+    /// are replayed. This is the input-side counterpart of `generation_durable_pos`.
+    pub fn prefill_resume_pos(&self) -> i64 {
+        self.prefill_stable_pos + 1
     }
 
     /// Committed generated token ids in output-position order (for `REBUILD_APPLY` feedback).
@@ -93,9 +107,21 @@ pub fn read(path: impl AsRef<std::path::Path>) -> Result<RecoveryState, Recovery
     let mut last_checkpoint: Option<(Vec<u8>, u64)> = None;
     let mut generation_durable_pos: i64 = -1;
     let mut last_commit_id: u64 = 0;
+    let mut prefill_stable_pos: i64 = -1;
 
     for r in &scan.records {
         match r.record_type {
+            rec_type::INPUT_CHUNK_COMMIT => {
+                // H10(c): the chunk watermark advances only forward; a record that would move it
+                // backwards is a damaged ledger, refused the way a generation gap is.
+                let icc = flatbuffers::root::<wal::InputChunkCommit>(&r.payload)
+                    .map_err(|e| RecoveryError::Malformed("INPUT_CHUNK_COMMIT", e.to_string()))?;
+                let last = icc.last_input_pos();
+                if last <= prefill_stable_pos {
+                    return Err(RecoveryError::OutOfOrder { previous: prefill_stable_pos, found: last });
+                }
+                prefill_stable_pos = last;
+            }
             rec_type::INITIAL_COMMIT => {
                 let ic = flatbuffers::root::<wal::InitialCommit>(&r.payload)
                     .map_err(|e| RecoveryError::Malformed("INITIAL_COMMIT", e.to_string()))?;
@@ -165,6 +191,7 @@ pub fn read(path: impl AsRef<std::path::Path>) -> Result<RecoveryState, Recovery
         checkpoint_id,
         generation_durable_pos,
         last_commit_id,
+        prefill_stable_pos,
     })
 }
 
