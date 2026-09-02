@@ -50,6 +50,10 @@ on:
         description: 'CPU-seconds per shard (split evenly across the targets). Default 900 = the weekly leg. Directive 2026-09-01 item 5 authorises 2700 for dispatched acceleration legs — receipt them as "dispatched, not scheduled" (rule 24).'
         required: false
         default: '900'
+      targets:
+        description: 'Target list for the driver (`all`, or a single target such as `vendored-gguf`). Only the listed targets are REQUIRED by the classify step; the receipt must state the restriction (rule 24). Default all.'
+        required: false
+        default: 'all'
       force_stub_shard:
         description: 'RULE-25 SELF-TEST ONLY: shard number (1-8) to build with HYDRA_FORCE_ENGINE_STUB=1, so the classify step can be watched refusing an engine-less shard as INCONCLUSIVE. Leave empty for a real leg.'
         required: false
@@ -155,16 +159,19 @@ jobs:
       - name: Fuzz (shard ${{ matrix.shard }}, distinct seed)
         env:
           SECONDS_PER_SHARD: ${{ github.event.inputs.seconds || '900' }}
+          TARGETS: ${{ github.event.inputs.targets || 'all' }}
         run: |
           set -o pipefail
           SEED=$(( ${{ matrix.shard }} * 1000003 ))
-          echo "shard-seconds=$SECONDS_PER_SHARD trigger=${{ github.event_name }}"
+          echo "shard-seconds=$SECONDS_PER_SHARD trigger=${{ github.event_name }} targets=$TARGETS"
           ./target/release/hydra-fuzz \
-            --target all \
+            --target "$TARGETS" \
             --seconds "$SECONDS_PER_SHARD" \
             --seed "$SEED" 2>&1 | tee "fuzz-shard-${{ matrix.shard }}.log"
 
       - name: Classify (rule 16 — read the verdict lines, never the exit status)
+        env:
+          TARGETS: ${{ github.event.inputs.targets || 'all' }}
         run: |
           LOG="fuzz-shard-${{ matrix.shard }}.log"
           echo "--- verdict lines ---"
@@ -197,13 +204,17 @@ jobs:
           # `vendored-gguf` is in this list since 2026-09-01: the engine is built above, so a shard
           # on which it reports UNAVAILABLE is a shard whose engine is the stub — INCONCLUSIVE.
           # (`force_stub_shard` exists precisely so this branch can be watched firing.)
-          for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record vendored-gguf; do
+          # A restricted dispatch (`targets` input) requires only what it asked for — and its receipt
+          # must say so; it never counts toward the other parsers.
+          if [ "$TARGETS" = "all" ]; then REQUIRED="gguf frame-header wire-body manifest bootstrap wal-record boundary-record vendored-gguf"; else REQUIRED="$TARGETS"; fi
+          echo "required-targets=$REQUIRED"
+          for t in $REQUIRED; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
             grep -qE "^target=$t .*verdict=UNAVAILABLE" "$LOG" && {
               echo "verdict=INCONCLUSIVE (required target $t reported UNAVAILABLE — it was not driven; on vendored-gguf that means the engine was not linked)"; exit 1; }
           done
           # Belt and braces: the summary's own gap count must be zero now that all eight are required.
-          grep '^FUZZ SUMMARY' "$LOG" | grep -qE 'unavailable=0|targets=8 cpu_seconds' || {
+          grep '^FUZZ SUMMARY' "$LOG" | grep -qE 'unavailable=0' || {
             echo "verdict=INCONCLUSIVE (summary reports an unavailable target: $(grep '^FUZZ SUMMARY' "$LOG"))"; exit 1; }
           if grep -qE '^CRASH ' "$LOG"; then
             echo "verdict=RED (parser crash — replay coordinates are in the CRASH lines above; a vendored-gguf crash is a live finding on OUR pinned fork: rule 8, duplicate-search upstream master first)"

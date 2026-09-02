@@ -126,8 +126,13 @@ fn only_the_container_ci_runner_opts_into_a_wildcard_bind() {
     let opts_in = |src: &str| src.contains("ALLOW_WILDCARD_BIND_ENV") || src.contains(ALLOW_WILDCARD_BIND_ENV);
     // The crate that *defines* the constant and the test that *asserts on it* naturally mention it;
     // an opt-in is a use of the name anywhere else.
-    const DEFINES_OR_ASSERTS: [&str; 2] =
-        ["crates/hydra-transport/src/lib.rs", "crates/hydra-transport/tests/security_checklist.rs"];
+    const DEFINES_OR_ASSERTS: [&str; 3] = [
+        "crates/hydra-transport/src/lib.rs",
+        "crates/hydra-transport/tests/security_checklist.rs",
+        // 2026-09-02: the API-listener refusal oracle names the constant only to assert it is NOT
+        // set (the same vacuity guard this file uses); it opts nothing in.
+        "crates/hydra-coordinator/tests/api_bind.rs",
+    ];
     let offenders: Vec<String> = rust_sources()
         .into_iter()
         .filter(|(path, src)| {
@@ -153,7 +158,7 @@ fn only_the_container_ci_runner_opts_into_a_wildcard_bind() {
 /// are fine — they are how the rule stays legible.
 #[test]
 fn no_source_file_hardcodes_a_wildcard_listen_address() {
-    const ALLOWED: [&str; 5] = [
+    const ALLOWED: [&str; 6] = [
         "crates/hydra-worker/src/bin/hydra-2node-ci.rs", // namespaced container, published on 127.0.0.1
         "crates/hydra-transport/src/lib.rs",             // defines and documents the policy
         "crates/hydra-transport/tests/security_checklist.rs", // this file
@@ -162,6 +167,10 @@ fn no_source_file_hardcodes_a_wildcard_listen_address() {
         // `::ffff:0.0.0.0`, which this grep would not have caught and `is_unspecified` did not.
         // It must name the addresses to refuse them; being flagged here is the guard working.
         "crates/hydra-transport/tests/platform_hardening.rs",
+        // 2026-09-02 (M4-GATE row 3a): the refusal oracle for the client-API listener (`serve_tls`),
+        // which had none. Same shape as platform_hardening: it names the wildcard to prove it is
+        // refused, and this grep flagged it on its first full run — the guard working, again.
+        "crates/hydra-coordinator/tests/api_bind.rs",
     ];
     let mut offenders = Vec::new();
     for (path, src) in rust_sources() {
