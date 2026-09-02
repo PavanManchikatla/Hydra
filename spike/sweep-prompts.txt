@@ -1,0 +1,20 @@
+# spike/sweep-prompts.txt — the M−1 sweep's prompts, fixed in the repo so the sweep is a
+# RE-RUNNABLE procedure (PROJECT_STATE §8; BLUEPRINT §1.2 makes the sweep binding on every
+# vendor/llama.cpp bump).
+#
+# Provenance (rule 22 — the site was verified before this file was written): the sweep has no
+# runner in the tree; each combination was `spike/build/shard_split -m <model> -k <k> -p <prompt>`
+# invoked from an ad-hoc loop that printed `===== k=<k> prompt=P<n> =====` and `PROMPT_TEXT: <p>`.
+# The prompts below are copied VERBATIM from the `PROMPT_TEXT:` lines of the two logged sweeps,
+#   verification/ci-results/spike-sweep-pinned-c00bcebf.log   (15 combinations, 2026-08-25)
+#   verification/ci-results/spike-sweep-bump-f280b269.log     (15 combinations, 2026-08-25)
+# and match the P1–P3 named in submodule-bump-2026-08-25.md and L1-closed-2026-08-25.md. P1 is also
+# shard_split.cpp's built-in default (`-p` omitted). The ORIGINAL 2026-07 sweep's prompts were never
+# recorded (spike/FINDINGS.md says only "× 3 prompts"); these are the 2026-08-25 re-run's, which is
+# the sweep every later claim rests on.
+#
+# Format: one prompt per line, in order P1, P2, P3; `#` lines and blank lines are ignored.
+# `spike/sweep.sh` reads this file. Do not reorder: receipts refer to prompts by P-number.
+The capital of France is
+In a shocking finding, scientists discovered a herd of unicorns living in a remote valley
+def fibonacci(n):
