@@ -11,7 +11,7 @@
 
 ### (a) Standing rules currently in force
 
-> **Rules 1–26 are in force as of 2026-08-25.** Numbering is historical, not priority-ordered, and
+> **Rules 1–26 are in force as of 2026-09-02** (no rule was added this session; §7.69 records two PATTERNS at the design authority's direction — *closing a finding can invalidate its guard* and *an approval to report an external defect lapses if the defect may be ours* — and §7.68 widens rule 25 to test-log counts). Numbering is historical, not priority-ordered, and
 > 8b is a corollary to 8 rather than a rule of its own. The most load-bearing for a fresh session
 > are **12** (verification infrastructure gets no presumption of correctness), **16** (a CI outcome
 > is evidence only as a quoted `verdict=` line), **19** (an oracle must be able to produce the
@@ -60,11 +60,14 @@
 
 26. **⚑ A RESIDUAL MAY NAME ITS SITE CORRECTLY AND STILL BE WRONG ABOUT ITS BLAST RADIUS; AN ESTIMATE OF COST IS NOT EVIDENCE (design authority, ratified 2026-08-25, from §7.64).** *Rule 22 made us verify an owed item's **location**; this makes us distrust its **size**.* **The instance:** the `ACCEPT_LEGACY_ZERO_COMPLETION_HASH` row described itself as *"a single named constant… a one-line change with a compiler-visible effect"*. The site was real and correctly named — and the estimate was wrong in a way that mattered: the allowance was load-bearing for `hydra_wire::encode_finalize_activation` itself, hence for `hydra-worker::pair` and the three demo/CI binaries, hence for **`container-2node`**, so a flip-to-false would have turned the **standing multi-node verifier red**. It also exposed that the canonical *"activation succeeds"* test had **never once supplied real completion evidence**. **Binding: §8 rows state estimates AS ESTIMATES** — "expected one line", never "is one line" — and **no cost estimate is quoted as a reason to defer or to rush**; the only thing that establishes a change's blast radius is making the change and reading what breaks. **Corollary to rule 22, and its complement:** rule 22 costs one `grep`; this one costs one build, and both are cheaper than the item that looked done because nobody paid either.
 
-### (b) In-flight state (refreshed 2026-08-24 at session close)
+### (b) In-flight state (refreshed 2026-09-02 at session close)
 
 > **⏳ IN FLIGHT. Read this before treating any local artifact as a result.**
 >
-> **Refreshed 2026-08-25 at session close.** **No local background job is running.** Local == remote
+> **Refreshed 2026-09-02 at session close.** **No local background job is running.** Local == remote
+> at `4a67269`. **The 2026-09-01 directive is EXECUTED in full except item 6 (optional; nothing to commit — no compiled knowledge base exists, see §12)**: items 1–5 landed as seams `aa7ab70`/`a00089d` (summariser + §7.68), `f7e47e6` (leg 7, stale rows, M7/H10), `41ca8cd` (§7.69), `3b91179` (Metal abort fixed, §7.71), `e5843ab` (engine in `fuzz.yml`), and the receipts commit (§7.72). **Fuzz: 28.150 / 24 CPU-hours across 11 receipted legs, 0 crashes — MET.** **Metal abort: FIXED** (§7.71; the three GPU-OOM suites remain §8's hardware residual). **The next scheduled fuzz leg (Tue 04:15 UTC) is the first SCHEDULED leg with the vendored parser driven** — quote it, and note that its 900 s now split eight ways.
+>
+> *(Prior refresh, retained:)* **Refreshed 2026-08-25 at session close.** **No local background job is running.** Local == remote
 > at `303f729`. **All CI is green and OBSERVED, not assumed:** `container-2node`
 > `verdict=GREEN` on both arms (plain + `tc netem` jitter) on the commit that deletes the v1
 > blocker; `clean-checkout`, `TLC` and `DST Marathon` green on `HEAD`; fuzz leg 4 banked.
@@ -96,9 +99,7 @@
 > the vendored working tree — exactly the seven files listed in (1) of §0(c). Reverting them
 > silently disables the feature the patch provides.
 >
-> **1. Weekly fuzz legs** — `fuzz.yml`, Tuesdays 04:15 UTC, **eight targets** (`gguf`,
-> `frame-header`, `wire-body`, `manifest`, `bootstrap`, `wal-record`, `boundary-record`, and
-> `vendored-gguf`). **Only seven are required by the classify step**: `vendored-gguf` needs the real
+> **1. Weekly fuzz legs** — `fuzz.yml`, Tuesdays 04:15 UTC, **eight targets, ALL EIGHT REQUIRED since 2026-09-02 (§7.72)**: `gguf`, `frame-header`, `wire-body`, `manifest`, `bootstrap`, `wal-record`, `boundary-record`, and `vendored-gguf` — the workflow builds the vendored engine (cached on the pin SHA) and a shard whose engine is the stub is INCONCLUSIVE. *(Superseded:)* **Only seven are required by the classify step**: `vendored-gguf` needs the real
 > engine and **CI never builds it** (audit L1), so its CI status is **unavailable, never green**.
 > **Running total 12.150 / 24 CPU-hours (seven legs receipted; leg 7 banked 2026-09-01).** Obligation per leg: quote its `verdict=` lines into a new
 > `verification/ci-results/fuzz-<run-id>.md` and append the cumulative row. Until quoted, a leg is
@@ -135,6 +136,14 @@
 > **historical**. The quotable results are in `verification/ci-results/` and §12.
 
 ### (c) Current status + next work
+
+> **⚡⚡⚡ CURRENT STATE — 2026-09-02 (THIS BLOCK IS AUTHORITATIVE; every block below it is historical record).**
+>
+> **All gates M−1 → M3 PASSED; M4 code-complete; the M4 gate table (`verification/M4-GATE.md`) is assembled.** Since the 2026-08-25 pause: the 2026-09-01 STATE-OF-REPO report was ratified (§3 rejected → §7.68 and `scripts/test-receipt.sh`); the held directive was issued and executed (§7.69–§7.72). **M4 gate rows now: row 1 (fresh-account run) OPEN — owner's; row 2a/2b MET; row 3 (24 CPU-hours) MET (§7.72); row 4 (GPU) MET-on-measurable with the Metal ABORT residual now FIXED (§7.71) and the GPU-OOM residual still hardware-bound.**
+>
+> **What is owed and by whom (the four owner asks of 2026-08-25, updated):** (a) ratify or overrule each proposed ACCEPT in `M4-PRERELEASE-TRIAGE.md` — still open; (b) the CPU-only-evidence ruling — made (row 4 exists; measured); (c) the fork — DONE and ratified; (d) `docs/FRESH-ACCOUNT-TEST.md` — still the one measurement the project cannot take itself. **Agent-side owed, from this session:** the H10 residual found by reconciliation (the shipped `hydra-coordinator` never `open`s an existing stream — §8), the `recovery::read` chunk-commit half, and the rule-19 oracle gaps. **Do not start v2 work.**
+>
+> **Full-suite receipts come only from `scripts/test-receipt.sh`** (§7.68). Latest, both arms on `3b91179`: `arm=real exit=0 running=94 readable=94 mangled=0 passed=392 failed=0 ignored=7 ggml_assert=0 stub_msgs=0 wall=79m44s verdict=GREEN` · `arm=stub exit=0 running=94 readable=94 mangled=0 passed=392 failed=0 ignored=7 ggml_assert=0 stub_msgs=1 wall=31m32s verdict=GREEN`.
 
 > **⚡⚡⚡ CURRENT STATE — 2026-08-24 (THIS BLOCK IS AUTHORITATIVE; every narrative below it is historical record and superseded here).**
 >
@@ -315,7 +324,7 @@ The gate-evidence-table *format* (a)–(f) is preserved in `verification/M1-GATE
 > `hydra-worker`, which depends on `hydra-coordinator`, so the coordinator could not encode a frame
 > without a dependency cycle — see rule 21). **Binaries that matter now:** `hydra-coordinator` (the
 > real one, serves the API over TLS), `hydra-worker`, `hydra-cli` (`pair` / `status`).
-> **Build/test:** `cargo test --workspace -- --test-threads=1`. **Do NOT run overlapping `cargo`
+> **Build/test:** `scripts/test-receipt.sh` (both arms, checked counts — the only accepted receipt; §7.68); the bare command it wraps is `cargo test --workspace --no-fail-fast -- --test-threads=1`. **The M−1 sweep:** `spike/sweep.sh` reads `spike/sweep-prompts.txt`. **Do NOT run overlapping `cargo`
 > invocations** — they contend for the target lock and the stall looks exactly like a deadlock in
 > the code; that misread cost real time twice this session.
 
@@ -788,6 +797,7 @@ Apple Silicon M2, 8 GB RAM (→ small models locally; 70B targets need M2-milest
 5. If reality and this file disagree, fixing this file is the *first* task.
 
 ## 12. Changelog of this document
+- **2026-09-02** — **📋 SESSION HANDOFF: §0 refreshed to this moment** — (a) rules unchanged, the §7.69 patterns and §7.68's widening of rule 25 named; (b) in-flight rewritten (directive executed; fuzz 28.150 / 24 CPU-hours across 11 receipted legs, 0 crashes — MET; Metal abort fixed; next scheduled leg is the first scheduled engine leg); (c) a new authoritative current-state block; (d) `scripts/test-receipt.sh` and `spike/sweep.sh` recorded as the procedures. Item 6 of the directive (optional `docs/PROJECT-HISTORY.md`) NOT done: no compiled knowledge base exists to commit, and authoring one is new work the ruling did not ask for.**
 - **2026-09-02** — **✅ SEAM 4b+5: `vendored-gguf` wired and required in `fuzz.yml` (§7.72); self-test run 33659710112 quoted; acceleration legs dispatched at 2700 s/shard and receipted; cumulative 28.150 / 24 — MET.**
 - **2026-09-02** — **➡️ SEAM 4b LANDED, OBSERVATION PENDING: `fuzz.yml` now checks out the submodule, builds the vendored engine (CPU, shared, `GGML_NATIVE=OFF`, cached on the pin SHA), asserts from the build log that no stub was built, REQUIRES `vendored-gguf`, and classifies a vendored-parser abort as RED with the driver's IN-FLIGHT coordinates; a `force_stub_shard` dispatch input exists so the refusal can be watched firing (rule 25). The driver's `reason=` string now names the mechanism (stub built) instead of closed L1. Nothing is claimed until the self-test and the first engine leg are quoted (§7.72, to follow).**
 - **2026-09-02** — **✅ FIXED SEAM 4a: the Metal teardown abort was Hydra's leak (§7.71).** Pre-fix oracle at ngl 99 on `41ca8cd`: `arm=real exit=101 running=4 readable=4 mangled=0 passed=15 failed=0 ignored=0 ggml_assert=4 stub_msgs=0 wall=10m57s verdict=RED (cargo exit=101 with no failing result line — read the stderr)`. Post-fix: `arm=real exit=0 running=4 readable=4 mangled=0 passed=15 failed=0 ignored=0 ggml_assert=0 stub_msgs=0 wall=8m50s verdict=GREEN` · `arm=real exit=0 running=5 readable=5 mangled=0 passed=22 failed=0 ignored=0 ggml_assert=0 stub_msgs=0 wall=10m51s verdict=GREEN` · OOM suites `arm=real exit=101 running=3 readable=3 mangled=0 passed=7 failed=2 ignored=0 ggml_assert=0 stub_msgs=0 wall=6m18s verdict=RED (failed=2)`. Full workspace: `arm=real exit=0 running=94 readable=94 mangled=0 passed=392 failed=0 ignored=7 ggml_assert=0 stub_msgs=0 wall=79m44s verdict=GREEN · arm=stub exit=0 running=94 readable=94 mangled=0 passed=392 failed=0 ignored=7 ggml_assert=0 stub_msgs=1 wall=31m32s verdict=GREEN`. Receipt `verification/ci-results/metal-teardown-fix-2026-09-02.md`. No upstream report drafted (directive condition unmet).
