@@ -1,6 +1,6 @@
 name: fuzz
 
-# M4·1 (c) — parser fuzzing for the two untrusted-input surfaces.
+# M4·1 (c) — parser fuzzing for every parser of untrusted input in the tree.
 #
 # BLUEPRINT §3 (M4 DoD): "GGUF parser fuzzed for 24 CPU-hours without crashes."
 # Report Addendum 2 §D1: model files are untrusted input; GGUF parsing has had real CVEs.
@@ -12,7 +12,16 @@ name: fuzz
 # Rule 16, as everywhere: the job is GREEN only if the LOG says so. A green check-mark from a runner
 # is not evidence; the `verdict=` lines the driver prints are.
 #
-# Shape: `--seconds` per shard × `matrix.shard` shards × 3 targets, in parallel. Every shard uses a
+# **THE ENGINE IS BUILT HERE (directive 2026-09-01, item 4b).** Until 2026-09-01 this workflow never
+# initialised the submodule, so `hydra-engine-sys` built its stub and the `vendored-gguf` target —
+# the one that drives `gguf_init_from_file`, i.e. the parser a WORKER actually loads a shard
+# through — reported `verdict=UNAVAILABLE` on every leg. Every CPU-hour banked before this change
+# is on the seven pure-Rust parsers. From the first leg on this workflow, "GGUF parser fuzzed" also
+# means the vendored parser, and `vendored-gguf` is a REQUIRED target: a shard whose engine is
+# the stub is INCONCLUSIVE, never green. The engine build is cached on the submodule SHA so leg
+# time goes to fuzzing, not compiling.
+#
+# Shape: `--seconds` per shard × `matrix.shard` shards × 8 targets, in parallel. Every shard uses a
 # DIFFERENT seed, so parallelism buys coverage rather than repetition — running the same seed N
 # times would multiply the CPU-hours without adding a single new input.
 
@@ -38,9 +47,13 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: 'CPU-seconds per shard (split evenly across the 3 targets)'
+        description: 'CPU-seconds per shard (split evenly across the targets). Default 900 = the weekly leg. Directive 2026-09-01 item 5 authorises 2700 for dispatched acceleration legs — receipt them as "dispatched, not scheduled" (rule 24).'
         required: false
         default: '900'
+      force_stub_shard:
+        description: 'RULE-25 SELF-TEST ONLY: shard number (1-8) to build with HYDRA_FORCE_ENGINE_STUB=1, so the classify step can be watched refusing an engine-less shard as INCONCLUSIVE. Leave empty for a real leg.'
+        required: false
+        default: ''
   schedule:
     - cron: '15 4 * * 2'   # weekly Tuesday 04:15 UTC — a leg toward the 24 CPU-hour DoD
 
@@ -50,8 +63,10 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    # 8 shards × 900 s ≈ 2 CPU-hours per weekly leg; ~12 legs reach the DoD.
-    timeout-minutes: 45
+    # 8 shards × 900 s ≈ 2 CPU-hours per weekly leg. A dispatched 2700 s leg is 45 min of fuzzing
+    # plus a (cached) engine build, so the ceiling is raised well above it; the Actions job limit
+    # is 360 minutes.
+    timeout-minutes: 90
     strategy:
       # `fail-fast: false` so one crashing shard does not cancel the others — the CPU-seconds the
       # survivors spend are real evidence and are not thrown away because a sibling found a bug.
@@ -62,32 +77,88 @@ jobs:
         # nothing is worse than no knob. Change the list to change the width.
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
-      # No submodule init → hydra-engine-sys degrades to its control-plane stub. The parsers under
-      # test are pure Rust and need no engine; this also keeps the arm cheap enough to run weekly.
+      # The submodule IS the engine (audit L1 closed): the pinned fork carries the layer-window
+      # patch, so a plain init gives the tree the tests were run on.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Record the engine pin (the receipt names it; the cache is keyed on it)
+        id: pin
+        run: |
+          sha=$(git -C vendor/llama.cpp rev-parse HEAD)
+          echo "engine-pin=$sha"
+          echo "engine-pin-status=$(git -C vendor/llama.cpp status --porcelain | wc -l | tr -d ' ') modified files (must be 0)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # The build tree is what `hydra-engine-sys/build.rs` links (`vendor/llama.cpp/build/bin`).
+      # Cached on the exact submodule SHA + the configure flags below: a pin change rebuilds, a
+      # push that leaves the pin alone restores in seconds. CPU backend only — this is a parser
+      # target, and the runner has no GPU. `GGML_NATIVE=OFF` so the cached binary does not depend
+      # on which CPU model the runner happened to be.
+      - name: Restore the engine build tree
+        id: engine-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/llama.cpp/build
+          key: engine-build-v1-${{ runner.os }}-${{ steps.pin.outputs.sha }}-cpu-shared-nonative
+
+      - name: Build the vendored engine (llama + ggml-cpu, shared, CPU only)
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S vendor/llama.cpp -B vendor/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build vendor/llama.cpp/build --target llama -j"$(nproc)"
+          ls -la vendor/llama.cpp/build/bin/ | grep -E 'libllama|libggml' || { echo "engine libs missing after build"; exit 1; }
 
       # Release, because a release build runs ~10x more cases per second and CPU-hours are the DoD.
       # The debug build is NOT redundant: `cargo test -p hydra-fuzz` runs the same generator in
       # debug on every push, where arithmetic overflow PANICS instead of wrapping silently. Both
       # matter — debug catches the overflow, release reaches deeper. This is stated because running
       # only release would quietly give up the overflow oracle.
-      - name: Build the fuzz driver (release)
-        run: cargo build --release -p hydra-fuzz --bin hydra-fuzz
+      #
+      # **Rule 25 self-test:** `force_stub_shard` builds ONE shard deliberately engine-less so the
+      # classify step's refusal can be observed firing (an oracle must be able to produce the
+      # failure it guards). A real leg leaves it empty.
+      - name: Build the fuzz driver (release, linked against the vendored engine)
+        env:
+          FORCE_STUB: ${{ github.event.inputs.force_stub_shard == format('{0}', matrix.shard) && '1' || '' }}
+        run: |
+          set -o pipefail
+          if [ -n "$FORCE_STUB" ]; then
+            echo "engine=STUB (forced by force_stub_shard=${{ github.event.inputs.force_stub_shard }} — rule-25 self-test)"
+            HYDRA_FORCE_ENGINE_STUB=1 cargo build --release -p hydra-fuzz --bin hydra-fuzz 2>&1 | tee build.log
+          else
+            cargo build --release -p hydra-fuzz --bin hydra-fuzz 2>&1 | tee build.log
+            # The build script announces a stub loudly; a real leg must have built none. This is
+            # checked from the build LOG, not inferred from the cache step's status.
+            if grep -qiE 'building a stub|building the STUB' build.log; then
+              echo "engine=STUB — hydra-engine-sys did not link the vendored engine on a real leg"
+              grep -iE 'building a stub|building the STUB' build.log
+              echo "verdict=INCONCLUSIVE (the engine was not linked, so vendored-gguf cannot run — the leg is not evidence about the vendored parser)"
+              exit 1
+            fi
+            echo "engine=REAL (no stub message in the build log)"
+          fi
 
-      # `--target all` now covers EIGHT targets, SEVEN of which run here — every parser of untrusted input in the tree, per
+      # `--target all` covers EIGHT targets — every parser of untrusted input in the tree, per
       # standing rule 17 (a defect class fixed in one parser and left in another is not fixed):
-      # manifest/bootstrap/wal-record added by audit Wave 1a, boundary-record by Wave 1c (C3). A
-      # fixed --seconds buys proportionally less time per target. The classify step below requires
-      # ALL SEVEN to report, so a silently-dropped target is INCONCLUSIVE rather than a pass.
+      # manifest/bootstrap/wal-record added by audit Wave 1a, boundary-record by Wave 1c (C3),
+      # vendored-gguf by Wave 3 (H6) and REQUIRED since 2026-09-01. A fixed --seconds buys
+      # proportionally less time per target. The classify step below requires ALL EIGHT to report
+      # AND to have been driven, so a silently-dropped or stubbed target is INCONCLUSIVE, never a pass.
       - name: Fuzz (shard ${{ matrix.shard }}, distinct seed)
         env:
           SECONDS_PER_SHARD: ${{ github.event.inputs.seconds || '900' }}
         run: |
           set -o pipefail
           SEED=$(( ${{ matrix.shard }} * 1000003 ))
+          echo "shard-seconds=$SECONDS_PER_SHARD trigger=${{ github.event_name }}"
           ./target/release/hydra-fuzz \
             --target all \
             --seconds "$SECONDS_PER_SHARD" \
@@ -100,6 +171,17 @@ jobs:
           grep -E '^(target=|FUZZ SUMMARY)' "$LOG" || true
           echo "---------------------"
 
+          # **A vendored-parser ABORT leaves no summary and no CRASH line** — SIGABRT inside
+          # libggml kills the process, so the driver cannot report it. What survives is the IN-FLIGHT
+          # marker the driver writes before every probe (audit H6's reproduction contract): if it is
+          # still there, it names the case that killed the shard. Read it FIRST, so an abort is RED
+          # with replay coordinates rather than a generic "the driver did not finish".
+          MARKER="${TMPDIR:-/tmp}/hydra-fuzz-vendored/IN-FLIGHT"
+          if [ -f "$MARKER" ]; then
+            cp "$MARKER" "fuzz-shard-${{ matrix.shard }}.IN-FLIGHT"
+            echo "verdict=RED (the vendored parser ABORTED mid-case — a live finding on OUR pinned fork; rule 8: duplicate-search upstream master first. In-flight case: $(cat "$MARKER"))"
+            exit 1
+          fi
           # A missing summary line is a FAILURE, not a pass. A job that produced no verdict proves
           # nothing, and mapping "no output" to green is exactly the masked-failure shape rule 16
           # exists to prevent (§7.14/§7.15 caught it twice).
@@ -107,43 +189,40 @@ jobs:
             echo "verdict=INCONCLUSIVE (no FUZZ SUMMARY line — the driver did not finish)"
             exit 1
           fi
-          # Every target must have reported, or the run covered less than it claims.
-          # NOTE (audit H6): `vendored-gguf` is deliberately NOT in this list. It requires the real
-          # engine, and CI never builds it (audit L1 — build.rs degrades to a stub), so requiring it
-          # here would fail every run for a reason that has nothing to do with the parsers. Its CI
-          # status is UNAVAILABLE, not green, and the receipts must say which parser they protect.
-          for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record; do
+          # Every target must have reported, or the run covered less than it claims — and every
+          # target must have been DRIVEN, not merely mentioned. Until 2026-08-24 the driver printed
+          # verdict=GREEN for a target it had skipped entirely, so "reported" and "ran" were not the
+          # same claim and nothing here could tell them apart.
+          #
+          # `vendored-gguf` is in this list since 2026-09-01: the engine is built above, so a shard
+          # on which it reports UNAVAILABLE is a shard whose engine is the stub — INCONCLUSIVE.
+          # (`force_stub_shard` exists precisely so this branch can be watched firing.)
+          for t in gguf frame-header wire-body manifest bootstrap wal-record boundary-record vendored-gguf; do
             grep -q "^target=$t " "$LOG" || { echo "verdict=INCONCLUSIVE (target $t never reported)"; exit 1; }
-            # A REQUIRED target must have been DRIVEN, not merely mentioned. Until 2026-08-24 the
-            # driver printed verdict=GREEN for a target it had skipped entirely, so "reported" and
-            # "ran" were not the same claim and nothing here could tell them apart.
             grep -qE "^target=$t .*verdict=UNAVAILABLE" "$LOG" && {
-              echo "verdict=INCONCLUSIVE (required target $t reported UNAVAILABLE — it was not driven)"; exit 1; }
+              echo "verdict=INCONCLUSIVE (required target $t reported UNAVAILABLE — it was not driven; on vendored-gguf that means the engine was not linked)"; exit 1; }
           done
-          # `vendored-gguf` is EXPECTED to be unavailable here (audit L1). Assert that it says so
-          # rather than trusting it to: if it ever prints GREEN in CI, either the engine got built
-          # (good — promote it to the required list) or the target went back to claiming a green it
-          # did not earn (the §7.62 defect). Both need a human, so both stop the run.
-          if grep -qE "^target=vendored-gguf .*verdict=GREEN" "$LOG"; then
-            echo "verdict=INCONCLUSIVE (vendored-gguf reported GREEN in CI, where the engine is not built —"
-            echo "  either L1 is fixed and this target should be REQUIRED, or it is claiming an unearned green)"
-            exit 1
-          fi
+          # Belt and braces: the summary's own gap count must be zero now that all eight are required.
+          grep '^FUZZ SUMMARY' "$LOG" | grep -qE 'unavailable=0|targets=8 cpu_seconds' || {
+            echo "verdict=INCONCLUSIVE (summary reports an unavailable target: $(grep '^FUZZ SUMMARY' "$LOG"))"; exit 1; }
           if grep -qE '^CRASH ' "$LOG"; then
-            echo "verdict=RED (parser crash — replay coordinates are in the CRASH lines above)"
+            echo "verdict=RED (parser crash — replay coordinates are in the CRASH lines above; a vendored-gguf crash is a live finding on OUR pinned fork: rule 8, duplicate-search upstream master first)"
             exit 1
           fi
           grep '^FUZZ SUMMARY' "$LOG" | grep -q 'verdict=GREEN' || {
             echo "verdict=RED (summary is not GREEN)"; exit 1; }
-          # The summary now carries `unavailable=N`, so the quoted line states its own gap.
           echo "verdict=GREEN ($(grep '^FUZZ SUMMARY' "$LOG"))"
-          echo "--- coverage note for the receipt (Wave-3 directive: say which parser is protected) ---"
-          grep -E "^target=.*verdict=UNAVAILABLE" "$LOG" || echo "(every configured target was driven)"
+          echo "--- coverage note for the receipt ---"
+          echo "vendored-gguf: $(grep '^target=vendored-gguf ' "$LOG")"
 
       - name: Upload the shard log (the receipt's raw source)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-shard-${{ matrix.shard }}
-          path: fuzz-shard-${{ matrix.shard }}.log
+          path: |
+            fuzz-shard-${{ matrix.shard }}.log
+            fuzz-shard-${{ matrix.shard }}.IN-FLIGHT
+            build.log
+          if-no-files-found: ignore
           retention-days: 90

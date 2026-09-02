@@ -170,7 +170,7 @@ impl Target {
     /// already covers) and then does nothing — yet the driver counted its iterations and printed
     /// GREEN, because the verdict was "no crashes" and a no-op never crashes.
     ///
-    /// **In CI that green was structural**: audit L1 means CI never builds the real engine, so
+    /// **In CI that green was structural** (until 2026-09-01): CI never built the real engine, so
     /// every fuzz leg ever run printed `target=vendored-gguf ... verdict=GREEN` for ~100M
     /// iterations of a parser it never called, and spent an eighth of the CPU-hour budget doing
     /// it. PROJECT_STATE said its CI status is "unavailable, never green" — but the LOG said
@@ -180,10 +180,18 @@ impl Target {
     /// §7.31 in the evidence layer — *a test whose name promises more than its assertion is worse
     /// than no test, because it terminates inquiry* — and rule 19's blind oracle: it could not
     /// produce the failure it guards.
+    ///
+    /// **The reason string names the MECHANISM, not a closed audit item.** It used to cite
+    /// "audit L1"; L1 closed on 2026-08-25 (the engine is a pinned fork) and the string kept
+    /// citing it for a week, which is a caveat that had outlived its fact. What makes this target
+    /// unavailable is only ever that `hydra-engine-sys` built its stub — because no vendored build
+    /// tree was present, or because `HYDRA_FORCE_ENGINE_STUB` was set — and that is what it says.
     pub fn unavailable_reason(self) -> Option<&'static str> {
         match self {
             Target::VendoredGguf if !hydra_engine_sys::ENGINE_AVAILABLE => Some(
-                "engine not linked (audit L1): gguf_init_from_file is never invoked, so this target proves nothing",
+                "engine not linked: hydra-engine-sys built its STUB (no vendored llama.cpp build tree, \
+                 or HYDRA_FORCE_ENGINE_STUB set), so gguf_init_from_file is never invoked and this \
+                 target proves nothing",
             ),
             _ => None,
         }
