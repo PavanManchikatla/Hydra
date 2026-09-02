@@ -37,6 +37,63 @@ struct HydraContext {
 
 static bool g_backends_loaded = false;
 
+// ---------------------------------------------------------------------------------------------
+// [§7.71, 2026-09-01] Live-handle registry + exit drain — the Metal shutdown abort.
+//
+// ggml's Metal backend keeps its device in a function-local static (`ggml_metal_device_get`,
+// a `std::vector<unique_ptr>`), destroyed at process exit; the destructor asserts that every GPU
+// buffer was released (`GGML_ASSERT([rsets->data count] == 0)`). A model or context still alive
+// at exit therefore ABORTS the process after every test has already passed. Hydra's worker used to
+// leak its model outright (fixed in worker.rs), and test harnesses run endpoint threads that are
+// simply abandoned at exit — so the honest position is: whatever is still alive when the process
+// exits is released here, before ggml tears the device down.
+//
+// Ordering is the whole trick and it is deliberate: `std::atexit` handlers and C++ static
+// destructors run in REVERSE order of registration, and the Metal device static is constructed
+// (hence its destructor registered) DURING the first model load. Registering the drain AFTER that
+// load returns guarantees it runs BEFORE the device destructor. Frees are idempotent — a handle
+// the drain has already released is skipped — so a Rust `Drop` racing the exit is harmless.
+#include <mutex>
+#include <algorithm>
+#include <cstdlib>
+
+static std::mutex                 g_live_mu;
+static std::vector<HydraModel*>   g_live_models;
+static std::vector<HydraContext*> g_live_ctxs;
+static bool                       g_drain_registered = false;
+
+static void hydra_drain_live_handles_at_exit() {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    // Contexts first: each borrows its model.
+    for (HydraContext* c : g_live_ctxs) { if (c && c->ctx) llama_free(c->ctx); delete c; }
+    g_live_ctxs.clear();
+    for (HydraModel* m : g_live_models) { if (m && m->model) llama_model_free(m->model); delete m; }
+    g_live_models.clear();
+}
+
+static void hydra_track_model(HydraModel* h) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_models.push_back(h);
+    if (!g_drain_registered) { std::atexit(hydra_drain_live_handles_at_exit); g_drain_registered = true; }
+}
+static void hydra_track_context(HydraContext* c) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_ctxs.push_back(c);
+}
+// Returns true iff the handle was live (and is now untracked); false means it was already drained.
+static bool hydra_untrack_model(HydraModel* h) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    auto it = std::find(g_live_models.begin(), g_live_models.end(), h);
+    if (it == g_live_models.end()) return false;
+    g_live_models.erase(it); return true;
+}
+static bool hydra_untrack_context(HydraContext* c) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    auto it = std::find(g_live_ctxs.begin(), g_live_ctxs.end(), c);
+    if (it == g_live_ctxs.end()) return false;
+    g_live_ctxs.erase(it); return true;
+}
+
 extern "C" {
 
 HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers) {
@@ -53,6 +110,7 @@ HydraModel* hydra_model_load(const char* path, int32_t n_gpu_layers) {
     h->n_layer = llama_model_n_layer(model);
     h->n_embd  = llama_model_n_embd(model);
     h->n_vocab = llama_vocab_n_tokens(h->vocab);
+    hydra_track_model(h);
     return h;
     HYDRA_GUARD_END(nullptr)
 }
@@ -76,6 +134,7 @@ HydraModel* hydra_model_load_shard(const char* path, int32_t l0, int32_t l1, int
     h->n_vocab = llama_vocab_n_tokens(h->vocab);
     h->load_l0 = l0;
     h->load_l1 = l1;
+    hydra_track_model(h);
     return h;
     HYDRA_GUARD_END(nullptr)
 }
@@ -102,6 +161,7 @@ HydraModel* hydra_model_load_vocab_only(const char* path) {
     h->n_layer = llama_model_n_layer(model);
     h->n_embd  = llama_model_n_embd(model);
     h->n_vocab = llama_vocab_n_tokens(h->vocab);
+    hydra_track_model(h);
     return h;
     HYDRA_GUARD_END(nullptr)
 }
@@ -109,6 +169,7 @@ HydraModel* hydra_model_load_vocab_only(const char* path) {
 void hydra_model_free(HydraModel* m) {
     HYDRA_GUARD_BEGIN
     if (!m) return;
+    if (!hydra_untrack_model(m)) return;   // already released by the exit drain
     if (m->model) llama_model_free(m->model);
     delete m;
     HYDRA_GUARD_END_VOID
@@ -189,6 +250,7 @@ HydraContext* hydra_context_new(HydraModel* m, int32_t l0, int32_t l1,
     auto* h = new HydraContext();
     h->ctx = ctx; h->n_embd = m->n_embd; h->n_vocab = m->n_vocab; h->embeddings = cp.embeddings;
     h->n_ctx = n_ctx; h->n_batch = n_batch;
+    hydra_track_context(h);
     return h;
     HYDRA_GUARD_END(nullptr)
 }
@@ -196,6 +258,7 @@ HydraContext* hydra_context_new(HydraModel* m, int32_t l0, int32_t l1,
 void hydra_context_free(HydraContext* c) {
     HYDRA_GUARD_BEGIN
     if (!c) return;
+    if (!hydra_untrack_context(c)) return; // already released by the exit drain
     if (c->ctx) llama_free(c->ctx);
     delete c;
     HYDRA_GUARD_END_VOID

@@ -157,14 +157,38 @@ pub enum WorkerError {
     Transport(#[from] hydra_transport::TransportError),
 }
 
-/// The engine half of a worker. The [`Model`] is leaked to `'static` (one per worker process, freed
-/// at process exit) so the borrowing [`Context`] can be stored beside it without a self-referential
+/// The engine half of a worker. The [`Model`] is boxed to a raw pointer and handed out as
+/// `&'static` so the borrowing [`Context`] can be stored beside it without a self-referential
 /// struct; the worker owns the engine on a single thread, so the non-`Send` C handle never travels.
+///
+/// **§7.71 (2026-09-01) — the model is NOT leaked any more.** Until this seam the comment above
+/// read *"leaked to `'static` (one per worker process, freed at process exit)"* — and the second
+/// half was false: a `Box::leak` is freed by nobody. On Metal that was the shutdown abort of
+/// §7.65/§7.67 (`GGML_ASSERT([rsets->data count] == 0)`): ggml's Metal device singleton is torn
+/// down at exit and asserts that every GPU buffer was released, and the leaked model's buffers
+/// never were. #22593's "rsets_rm is never called" was the wrong root cause; the buffer simply
+/// outlived the device because its owner was never dropped. [`Drop for Engine`] releases the
+/// context first (it borrows the model) and then un-leaks the model.
 struct Engine {
-    ctx: Context<'static>,
+    /// Dropped explicitly in [`Drop for Engine`], BEFORE the model it borrows.
+    ctx: std::mem::ManuallyDrop<Context<'static>>,
+    /// The boxed model behind `ctx`'s `'static` borrow; un-leaked in [`Drop for Engine`].
+    model: *mut Model,
     n_embd: usize,
     /// True iff this stage extracts a boundary (i.e. it is not the final logits stage).
     emit_boundary: bool,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // SAFETY: `ctx` is dropped exactly once, here, and it is the only borrower of `*model`;
+        // `model` came from `Box::into_raw` in `try_new` and is reclaimed exactly once, after the
+        // borrower is gone. Nothing else holds the `'static` reference past this point.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.ctx);
+            drop(Box::from_raw(self.model));
+        }
+    }
 }
 
 /// `i32::try_from` on a network-derived position, bounded to `[0, n_ctx)` (audit 1c). Every
@@ -209,11 +233,21 @@ impl Engine {
             None => Model::load(path, cfg.n_gpu_layers)?,
         };
         let n_embd = model.n_embd() as usize;
-        let model: &'static Model = Box::leak(Box::new(model));
+        let model_ptr: *mut Model = Box::into_raw(Box::new(model));
+        // SAFETY: the pointer is valid until `Drop for Engine` reclaims it, and `ctx` (the only
+        // borrower) is dropped there first. See the struct comment.
+        let model: &'static Model = unsafe { &*model_ptr };
         // A boundary-emitting stage is an embeddings context; the final stage is a logits context.
         let embeddings = !cfg.is_final;
-        let ctx = model.context(cfg.layer_first, cfg.layer_last, embeddings, cfg.n_ctx, cfg.n_ctx)?;
-        Ok(Some(Engine { ctx, n_embd, emit_boundary: embeddings }))
+        let ctx = match model.context(cfg.layer_first, cfg.layer_last, embeddings, cfg.n_ctx, cfg.n_ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                // The context failed, so nothing borrows the model: reclaim it instead of leaking.
+                unsafe { drop(Box::from_raw(model_ptr)) };
+                return Err(e.into());
+            }
+        };
+        Ok(Some(Engine { ctx: std::mem::ManuallyDrop::new(ctx), model: model_ptr, n_embd, emit_boundary: embeddings }))
     }
 
     /// Apply one token at `pos`. Returns the extracted boundary (emit stages) or `None` (final).
