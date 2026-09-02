@@ -19,13 +19,15 @@ if [ "${1:-}" = "--no-edit" ]; then NOEDIT=1; shift; else while [ $# -gt 0 ] && 
 PATHS=(); MSG=""
 while [ $# -gt 0 ]; do case "$1" in -m) MSG="$2"; shift 2;; *) PATHS+=("$1"); shift;; esac; done
 [ -n "$MSG" ] || { echo "state-commit: -m message required" >&2; exit 2; }
-before=$(git hash-object PROJECT_STATE.md)
+# The reference PROJECT_STATE.md is compared against is what is COMMITTED (HEAD), not the working
+# tree before the edit: with --no-edit the working tree is already edited, and comparing a hash
+# against itself would refuse every correct commit (found on the guard's first --no-edit use).
 if [ "$NOEDIT" -eq 0 ]; then
   [ "${#EDIT[@]}" -gt 0 ] || { echo "state-commit: no edit script given" >&2; exit 2; }
   "${EDIT[@]}" || { echo "state-commit: REFUSED — the edit step exited non-zero; nothing committed" >&2; exit 1; }
 fi
-after=$(git hash-object PROJECT_STATE.md)
-[ "$before" != "$after" ] || { echo "state-commit: REFUSED — PROJECT_STATE.md is unchanged (§11 same-commit rule); nothing committed" >&2; exit 1; }
-git add PROJECT_STATE.md "${PATHS[@]}"
+git diff --quiet HEAD -- PROJECT_STATE.md && { echo "state-commit: REFUSED — PROJECT_STATE.md is unchanged against HEAD (§11 same-commit rule); nothing committed" >&2; exit 1; }
+# An empty extra-path list is legal (a PROJECT_STATE-only commit); `${PATHS[@]+...}` is the bash-3.2-safe spelling under set -u.
+git add PROJECT_STATE.md ${PATHS[@]+"${PATHS[@]}"}
 git commit -q -m "$MSG"
 echo "state-commit: committed $(git rev-parse --short HEAD)"
