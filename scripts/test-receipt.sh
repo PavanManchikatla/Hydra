@@ -9,13 +9,15 @@
 # receipt whose numbers are checked against each other.
 #
 # Rule 25 — the failure mode must be expressible. The receipt EXITS NON-ZERO with
-# `verdict=INCONCLUSIVE` when running == 0, when readable == 0, or when mangled > 0. A run that
+# `verdict=INCONCLUSIVE` when running == 0, when readable == 0, when mangled > 0, or when
+# passed + failed + ignored == 0 (every suite started, no test executed — 2026-09-02). A run that
 # produced no events is not a clean run; it is no run. Test this on an empty log before trusting it
 # on a real one (`--summarise /dev/null /dev/null` must say INCONCLUSIVE).
 #
 # Usage:
 #   scripts/test-receipt.sh [--out DIR] [--arms real,stub] [--toolchain 1.98.0] [-- <extra cargo test args>]
 #   scripts/test-receipt.sh --summarise STDOUT STDERR [ARM-LABEL]      # classify an existing pair of logs
+#   scripts/test-receipt.sh --selftest                                  # the summariser's own oracle (fabricated logs)
 #
 # Extra args after `--` are appended to `cargo test` BEFORE the libtest `--` (package/test filters),
 # e.g. `-- -p hydra-worker --test d1_two_stage`. HYDRA_TEST_ENV="K=V K2=V2" adds environment for the
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
     --arms) ARMS="$2"; shift 2;;
     --toolchain) TOOLCHAIN="$2"; shift 2;;
     --summarise) SUMMARISE=1; shift; break;;
+    --selftest) ARMS="--selftest"; shift;;
     --) shift; EXTRA=("$@"); break;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -57,6 +60,10 @@ summarise() {
   if [ "$running" -eq 0 ]; then verdict="INCONCLUSIVE (running=0 — no suite was started; nothing was measured)"; rc=1
   elif [ "$readable" -eq 0 ]; then verdict="INCONCLUSIVE (readable=0 — no complete result line; nothing can be counted)"; rc=1
   elif [ "$mangled" -ne 0 ]; then verdict="INCONCLUSIVE (mangled=$mangled — $running suites started, $readable readable verdicts; a suite's verdict is unreadable)"; rc=1
+  # Rule 25, second instance (design authority, 2026-09-02): a run in which every suite started but
+  # NO TEST EXECUTED is not a clean run — it is a run that measured nothing. The first version of
+  # this script read passed=0 failed=0 ignored=0 as GREEN.
+  elif [ $(( passed + failed + ignored )) -eq 0 ]; then verdict="INCONCLUSIVE (passed+failed+ignored=0 — every suite started and no test executed; nothing was measured)"; rc=1
   elif [ "$failed" -ne 0 ] || grep -qE '^test result: FAILED' "$so"; then verdict="RED (failed=$failed)"; rc=1
   elif [ "$exitcode" != "0" ] && [ "$exitcode" != "?" ]; then verdict="RED (cargo exit=$exitcode with no failing result line — read the stderr)"; rc=1
   else verdict="GREEN"; fi
@@ -67,6 +74,37 @@ summarise() {
   return $rc
 }
 
+# ---- the self-test: the summariser must produce every verdict it guards (rules 19/25) -------
+# Fabricated logs only — no cargo. Each case states the verdict it expects; any mismatch is a
+# failing self-test. `--selftest` exits 0 only when all cases match.
+selftest() {
+  local d; d=$(mktemp -d); local fails=0
+  expect() { # label, expected-verdict-prefix, stdout-file, stderr-file
+    local out; out=$(summarise "$3" "$4" "$1" "?" "?" || true)
+    if [[ "$out" == *"verdict=$2"* ]]; then echo "selftest OK   [$1] -> $2"; else echo "selftest FAIL [$1] expected verdict=$2, got: $out"; fails=$((fails+1)); fi
+  }
+  : > "$d/empty.out"; : > "$d/empty.err"
+  expect "empty log" "INCONCLUSIVE (running=0" "$d/empty.out" "$d/empty.err"
+  printf '     Running unittests src/lib.rs (x)\n     Running tests/a.rs (y)\nggml_metal_free: deallocating\n' > "$d/m.err"
+  printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ggml_metal_free: deallocating\n' > "$d/m.out"
+  expect "mangled (2 started, 1 readable)" "INCONCLUSIVE (mangled=1" "$d/m.out" "$d/m.err"
+  printf '     Running tests/a.rs (y)\n' > "$d/f.err"
+  printf 'test a ... FAILED\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$d/f.out"
+  expect "one failing suite" "RED (failed=1" "$d/f.out" "$d/f.err"
+  # The calibration shape (design authority, 2026-09-02): 94 suites started, 94 readable, and NOT ONE
+  # test executed. This used to read GREEN; it must read INCONCLUSIVE.
+  : > "$d/z.err"; : > "$d/z.out"
+  for i in $(seq 1 94); do printf '     Running tests/s%s.rs (h)\n' "$i" >> "$d/z.err"; printf 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n' >> "$d/z.out"; done
+  expect "zero tests executed (94/94, all 0/0/0)" "INCONCLUSIVE (passed+failed+ignored=0" "$d/z.out" "$d/z.err"
+  printf '     Running tests/a.rs (y)\n   Doc-tests foo\n' > "$d/g.err"
+  printf 'test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$d/g.out"
+  expect "green (2 started, 2 readable, tests ran)" "GREEN" "$d/g.out" "$d/g.err"
+  rm -rf "$d"
+  [ "$fails" -eq 0 ] && { echo "selftest verdict=GREEN (all cases produced the verdict they guard)"; return 0; }
+  echo "selftest verdict=RED ($fails case(s) did not produce the verdict they guard)"; return 1
+}
+
+if [ "${1:-}" = "--selftest" ] || [ "$SUMMARISE" -eq 0 ] && [ "$ARMS" = "--selftest" ]; then selftest; exit $?; fi
 if [ "$SUMMARISE" -eq 1 ]; then
   [ $# -ge 2 ] || { echo "usage: --summarise STDOUT STDERR [LABEL]" >&2; exit 2; }
   summarise "$1" "$2" "${3:-arm}" "?" "?"

@@ -334,6 +334,15 @@ int32_t hydra_kv_truncate(HydraContext* c, int32_t pos) {
 /* [audit H6] The vendored-parser fuzz entry point. Guarded like every other entry point: the
  * point of the exercise is that a hostile GGUF must produce a return value, never an unwind into
  * Rust and never an abort. */
+static void hydra_log_sink(enum ggml_log_level, const char*, void*) { /* dropped on purpose */ }
+
+void hydra_log_silence(void) {
+    HYDRA_GUARD_BEGIN
+    // llama_log_set forwards to ggml_log_set in the vendored tree, so one call covers both.
+    llama_log_set(hydra_log_sink, nullptr);
+    HYDRA_GUARD_END_VOID
+}
+
 int32_t hydra_gguf_probe(const char* path) {
     HYDRA_GUARD_BEGIN
     if (!path) return HYDRA_E_NULL;

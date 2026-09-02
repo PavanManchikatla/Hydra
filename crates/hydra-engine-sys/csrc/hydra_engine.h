@@ -105,6 +105,11 @@ int32_t hydra_kv_truncate(HydraContext* c, int32_t pos);
  * project. A crash here is a crash in the process that holds the model. */
 int32_t hydra_gguf_probe(const char* path);
 
+/* [§7.73] Route the engine's logger to a sink. `gguf_init_from_file` prints a diagnostic for every
+ * hostile file it rejects; a 2700 s fuzz shard produced ~85 MB of them and the printing itself costs
+ * iterations. Idempotent; affects the whole process (ggml + llama share one logger). */
+void hydra_log_silence(void);
+
 #ifdef __cplusplus
 }
 #endif

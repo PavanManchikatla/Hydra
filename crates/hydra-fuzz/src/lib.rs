@@ -297,6 +297,11 @@ pub fn run_case(target: Target, seed: u64, iteration: u64) -> Option<Crash> {
             // one, because that is the order `verify_shard` now enforces on the load path.
             let hardened_accepts = hydra_modelsvc::gguf::Gguf::parse_metadata(&input, input.len() as u64).is_ok();
             if hydra_engine_sys::ENGINE_AVAILABLE && hardened_accepts {
+                // §7.73: the vendored reader logs every rejection; at fuzz rates that was ~85 MB per
+                // 2700 s shard, enough to break the run-level log endpoints, and the printing itself
+                // costs iterations. Silenced once per process, before the first probe.
+                static SILENCED: std::sync::Once = std::sync::Once::new();
+                SILENCED.call_once(hydra_engine_sys::log_silence);
                 if let Some(path) = write_temp_case(&input, seed, iteration) {
                     // The coordinates go to disk BEFORE the call, because the failure mode here is
                     // an uncatchable abort — see `mark_in_flight`.

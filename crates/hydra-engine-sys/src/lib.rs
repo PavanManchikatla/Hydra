@@ -100,6 +100,7 @@ mod ffi {
         pub fn hydra_logits(c: *mut HydraContext, at_pos: i32, out: *mut f32, out_cap: i32) -> i32;
         pub fn hydra_kv_truncate(c: *mut HydraContext, pos: i32) -> c_int;
         pub fn hydra_gguf_probe(path: *const c_char) -> i32;
+        pub fn hydra_log_silence();
     }
 }
 
@@ -124,6 +125,13 @@ mod imp {
     ///
     /// The 24-CPU-hour budget has been fuzzing `hydra-modelsvc`'s Rust reader — the **offline
     /// splitter's** parser. The worker loads through *this* one. They are different programs.
+    /// Route the engine's logger to a sink for the rest of the process (§7.73). Used by the fuzz
+    /// driver: the vendored GGUF reader logs every rejected file, which at fuzz rates is tens of
+    /// megabytes per shard and a measurable share of the iterations.
+    pub fn log_silence() {
+        unsafe { ffi::hydra_log_silence() };
+    }
+
     pub fn gguf_probe(path: &str) -> Result<bool, EngineError> {
         let c = CString::new(path).map_err(|_| EngineError { code: 8, what: "path contains a NUL" })?;
         let rc = unsafe { ffi::hydra_gguf_probe(c.as_ptr()) };
@@ -469,6 +477,9 @@ mod imp {
         Err(EngineError::unavailable())
     }
 
+    /// Stub twin of the real `imp::log_silence` (a free function, like `gguf_probe`).
+    pub fn log_silence() {}
+
     impl Model {
         pub fn load(_path: &str, _n_gpu_layers: i32) -> Result<Model, EngineError> {
             Err(EngineError::unavailable())
@@ -540,7 +551,7 @@ mod imp {
     }
 }
 
-pub use imp::{gguf_probe, Context, Model};
+pub use imp::{gguf_probe, log_silence, Context, Model};
 
 /// True when the real engine is linked (the vendored build tree was present at build time).
 pub const ENGINE_AVAILABLE: bool = cfg!(not(engine_unavailable));
