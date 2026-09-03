@@ -57,7 +57,8 @@ CONSTANTS
     MaxPos,            \* bound on abstract applied positions (e.g. 2)
     MaxCrashes,        \* bound on total crash events => EventuallyStable holds
     MaxCkpt,           \* bound on segment/sampler checkpoint ids (see the note below)
-    EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled
+    EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled,
+    RestartDerivesByMax   \* [2026-09-02 §6.5a] FALSE = MUTATION 5: restart derives the TARGET by MIN
 
 (***************************************************************************************)
 (* MaxCkpt — the model-bounding constant added 2026-08-22 (F-UNBOUNDED-SEGMENT,        *)
@@ -92,6 +93,7 @@ ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 
 ASSUME EnableUnservable \in BOOLEAN /\ ResetTruncates \in BOOLEAN
        /\ AttemptFencing \in BOOLEAN /\ AbortGuardEnabled \in BOOLEAN
+       /\ RestartDerivesByMax \in BOOLEAN
 
 NoGen == 0
 Sym == Permutations(Stages)
@@ -237,7 +239,12 @@ SendBeginRecovery ==
 StageRecvBeginAt(s, tEpoch, r0) ==
     \E m \in msgs : /\ m.t = "BEGIN" /\ m.tgt = tEpoch /\ m.r = r0
         /\ \/ (* --- Case A: first application at base --- *)
-              /\ stState[s] \in {"ACTIVE_FINAL", "FROZEN"} /\ stEpoch[s] = m.base
+              (* 2026-09-03 (§6.5a): REBUILDING / FROZEN_READY at base are admitted too — a stage
+                 caught up for an activation that never committed (the coordinator crashed first
+                 and fenced forward). Before §6.5a a BEGIN could only reach ACTIVE_FINAL/FROZEN
+                 stages; the fence-forward restart made this state reachable, and the product
+                 oracle's third window found the model and the code dropping it as Case C. *)
+              /\ stState[s] \in {"ACTIVE_FINAL", "FROZEN", "REBUILDING", "FROZEN_READY"} /\ stEpoch[s] = m.base
               /\ stState'  = [stState  EXCEPT ![s] = "FROZEN"]
               /\ stEpoch'  = [stEpoch  EXCEPT ![s] = m.tgt]
               /\ stRId'    = [stRId    EXCEPT ![s] = m.r]
@@ -481,36 +488,101 @@ StageCrash(s) ==            \* shard loss: LOST + new stage generation
         predCompl, stEpoch, stRId, stAttempt, installedCkpt, candidateCkpt,
         segCommitted, caseBviolation, servedCount >>
 
+(* [2026-09-02, spec §6.5a — design authority] THE COORDINATOR'S VOLATILE STATE DOES NOT       *)
+(* SURVIVE A CRASH. Until this amendment CoordCrash left activeEpoch/recTarget/rId/attempt/…     *)
+(* UNCHANGED, so the model quietly assumed a restarted PROCESS still knew them; a real process    *)
+(* knows only its WAL. Crash now sets every volatile coordinator variable to a distinguished ⊥   *)
+(* and CoordRestart RE-DERIVES them from `wal` (the durable truth) — and fences forward.           *)
 CoordCrash ==
     /\ crashes < MaxCrashes /\ cState # "CRASHED"
     /\ crashes' = crashes + 1 /\ cState' = "CRASHED"
     /\ candidateCkpt' = 0                       \* volatile candidates die with C's peer
-    /\ UNCHANGED << msgs, wal, activeEpoch, recTarget, rId, attempt, actKind,
-        truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
+    /\ activeEpoch' = -1 /\ recTarget' = -1 /\ rId' = -1 /\ attempt' = -1
+    /\ actKind' = "BOT" /\ truncateTo' = -1
+    /\ tupleGen' = [s \in Stages |-> NoGen] /\ tupleApplied' = -1
+    /\ completeDurable' = FALSE /\ unservable' = FALSE /\ complId' = -1 /\ predCompl' = -1
+    \* `goal` is NOT volatile: it is the input frontier the COMMIT STREAM records (prompt length /
+    \* durable positions), re-read on restart from that durable log — the model keeps it.
+    /\ UNCHANGED << msgs, wal, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
         installedCkpt, segCommitted, caseBviolation, servedCount >>
 
-CoordRestart ==             \* phase-specific restart rule (spec §6.5), driven by WAL
-    \* BRANCH PRIORITY IS LOAD-BEARING (F-UNSERVABLE): `unservable` MUST be tested before the
-    \* `completeDurable` branches. A superseded-but-completed activation (unservable=TRUE with a
-    \* durable COMPLETE still present for this epoch) must resume SUPERSEDING, never re-enter
-    \* ACTIVATION_COMPLETE/finalization — that would reopen the I22 hole. This model was already
-    \* correct; the spec prose (§6.5) and the Rust impl were the layers that shadowed the order.
-    \* Do not "simplify" or reorder this IF/ELSIF chain.
+(* [2026-09-02, spec §6.5a] RESTART = DERIVE FROM THE WAL, CLASSIFY, FENCE FORWARD.                *)
+(*                                                                                               *)
+(* Every value the pre-amendment action read from a variable is now a function of `wal`:         *)
+(*   dTarget   = max BEGIN.tgt            (the latest recovery's target; Init writes tgt 0)        *)
+(*               [MUTATION 5 (RestartDerivesByMax = FALSE): min instead of max]                   *)
+(*   dRId      = max over BEGIN.r / RESET.newr at dTarget                                         *)
+(*   dAttempt  = max INTENT.a at (dTarget, dRId), 0 if none                                     *)
+(*   dEpoch    = max INTENT.tgt, -1 if none  (activeEpoch as the ruling defines it)                *)
+(*   dTrunc    = trunc of the latest BEGIN at dTarget                                             *)
+(*   dComplete = a COMPLETE at (dTarget, dRId, dAttempt); dComplId = max COMPLETE.cid (0 if none) *)
+(*   dUnserv   = an UNSERVABLE naming dComplId                                                    *)
+(* Branch order is §6.5's and remains load-bearing (F-UNSERVABLE): UNSERVABLE before COMPLETE.    *)
+(* A durable COMPLETE carries completion evidence and is finished (I22); everything else fences   *)
+(* forward — a new recovery at rId+1 targeting epoch+1, so an INTENT without completion evidence  *)
+(* is never resumed. Bound exhaustion resolves by explicit termination (§11), never a crash loop. *)
+(* SOUNDNESS: INTENT and BEGIN are written (Wal) before sent (Send) — "sent implies durable" — so *)
+(* the durable maxima are ≥ anything any stage has seen, and the new recovery outranks all of it. *)
+Begins    == { rec \in wal : rec.t = "BEGIN" }
+Intents   == { rec \in wal : rec.t = "INTENT" }
+Completes == { rec \in wal : rec.t = "COMPLETE" }
+MaxOf(S, dflt) == IF S = {} THEN dflt ELSE CHOOSE x \in S : \A y \in S : y <= x
+MinOf(S, dflt) == IF S = {} THEN dflt ELSE CHOOSE x \in S : \A y \in S : y >= x
+\* MUTATION 5 lives HERE, on the TARGET: with fence-forward, a minimum-derived ATTEMPT is harmless by
+\* construction (the new epoch resets the attempt space), but a minimum-derived TARGET re-opens a
+\* recovery below one already in flight — a stale BEGIN that frozen stages accept as Case B replay.
+DTarget   == IF RestartDerivesByMax THEN MaxOf({ b.tgt : b \in Begins }, 0)
+                                    ELSE MinOf({ b.tgt : b \in Begins }, 0)
+DRId      == MaxOf({ b.r : b \in { bb \in Begins : bb.tgt = DTarget } }
+                   \cup { rs.newr : rs \in { r0 \in wal : r0.t = "RESET" /\ r0.tgt = DTarget } }, 0)
+DAttemptSet == { i.a : i \in { ii \in Intents : ii.tgt = DTarget /\ ii.r = DRId } }
+DAttempt  == MaxOf(DAttemptSet, 0)
+DEpoch    == MaxOf({ i.tgt : i \in Intents }, -1)
+DTrunc    == (CHOOSE b \in Begins : b.tgt = DTarget /\ \A b2 \in Begins : b2.tgt = DTarget => b2.r <= b.r).trunc
+DIntent   == { i \in Intents : i.tgt = DTarget /\ i.r = DRId /\ i.a = DAttempt }
+DGens     == IF DIntent = {} THEN [s \in Stages |-> NoGen] ELSE (CHOOSE i \in DIntent : TRUE).gens
+DApplied  == IF DIntent = {} THEN 0 ELSE (CHOOSE i \in DIntent : TRUE).ap
+DComplete == \E c \in Completes : c.tgt = DTarget /\ c.r = DRId /\ c.a = DAttempt
+DComplId  == MaxOf({ c.cid : c \in Completes }, 0)          \* ids stay monotone across restarts
+\* The completion THIS target decided (0 if none). An UNSERVABLE names a completion; only one that
+\* names the derived target's completion classifies the restart as SUPERSEDING. A superseded
+\* completion of an EARLIER target is finished business — the recovery its supersession opened is
+\* already in the log as a later BEGIN. (Derivation defect found by the DST, 2026-09-03: the first
+\* draft matched ANY completion and re-entered SUPERSEDING at a target that had decided nothing.)
+DTargetCid == MaxOf({ c.cid : c \in { cc \in Completes : cc.tgt = DTarget /\ cc.r = DRId /\ cc.a = DAttempt } }, 0)
+DUnserv   == DComplete /\ \E u \in wal : u.t = "UNSERVABLE" /\ u.cid = DTargetCid
+
+CoordRestart ==
     /\ cState = "CRASHED"
-    /\ cState' =
-         IF unservable                      THEN "SUPERSEDING"
-         ELSE IF completeDurable /\ ~AllFinalized THEN "ACTIVATION_COMPLETE"
-         ELSE IF completeDurable /\ AllFinalized  THEN "FINALIZING"
-         ELSE IF AbortGuardEnabled /\ AttemptAborted(attempt)
-                                                  THEN "READY_ALL"   \* TLC-1 / I25; MUTATION 4
-         ELSE IF \E rec \in wal : rec.t = "INTENT" /\ rec.tgt = recTarget
-                                   /\ rec.r = rId /\ rec.a = attempt
-                                            THEN "ACTIVATION_INTENT_DURABLE"
-         ELSE                                    "RECOVERY_STARTED"
-    /\ UNCHANGED << msgs, wal, activeEpoch, recTarget, rId, attempt, actKind,
-        truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
+    \* Re-derive the volatile state from the durable log — every variable, no survivors.
+    /\ activeEpoch' = DEpoch /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
+    /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
+    /\ truncateTo' = DTrunc
+    /\ tupleGen' = DGens /\ tupleApplied' = DApplied         \* the tuple the durable INTENT bound
+    /\ completeDurable' = DComplete /\ unservable' = DUnserv
+    /\ complId' = DComplId /\ predCompl' = 0
+    /\ IF DUnserv THEN
+            \* §6.7: a recorded UNSERVABLE resumes the superseding recovery (F-UNSERVABLE order).
+            /\ cState' = "SUPERSEDING" /\ UNCHANGED wal
+       ELSE IF DComplete /\ servedCount = 0 THEN
+            \* The decision stands (I22): finish it. FINALIZED evidence is re-collected on the wire.
+            \* Only while the activation has NOT served (spec §6.5a refinement, 2026-09-03): the
+            \* commit stream (abstracted by servedCount, which survives a crash exactly as the
+            \* durable stream does) witnesses service; a crash after service is outside any
+            \* transaction and falls through to the fence — the data-plane tail beyond the durable
+            \* frontier, which this model does not represent, needs the BEGIN's truncation.
+            /\ cState' = "ACTIVATION_COMPLETE" /\ UNCHANGED wal
+       ELSE IF DTarget + 1 <= MaxEpoch /\ DRId + 1 <= MaxRId THEN
+            \* FENCE FORWARD: a new recovery strictly above every durable (hence every sent) value.
+            /\ Wal([t |-> "BEGIN", base |-> DTarget, tgt |-> DTarget + 1,
+                    r |-> DRId + 1, trunc |-> DTrunc])
+            /\ cState' = "RECOVERY_STARTED"
+            /\ recTarget' = DTarget + 1 /\ rId' = DRId + 1 /\ attempt' = 0
+            /\ actKind' = "RECOVERY"
+       ELSE
+            \* Bounds exhausted: §11 explicit termination, never an indefinite restart loop.
+            /\ Wal([t |-> "TERMINAL", tgt |-> DTarget]) /\ cState' = "TERMINAL"
+    /\ UNCHANGED << msgs, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
         installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
 
 --------------------------------------------------------------------------------------
@@ -634,7 +706,12 @@ AbortSafety     == \A m \in msgs :                                        \* I21
                       (m.t = "ABORT") => ~(completeDurable /\ m.a = attempt
                                            /\ m.tgt = recTarget /\ m.r = rId)
 CandidateIsolation == installedCkpt \in segCommitted                      \* I24
-DecisionMonotone   == completeDurable => (\E rec \in wal : rec.t = "COMPLETE")  \* I10a/WAL
+DecisionMonotone   ==                                                        \* I10a/WAL
+    /\ completeDurable => (\E rec \in wal : rec.t = "COMPLETE")
+    \* Strengthened 2026-09-03 (the code's invariant, which the DST holds, was stronger than the
+    \* model's): every post-decision coordinator state rests on a durable COMPLETE — a restart may
+    \* not re-enter SUPERSEDING / ACTIVATION_COMPLETE / FINALIZING off an earlier target's decision.
+    /\ (cState \in {"ACTIVATION_COMPLETE", "FINALIZING", "SUPERSEDING"}) => completeDurable
 AbortFinality      ==                                                     \* I25 (TLC-1)
     ~\E ab \in wal, co \in wal :
         /\ ab.t = "ABORT" /\ co.t = "COMPLETE"
@@ -666,8 +743,15 @@ ResetPreservesAttemptSpace ==
         => (/\ attempt' = attempt
             /\ \A s \in Stages : stAttempt'[s] >= stAttempt[s]) ]_vars
 
+(* [2026-09-02 §6.5a] IntentFence: the coordinator's attempt is never BELOW a durable intent's *)
+(* at its current (target, recovery_id). Faithful operation keeps it (attempt advances with every  *)
+(* INTENT written); a restart that derived by MIN (MUTATION 5) breaks it in one state.            *)
+IntentFence == (cState # "CRASHED") =>
+    \A rec \in wal : (rec.t = "INTENT" /\ rec.tgt = recTarget /\ rec.r = rId) => rec.a <= attempt
+
 Inv == /\ ServiceSafety /\ TupleSafety /\ CaseBPure /\ NoPreactiveServe
        /\ AbortSafety   /\ CandidateIsolation /\ DecisionMonotone /\ AbortFinality
+       /\ IntentFence
 
 --------------------------------------------------------------------------------------
 (* -------- Liveness (check with Fairness; smaller bounds recommended) -------- *)

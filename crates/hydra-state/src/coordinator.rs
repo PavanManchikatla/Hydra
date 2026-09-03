@@ -155,15 +155,39 @@ pub struct Coordinator {
 
     /// Durable coordinator WAL (the coordinator's persistent truth).
     wal: Vec<WalRecord>,
-    /// The recovery whose `BEGIN` record is in flight (M4·0b).
-    pending_recovery: Option<(Epoch, Epoch, i64)>,
+    /// The recovery whose `BEGIN` record is in flight (M4·0b): `(base, target, truncate_to, recovery_id)`.
+    /// The recovery id is `0` for a recovery opened from SERVICEABLE and `derived + 1` for one a
+    /// restart fences forward with (spec §6.5a, 2026-09-02).
+    pending_recovery: Option<(Epoch, Epoch, i64, RecoveryId)>,
     /// The reset whose record is in flight (M4·0b).
     pending_reset: Option<(Epoch, RecoveryId, RecoveryId, i64)>,
+    /// The commit stream's witness that the completed activation has served (spec §6.5a
+    /// refinement): set only by `restart_from`; a served activation's crash fences forward.
+    served: bool,
     /// Per-(session, epoch) monotonic counter owned by the SM, feeding effect ids (WAL-FORMAT §4).
     monotonic_seq: u64,
 }
 
 impl Coordinator {
+    /// **A coordinator PROCESS that restarted (spec §6.5a, 2026-09-02): everything it knows is
+    /// `records`, the durable control log.** Construct, then feed `CoordEvent::Restart`: the
+    /// derivation and the fence-forward live in [`Self::restart`], mirroring the model's
+    /// `CoordRestart`, so no decision is taken by whoever calls this (rule 21: the placement was
+    /// reachable — `hydra-state` owns it). Until `Restart` is fed the volatile fields are the
+    /// model's ⊥ and must not be read.
+    /// `served`: the commit stream's witness that the completed activation has already served (a
+    /// generation commit exists). Spec §6.5a refinement (2026-09-03): a durable COMPLETE re-enters
+    /// finalization only while the activation has NOT served; a crash after service is outside any
+    /// transaction and fences forward — the stages' data-plane tail beyond the durable frontier
+    /// needs the BEGIN's truncation, which no re-entered finalization performs.
+    pub fn restart_from(session: SessionId, n_stages: u16, checkpoint: CheckpointId, records: Vec<WalRecord>, served: bool) -> Self {
+        let mut c = Self::new_initial(session, n_stages, checkpoint);
+        c.served = served;
+        c.wal = records;
+        c.state = CoordState::Crashed;
+        c
+    }
+
     /// A session admitted with an INITIAL activation pending at epoch 0 (TLA+ `Init`).
     pub fn new_initial(session: SessionId, n_stages: u16, checkpoint: CheckpointId) -> Self {
         Self {
@@ -182,6 +206,7 @@ impl Coordinator {
             next_completion_id: 1,
             pending_recovery: None,
             pending_reset: None,
+            served: false,
             wal: Vec::new(),
             monotonic_seq: 0,
         }
@@ -218,10 +243,6 @@ impl Coordinator {
         self.wal.iter().any(
             |r| matches!(r, WalRecord::ActivationComplete { tuple, .. } if tuple.epoch == self.epoch),
         )
-    }
-
-    fn unservable_recorded(&self) -> bool {
-        self.wal.iter().any(|r| matches!(r, WalRecord::ActivationUnservable { .. })) && self.completed()
     }
 
     /// True iff a durable ABORT exists for `(epoch, recovery_id, attempt)` (I25 predicate).
@@ -404,11 +425,12 @@ impl Coordinator {
                 let completion_id = self.completion_id().unwrap_or(0);
                 // F-UNSERVABLE: record the ACTIVATION_UNSERVABLE fact in the durable WAL *and*
                 // transition, atomically — mirroring TLA+ `CoordRecordUnservable` (Wal(UNSERVABLE)
-                // ∧ unservable'=TRUE ∧ cState'=SUPERSEDING). Without the durable record,
-                // `unservable_recorded()` (and thus §6.5's restart-superseding branch, which is
-                // evaluated *before* the COMPLETE branch) can never fire, so a crash in the window
-                // before the superseding BEGIN_RECOVERY would restart into finalization and reopen
-                // the I22 hole. This durability was missing; the WAL effect alone was not enough.
+                // ∧ unservable'=TRUE ∧ cState'=SUPERSEDING). Without the durable record, a restart
+                // — which derives everything from the durable log (spec §6.5a; `restart()`) and
+                // evaluates the superseding branch *before* the COMPLETE branch — can never
+                // classify SUPERSEDING, so a crash in the window before the superseding
+                // BEGIN_RECOVERY would restart into finalization and reopen the I22 hole. This
+                // durability was missing; the WAL effect alone was not enough.
                 // Mut5 (`mutation_unservable_restart`) reintroduces exactly that omission: the
                 // WriteWal effect below is still emitted (a real disk / the sim's virtual WAL records
                 // it), but `self.wal` does not — so restart misclassifies. The sim re-finds it via
@@ -438,7 +460,7 @@ impl Coordinator {
                 // weaker than the model it mirrors, in the one place I22 depends on.
                 let id = self.next_effect_id(EffectKind::WriteWal);
                 let (base, target) = (self.epoch, self.epoch + 1);
-                self.pending_recovery = Some((base, target, 0));
+                self.pending_recovery = Some((base, target, 0, 0));
                 self.state = CoordState::RecoveryStartedPending;
                 vec![Effect::WriteWal {
                     id,
@@ -453,7 +475,7 @@ impl Coordinator {
                 let id = self.next_effect_id(EffectKind::WriteWal);
                 let (base, target) = (self.epoch, self.epoch + 1);
                 self.state = CoordState::RecoveryStartedPending;
-                self.pending_recovery = Some((base, target, truncate_to));
+                self.pending_recovery = Some((base, target, truncate_to, 0));
                 vec![Effect::WriteWal {
                     id,
                     record: WalRecord::BeginRecovery { base, target, recovery_id: 0, truncate_to },
@@ -461,7 +483,7 @@ impl Coordinator {
             }
             ProceedSendBeginRecovery => {
                 let id = self.next_effect_id(EffectKind::SendMsg);
-                let (base, target, truncate_to) = self.pending_recovery.expect("RECOVERY_STARTED implies a pending recovery");
+                let (base, target, truncate_to, _rid) = self.pending_recovery.expect("RECOVERY_STARTED implies a pending recovery");
                 self.state = CoordState::Reconstructing;
                 vec![Effect::Send {
                     id,
@@ -490,10 +512,7 @@ impl Coordinator {
                 self.state = CoordState::Crashed;
                 Vec::new()
             }
-            Restart => {
-                self.restart();
-                Vec::new()
-            }
+            Restart => self.restart(),
         }
     }
 
@@ -544,17 +563,17 @@ impl Coordinator {
             }
             WalKindTag::BeginRecovery => {
                 if self.state == CoordState::RecoveryStartedPending {
-                    let (_base, target, _t) = self.pending_recovery.expect("pending recovery");
+                    let (_base, target, _t, rid) = self.pending_recovery.expect("pending recovery");
                     // The model's post-state, applied only once the record is durable.
                     self.epoch = target;
-                    self.recovery_id = 0;
+                    self.recovery_id = rid;
                     self.attempt = 0;
                     self.kind = ActivationKind::Recovery;
                     self.tuple = None;
                     self.committed.clear();
                     self.finalized.clear();
                     self.lost.clear();
-                    self.wal.push(WalRecord::BeginRecovery { base: target - 1, target, recovery_id: 0, truncate_to: _t });
+                    self.wal.push(WalRecord::BeginRecovery { base: target - 1, target, recovery_id: rid, truncate_to: _t });
                     self.state = CoordState::RecoveryStarted;
                 }
             }
@@ -599,33 +618,125 @@ impl Coordinator {
         Vec::new()
     }
 
-    /// Phase-specific restart (spec §6.5), driven purely by the durable WAL — no clocks, no I/O.
-    fn restart(&mut self) {
-        let complete = self.completed();
-        let intent = self.wal.iter().any(|r| {
-            matches!(r, WalRecord::ActivationCommitIntent { tuple }
-                if tuple.attempt == self.attempt)
+    /// **Restart (spec §6.5 + §6.5a, 2026-09-02): derive from the durable WAL, classify, fence
+    /// forward.** Mirrors the model's `CoordRestart` branch for branch:
+    ///
+    /// * `dTarget`  = max `target` over durable `BEGIN_RECOVERY` records (0 if none — INITIAL);
+    /// * `dRId`     = max `recovery_id` over BEGINs / `new_recovery_id` over RESETs at `dTarget`;
+    /// * `dAttempt` = max `attempt` over durable INTENTs at `(dTarget, dRId)` (0 if none);
+    /// * `dTrunc`   = `truncate_to` of the latest BEGIN at `dTarget`;
+    /// * `dComplete`/`dComplId` = the durable COMPLETE at `(dTarget, dRId, dAttempt)` / max id;
+    /// * `dUnserv`  = a durable UNSERVABLE naming `dComplId`.
+    ///
+    /// Then: UNSERVABLE → `Superseding` (F-UNSERVABLE order); COMPLETE → `ActivationComplete`
+    /// (the decision stands, I22); **everything else fences forward** — a `BEGIN_RECOVERY` at
+    /// `(dTarget + 1, dRId + 1)` is written (an effect; the send follows `WalDurable`), and an
+    /// intent without completion evidence is never resumed. "Sent implies durable" (INTENT and
+    /// BEGIN are fsynced before they are sent) is what makes the derived maxima a fence.
+    ///
+    /// The model's bound-exhaustion branch (→ TERMINAL) is a property of TLC's finite constants;
+    /// the implementation has no such bound, so it is not mirrored here.
+    fn restart(&mut self) -> Vec<Effect> {
+        debug_assert_eq!(self.state, CoordState::Crashed, "Restart is only meaningful from CRASHED");
+        // ---- derive ----
+        let d_target: Epoch = self
+            .wal
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::BeginRecovery { target, .. } => Some(*target),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let d_rid: RecoveryId = self
+            .wal
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::BeginRecovery { target, recovery_id, .. } if *target == d_target => Some(*recovery_id),
+                WalRecord::ResetRecoveryAttempt { target, new_recovery_id, .. } if *target == d_target => Some(*new_recovery_id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let d_attempt: crate::AttemptId = self
+            .wal
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::ActivationCommitIntent { tuple } if tuple.epoch == d_target && tuple.recovery_id == d_rid => Some(tuple.attempt),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let d_trunc: i64 = self
+            .wal
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::BeginRecovery { target, recovery_id, truncate_to, .. } if *target == d_target => Some((*recovery_id, *truncate_to)),
+                _ => None,
+            })
+            .max_by_key(|(rid, _)| *rid)
+            .map(|(_, t)| t)
+            .unwrap_or(0);
+        let d_complete = self.wal.iter().find_map(|r| match r {
+            WalRecord::ActivationComplete { tuple, completion_id }
+                if tuple.epoch == d_target && tuple.recovery_id == d_rid && tuple.attempt == d_attempt =>
+            {
+                Some((tuple.clone(), *completion_id))
+            }
+            _ => None,
         });
+        let d_compl_id: CompletionId = self
+            .wal
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::ActivationComplete { completion_id, .. } => Some(*completion_id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        // Only an UNSERVABLE naming THIS target's completion classifies the restart as superseding
+        // (spec §6.5a). A superseded completion of an earlier target is finished business: the
+        // recovery its supersession opened is already in the log as a later BEGIN_RECOVERY, and
+        // re-entering SUPERSEDING off it would claim a decision this target never made. The DST
+        // found exactly that on 2026-09-03 (`DecisionMonotone — post-decision state Superseding
+        // without a durable COMPLETE`); `d_compl_id` above stays the GLOBAL maximum so ids remain
+        // monotone across restarts.
+        let d_unserv = match &d_complete {
+            Some((_, cid)) => self.wal.iter().any(|r| matches!(r, WalRecord::ActivationUnservable { completion_id } if completion_id == cid)),
+            None => false,
+        };
+
+        // ---- re-derive the volatile state: no survivors ----
+        self.epoch = d_target;
+        self.recovery_id = d_rid;
+        self.attempt = d_attempt;
+        self.kind = if d_target == 0 { ActivationKind::Initial } else { ActivationKind::Recovery };
+        self.tuple = d_complete.as_ref().map(|(t, _)| t.clone());
+        self.next_completion_id = d_compl_id + 1;
         self.committed.clear();
         self.finalized.clear();
-        // AbortGuardEnabled = the I25 guard (off only under the Mut4 mutation).
-        let abort_guard = !cfg!(feature = "mutation_no_abort_finality");
-        self.state = if self.unservable_recorded() {
-            // §6.7: an unservable activation was recorded → resume the superseding recovery.
-            CoordState::Superseding
-        } else if complete {
-            // decision stands; finalize.
-            CoordState::ActivationComplete
-        } else if abort_guard && self.attempt_aborted(self.attempt) {
-            // TLC-1 / I25: durable ABORT for the current attempt, no COMPLETE ⇒ attempt terminal;
-            // proceed to a NEW intent at attempt+1. NEVER replay COMMIT for the aborted attempt.
-            // (Mut4 disables this branch → falls through to replay COMMIT → reproduces TLC-1.)
-            CoordState::ReadyAll
-        } else if intent {
-            // intent durable, no complete ⇒ replay COMMIT (converge, I18)
-            CoordState::IntentDurable
+        self.lost.clear();
+        self.pending_recovery = None;
+        self.pending_reset = None;
+
+        // ---- classify (§6.5 order is load-bearing), then fence forward ----
+        if d_unserv {
+            self.state = CoordState::Superseding;
+            Vec::new()
+        } else if d_complete.is_some() && !self.served {
+            // §6.5 branch 2 — only while the activation has NOT served (§6.5a refinement): a crash
+            // after service is outside any transaction and falls through to the fence, because the
+            // stages hold a data-plane tail beyond the durable frontier that only the BEGIN's
+            // truncation removes (§2.3d), and a re-entered finalization would leave the old epoch
+            // unfenced.
+            self.state = CoordState::ActivationComplete;
+            Vec::new()
         } else {
-            CoordState::Reconstructing
-        };
+            let (base, target, rid) = (d_target, d_target + 1, d_rid + 1);
+            let id = self.next_effect_id(EffectKind::WriteWal);
+            self.pending_recovery = Some((base, target, d_trunc, rid));
+            self.state = CoordState::RecoveryStartedPending;
+            vec![Effect::WriteWal { id, record: WalRecord::BeginRecovery { base, target, recovery_id: rid, truncate_to: d_trunc } }]
+        }
     }
 }

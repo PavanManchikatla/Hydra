@@ -256,7 +256,12 @@ impl Stage {
                 // PREACTIVE is reversible"): a still-preactive stage reverts (discard the preactive
                 // tuple, freeze at target, adopt r), so a post-supersession stage is never marooned
                 // (F-LIVENESS-FAIR family 3; the model carried the same gap).
-                if matches!(self.state, ActiveFinal | Frozen | Preactive) && self.epoch == base {
+                // REBUILDING / FROZEN_READY at base (2026-09-03, spec §1.3 with §6.5a): a stage
+                // caught up for an activation that never committed — the coordinator crashed first
+                // and fenced forward — takes the same freeze-and-truncate; its unfinished catch-up
+                // at the old epoch is abandoned. The restart oracle's third window found this
+                // state dropped as Case C, with the coordinator waiting forever for the ack.
+                if matches!(self.state, ActiveFinal | Frozen | Preactive | Rebuilding | FrozenReady) && self.epoch == base {
                     self.state = Frozen;
                     self.epoch = target;
                     self.recovery_id = r;

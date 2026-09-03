@@ -6,9 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "The coordinator: durable commit stream (hydra-wal on a real disk file), token ledger, group commit (spec §3), and (later sub-slices) the OpenAI/SSE surface + D1 recovery orchestration. Emit-after-commit governs everything."
 
-[[bin]]
-name = "hydra-coordinator"
-path = "src/bin/hydra-coordinator.rs"
+# The `hydra-coordinator` BINARY moved to `crates/hydra-node` on 2026-09-02 (rule 27 / §7.76): this
+# crate is lib-only. The binary needs the stage drivers in `hydra-worker`, which depends on this
+# crate — so the product process lives at the top of the graph, not here.
 
 [dependencies]
 hydra-proto = { path = "../hydra-proto" }

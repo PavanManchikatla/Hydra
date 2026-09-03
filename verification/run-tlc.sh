@@ -23,4 +23,5 @@ run baseline-safety   -config BaselineSafety.cfg
 run baseline-liveness -config BaselineLiveness.cfg
 run mut1-unservable   -config Mut1Unservable.cfg
 run mut3-attemptfence -config Mut3AttemptFence.cfg
+run mut5-restartmin   -config Mut5RestartMin.cfg
 echo "ALL DONE"

@@ -27,6 +27,16 @@ if [ "$NOEDIT" -eq 0 ]; then
   "${EDIT[@]}" || { echo "state-commit: REFUSED — the edit step exited non-zero; nothing committed" >&2; exit 1; }
 fi
 git diff --quiet HEAD -- PROJECT_STATE.md && { echo "state-commit: REFUSED — PROJECT_STATE.md is unchanged against HEAD (§11 same-commit rule); nothing committed" >&2; exit 1; }
+# The commit's input is the INDEX, not this path list: `git add <paths>` commits whatever else was
+# already staged. 06b9649 (2026-09-03) carried three file moves a `git mv` had left in the index and
+# put `main` without the coordinator binary's source for 22 minutes (clean-checkout RED). Refuse a
+# dirty index up front; the caller unstages or names the paths deliberately.
+if ! git diff --cached --quiet; then
+  echo "state-commit: REFUSED — the index already holds staged changes not named on this command line:" >&2
+  git diff --cached --name-status >&2
+  echo "state-commit: unstage them (git restore --staged <path>) or name them as paths; nothing committed" >&2
+  exit 1
+fi
 # An empty extra-path list is legal (a PROJECT_STATE-only commit); `${PATHS[@]+...}` is the bash-3.2-safe spelling under set -u.
 git add PROJECT_STATE.md ${PATHS[@]+"${PATHS[@]}"}
 git commit -q -m "$MSG"

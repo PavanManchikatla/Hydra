@@ -51,7 +51,14 @@ fn detection_stats(k: u64, budget: u64) -> (u64, u64, u64) {
 fn mut4_i25_caught_by_randomized_runs() {
     let (caught, total, median) = detection_stats(200, 20_000);
     println!("Mut4 (I25 AbortFinality): {caught}/{total} seeds caught; median steps-to-detection = {median}");
-    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+    // Under spec §6.5a (2026-09-03) a restart fences forward and never resurrects an aborted
+    // attempt, so the I25 guard has nothing left to guard on the crash path; TLC's Mut4 drains
+    // clean for the same reason. A low catch-rate here is therefore NOT a gentle schedule — it is
+    // the subsumption, escalated to the design authority (PROJECT_STATE §7.77), red by design.
+    assert!(
+        caught * 100 >= total * 95,
+        "verdict=ESCALATED-SUBSUMED (Mut4 catch-rate {caught}/{total}: under spec §6.5a fence-forward the aborted attempt cannot be resurrected by a restart, so the mutation has nothing to sabotage — PROJECT_STATE §7.77)"
+    );
 }
 
 #[cfg(feature = "mutation_no_unservable")]
@@ -95,5 +102,13 @@ fn mut5_unservable_restart_caught_by_randomized_runs() {
     println!("scheduler: {}", hydra_sim::SCHED_VERSION);
     let (caught, total, median) = detection_stats(200, 20_000);
     println!("Mut5 (WalCodecDivergence / omitted durable UNSERVABLE): {caught}/{total} seeds caught; median steps-to-detection = {median}");
-    assert!(caught * 100 >= total * 95, "catch-rate {caught}/{total} too low — schedule too gentle");
+    // Since 2026-09-03 the sim REBUILDS the coordinator from the codec-recovered log on every
+    // restart (spec §6.5a), so an in-memory `self.wal` omission cannot reach a restart's
+    // classification any more; the cross-check now guards `restart()` itself. If this mutation
+    // is no longer caught, that is the subsumption — escalated (PROJECT_STATE §7.77), not a
+    // gentle schedule.
+    assert!(
+        caught * 100 >= total * 95,
+        "verdict=ESCALATED-SUBSUMED (code-level Mut5 catch-rate {caught}/{total}: the restart derives from the disk, not from `self.wal`, so omitting the record from memory sabotages nothing a restart reads — PROJECT_STATE §7.77)"
+    );
 }

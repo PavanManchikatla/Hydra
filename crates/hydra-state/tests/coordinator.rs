@@ -4,17 +4,18 @@
 
 use hydra_state::coordinator::WalKindTag::*;
 use hydra_state::CoordEvent::*;
-use hydra_state::{invariants, CoordEvent, CoordState, Coordinator, SessionId};
+use hydra_state::{invariants, CoordEvent, CoordState, Coordinator, SessionId, WalRecord};
 
 fn sid() -> SessionId {
     SessionId([1u8; 16])
 }
 
-/// Step and assert all invariants hold afterward.
-fn step_ok(c: &mut Coordinator, ev: CoordEvent) {
-    c.step(ev);
+/// Step and assert all invariants hold afterward; hands back the effects for spot assertions.
+fn step_ok(c: &mut Coordinator, ev: CoordEvent) -> Vec<hydra_state::Effect> {
+    let effs = c.step(ev);
     let v = invariants::check(c);
     assert!(v.is_empty(), "invariant violated {v:?} in state {:?}", c.state());
+    effs
 }
 
 fn drive_happy_path(n: u16) -> Coordinator {
@@ -84,14 +85,16 @@ fn abort_returns_to_ready_at_next_attempt() {
 //   S8        : CoordAbortActivation            -> ProceedAbort ; WalDurable(Abort)
 //   S9        : CoordCrash                      -> Crash
 //   S10       : CoordRestart                    -> Restart
-//               faithful: -> READY_ALL (attempt terminal, I25)  | Mut4: -> ACTIVATION_INTENT_DURABLE
-//   S11       : CoordSendCommit (replay)        -> ProceedSendCommit                  (Mut4 only)
-//   S12–S13   : StageRecvCommitAt (stale acks)  -> StageCommitted{…,attempt:1} ×2     (Mut4 only)
-//   S14       : CoordWriteComplete              -> ProceedWriteComplete ; WalDurable(Complete)
-//               => Mut4: `AbortFinality`/I25 violated at the mapped step S14.
+//               §6.5a (2026-09-03): -> RECOVERY_STARTED — the restart derives from the WAL and
+//               FENCES FORWARD to (epoch+1, rid+1); the aborted attempt is terminal AND fenced.
+//               (Before §6.5a: faithful -> READY_ALL | Mut4 -> ACTIVATION_INTENT_DURABLE, the
+//               resurrection this trace existed to catch.)
+//   S11–S14   : the Mut4 replay (CoordSendCommit, stale StageRecvCommitAt ×2, CoordWriteComplete)
+//               is UNREACHABLE under fence-forward: no state after S10 accepts an attempt-1 ack.
+//               => Mut4 is SUBSUMED by §6.5a — escalated, PROJECT_STATE §7.77; see `mut4_…` below.
 
-// Faithful build (I25 guard on): the replay diverges from TLC at S10 (READY_ALL) and completes
-// with no violation. The Mut4 build is covered by `mut4_…` below (mutation-parity convention).
+// Faithful build (I25 guard on): the aborted attempt stays terminal across the restart, the stale
+// attempt-1 acks are rejected by the fenced state, and no COMPLETE can ever exist for attempt 1.
 #[cfg(not(feature = "mutation_no_abort_finality"))]
 #[test]
 fn tlc1_crash_after_abort_never_completes_aborted_attempt() {
@@ -106,24 +109,44 @@ fn tlc1_crash_after_abort_never_completes_aborted_attempt() {
     step_ok(&mut c, ProceedAbort); // S8: durably ABORT attempt 1
     step_ok(&mut c, WalDurable(Abort));
     step_ok(&mut c, Crash); // S9
-    step_ok(&mut c, Restart); // S10
-    // pivotal spot assertions on trace-relevant fields (faithful branch of S10):
-    assert_eq!(c.state(), CoordState::ReadyAll, "S10 faithful: aborted attempt is terminal");
-    assert_eq!(c.attempt(), 1, "attempt id unchanged across the aborted-attempt restart");
-    assert!(c.attempt_aborted(1), "durable ABORT for attempt 1 persists across restart");
-    // the lingering stale attempt-1 acks (TLC S12–S13) complete nothing under the guard
-    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
-    step_ok(&mut c, StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
+    let effs = step_ok(&mut c, Restart); // S10
+    // pivotal spot assertions on trace-relevant fields (S10 under §6.5a):
+    assert_eq!(c.state(), CoordState::RecoveryStartedPending, "S10: the restart fences forward — it never resumes the aborted attempt");
+    assert!(
+        effs.iter().any(|e| matches!(e, hydra_state::Effect::WriteWal { record: WalRecord::BeginRecovery { base: 0, target: 1, recovery_id: 1, .. }, .. })),
+        "the fence-forward BEGIN is the restart's only effect; got {effs:?}"
+    );
+    // The new (epoch, rid) take effect when the BEGIN is DURABLE — WAL-before-wire; the model's
+    // CoordRestart writes and advances in one action, the code splits the fsync out.
+    step_ok(&mut c, WalDurable(BeginRecovery));
+    assert_eq!(c.state(), CoordState::RecoveryStarted);
+    assert_eq!((c.epoch(), c.recovery_id(), c.attempt()), (1, 1, 0), "a NEW recovery at (epoch+1, rid+1); the attempt space restarts");
+    assert!(
+        c.wal().iter().any(|r| matches!(r, WalRecord::ActivationAbort { epoch: 0, recovery_id: 0, attempt: 1 })),
+        "the durable ABORT for attempt 1 persists across restart (the log is the state)"
+    );
+    // the lingering stale attempt-1 acks (TLC S12–S13) are REJECTED by the fenced state — not
+    // merely not counted: the events are not accepted at all.
+    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 }).is_empty());
+    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 }).is_empty());
+    assert_eq!(c.state(), CoordState::RecoveryStarted, "stale acks move nothing");
     assert!(!c.completed(), "no COMPLETE for an aborted attempt (I25)");
     assert!(invariants::check(&c).is_empty());
 }
 
 // ---- mutation parity (Mut4 = no abort finality); run with `--features mutation_no_abort_finality` ----
-// Same mapped sequence as above; with the guard off, S10 goes to ACTIVATION_INTENT_DURABLE and the
-// replayed commit + stale acks reach CoordWriteComplete (S14), violating I25 exactly as TLC reports.
+// ⛔ ESCALATED-SUBSUMED (2026-09-03, PROJECT_STATE §7.77). Mut4's designed trace needed S10 to
+// RESUME the aborted attempt (CoordRestart → ACTIVATION_INTENT_DURABLE) so that a replayed COMMIT
+// and the stale acks could reach CoordWriteComplete. Spec §6.5a removed that restart: a restart
+// derives from the WAL and fences forward, so with the I25 guard OFF the sequence still cannot
+// complete attempt 1 — there is no state after S10 that accepts an attempt-1 ack. TLC reports the
+// same (`Mut4RestartMin` drains clean: `verdict=ESCALATED-SUBSUMED`). This test therefore asserts
+// the SUBSUMPTION — the mutation is unreachable, not "caught" — so a reader running the feature
+// build sees the fact rather than a green "caught by checker" the checker never earned. What the
+// mutation should sabotage instead is the design authority's ruling; until then this is the record.
 #[cfg(feature = "mutation_no_abort_finality")]
 #[test]
-fn mut4_completion_after_abort_is_caught_by_checker() {
+fn mut4_is_unreachable_under_fence_forward_escalated_subsumed() {
     let mut c = Coordinator::new_initial(sid(), 2, 1);
     c.step(StagesReconstructed); // S2–S5
     c.step(ProceedWriteIntent); // S6: attempt 1
@@ -134,17 +157,18 @@ fn mut4_completion_after_abort_is_caught_by_checker() {
     c.step(ProceedAbort); // S8
     c.step(WalDurable(Abort));
     c.step(Crash); // S9
-    c.step(Restart); // S10: guard off → resurrects the attempt
-    assert_eq!(c.state(), CoordState::IntentDurable, "S10 Mut4: aborted attempt resurrected");
-    assert_eq!(c.attempt(), 1, "the resurrected attempt is the aborted attempt 1");
-    c.step(ProceedSendCommit); // S11: replay COMMIT for attempt 1
-    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 }); // S12–S13: stale acks now counted
-    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
-    c.step(ProceedWriteComplete); // S14: guard off → allowed
-    c.step(WalDurable(Complete)); // COMPLETE written for an aborted attempt
-    let v = invariants::check(&c);
-    assert!(
-        v.iter().any(|x| x.invariant == "I25 AbortFinality"),
-        "mutation parity: checker must catch Mut4's I25 violation at S14; got {v:?}"
-    );
+    c.step(Restart); // S10: guard off — and STILL a fence-forward, not a resurrection
+    assert_eq!(c.state(), CoordState::RecoveryStartedPending, "ESCALATED-SUBSUMED: with the guard off the restart still fences forward (§6.5a)");
+    c.step(WalDurable(BeginRecovery));
+    assert_eq!((c.epoch(), c.attempt()), (1, 0), "attempt 1 is fenced behind epoch 1 — it cannot be resurrected");
+    // S11–S14 as designed: nothing is accepted, nothing completes.
+    assert!(c.step(ProceedSendCommit).is_empty(), "S11 unreachable");
+    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 }).is_empty());
+    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 }).is_empty());
+    assert!(c.step(ProceedWriteComplete).is_empty(), "S14 unreachable");
+    assert!(!c.completed(), "no COMPLETE for the aborted attempt — the mutation had nothing to sabotage");
+    assert!(invariants::check(&c).is_empty(), "and the checker sees a legal state, because it IS one: the I25 hole is closed by the fence, not the guard");
+    // Red by design (rule 25: a verdict token must express failure), exactly as the TLC smoke is,
+    // until the design authority rules what Mut4 should sabotage under fence-forward.
+    panic!("verdict=ESCALATED-SUBSUMED (Mut4 is unreachable under spec §6.5a fence-forward: the facts above hold, the mutation had nothing to sabotage — PROJECT_STATE §7.77)");
 }

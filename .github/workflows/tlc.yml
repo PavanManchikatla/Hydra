@@ -61,7 +61,11 @@ jobs:
           if grep -q "Invariant CaseBPure is violated" mut2.log; then
             echo "OK: Mut2 tripped CaseBPure (rc=$rc)"
           else
-            echo "FAIL: Mut2 did NOT trip CaseBPure — the mutation stopped firing"; tail -40 mut2.log; exit 1
+            # [2026-09-02, spec §6.5a] Mut2's designed trace re-sent the same BEGIN/COMMIT through a restart;
+            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
+            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
+            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
+            echo "verdict=ESCALATED-SUBSUMED (Mut2 did NOT trip CaseBPure: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut2.log; exit 1
           fi
       - name: Mut4 must trip AbortFinality (no abort finality — TLC-1/I25)
         working-directory: verification
@@ -72,8 +76,24 @@ jobs:
           if grep -q "Invariant AbortFinality is violated" mut4.log; then
             echo "OK: Mut4 tripped AbortFinality (rc=$rc)"
           else
-            echo "FAIL: Mut4 did NOT trip AbortFinality — the mutation stopped firing"; tail -40 mut4.log; exit 1
+            # [2026-09-02, spec §6.5a] Mut4's designed trace re-sent the same BEGIN/COMMIT through a restart;
+            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
+            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
+            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
+            echo "verdict=ESCALATED-SUBSUMED (Mut4 did NOT trip AbortFinality: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut4.log; exit 1
           fi
+      - name: Mut5 must trip Inv (restart derives the target by MIN — spec §6.5a, 2026-09-02)
+        working-directory: verification
+        run: |
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config Mut5RestartMin.cfg HydraActivationCore.tla > mut5.log 2>&1 || rc=$?
+          if grep -q "is violated" mut5.log; then
+            echo "verdict=GREEN (Mut5 fired: $(grep -E 'Invariant .* is violated' mut5.log | head -1); rc=$rc)"
+          else
+            echo "verdict=MASKED-FAILURE (Mut5 did NOT fire — the restart-derivation mutation stopped firing)"; tail -40 mut5.log; exit 1
+          fi
+
       - name: Baseline-safety smoke must NOT violate (bounded time budget)
         working-directory: verification
         run: |
@@ -108,6 +128,7 @@ jobs:
           - { name: baseline-live,   cfg: BaselineLiveness.cfg, expect: clean }
           - { name: mut1,            cfg: Mut1Unservable.cfg,    expect: violation }
           - { name: mut3,            cfg: Mut3AttemptFence.cfg,  expect: violation }
+          - { name: mut5,            cfg: Mut5RestartMin.cfg,    expect: violation }
           # §7.15/Q2 fast mutation lane: deliberately smaller SOUND bounds (MaxCrashes=1, MaxPos=1)
           # so the F2 fencing counterexample is shallow — a mutation check only needs the violation
           # to exist at SOME sound bounds. Paired with baseline-safety-fast at the IDENTICAL bounds

@@ -95,6 +95,9 @@ pub struct World {
     /// and restart recovers via the real partial-tail-discard scanner. Cross-checked against the
     /// coordinator's own durable WAL on every restart (M0 §5 torn-write contract in the loop).
     vwal: VirtualWal,
+    /// The round's session id — a restart rebuilds the coordinator for THIS session from the
+    /// records the real codec recovers (spec §6.5a: volatile state is a pure function of the log).
+    sid: [u8; 16],
     n_stages: u16,
     rng: Rng,
     /// A WAL write emitted but not yet durable (crash here loses it — the decided-but-untold window).
@@ -142,6 +145,7 @@ impl World {
             coord: Coordinator::new_initial(SessionId([7; 16]), n_stages, 1),
             stages: Vec::new(),
             vwal: VirtualWal::new([7; 16]),
+            sid: [7; 16],
             n_stages,
             rng: Rng::new(seed),
             pending_wal: None,
@@ -172,6 +176,7 @@ impl World {
         sid[0] = self.round as u8;
         sid[1] = (self.round >> 8) as u8;
         self.coord = Coordinator::new_initial(SessionId(sid), self.n_stages, 1);
+        self.sid = sid;
         self.vwal = VirtualWal::new(sid);
         self.pending_wal = None;
         self.commit_acks.clear();
@@ -526,28 +531,39 @@ impl World {
                     }
                     _ => {}
                 }
-                let effects = self.coord.step(ev);
-                self.interpret(effects);
-                // On restart, the real codec recovers the durable prefix from the (possibly torn)
-                // virtual disk; it must equal the coordinator's own durable WAL. A divergence means
-                // the WAL-FORMAT §5 torn-write recovery disagrees with the sim's durability model.
-                if is_restart {
+                // On restart (spec §6.5a, 2026-09-03): the real codec recovers the durable prefix
+                // from the (possibly torn) virtual disk and the coordinator is REBUILT from it —
+                // nothing survives the crash in memory, which is the amendment's whole content.
+                // Before §6.5a the sim restarted the same in-memory object and merely compared its
+                // WAL to the recovered set; that comparison is kept below as the check that the
+                // restart step itself appends nothing the disk does not hold.
+                let recovered = if is_restart {
                     match self.vwal.recover() {
                         Err(e) => {
                             return Some(self.fail("WalCodecRecover", format!("{e:?}")));
                         }
                         Ok(recovered) => {
-                            if recovered.as_slice() != self.coord.wal() {
-                                return Some(self.fail(
-                                    "WalCodecDivergence",
-                                    format!(
-                                        "codec recovered {} records, coordinator holds {}",
-                                        recovered.len(),
-                                        self.coord.wal().len()
-                                    ),
-                                ));
-                            }
+                            // The sim has no data plane, so no service witness: a durable COMPLETE re-enters
+                            // finalization here exactly as the model does with servedCount = 0.
+                            self.coord = Coordinator::restart_from(SessionId(self.sid), self.n_stages, 1, recovered.clone(), false);
+                            Some(recovered)
                         }
+                    }
+                } else {
+                    None
+                };
+                let effects = self.coord.step(ev);
+                self.interpret(effects);
+                if let Some(recovered) = recovered {
+                    if recovered.as_slice() != self.coord.wal() {
+                        return Some(self.fail(
+                            "WalCodecDivergence",
+                            format!(
+                                "codec recovered {} records, coordinator holds {} after the restart step",
+                                recovered.len(),
+                                self.coord.wal().len()
+                            ),
+                        ));
                     }
                 }
             }

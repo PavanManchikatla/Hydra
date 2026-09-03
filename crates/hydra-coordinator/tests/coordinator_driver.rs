@@ -147,15 +147,20 @@ async fn a_crash_between_writing_the_intent_and_its_durability_is_classified_fro
 
 /// **§6.5 window 2 — INTENT durable, COMMIT_ACTIVATION not yet sent.**
 ///
-/// The gap TLC-1 exploited: decided-but-not-told. The coordinator must resume the *same* attempt
-/// rather than starting a new one, or two attempts exist for one intent.
+/// The gap TLC-1 exploited: decided-but-not-told. Under spec §6.5a the restarting coordinator does
+/// NOT resume the attempt: its volatile state is a pure function of the log, and a restart FENCES
+/// FORWARD — a new recovery at (epoch+1, rid+1) whose BEGIN is durable before anything is sent —
+/// so the durable-but-unsent INTENT can never be completed by a later process, and any stage that
+/// somehow saw it is fenced by the epoch. (Before 2026-09-03 this test asserted the opposite —
+/// "the SAME attempt resumes" — the semantics the amendment retired; PROJECT_STATE §7.77.)
 #[tokio::test]
-async fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_resumes_the_same_attempt() {
+async fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_fences_forward() {
     let mut h = harness(2);
     h.driver.step(CoordEvent::StagesReconstructed).await.unwrap();
     h.driver.step(CoordEvent::ProceedWriteIntent).await.unwrap();
     assert_eq!(h.driver.state(), CoordState::IntentDurable);
-    let attempt_before = h.driver.coordinator().attempt();
+    let epoch_before = h.driver.coordinator().epoch();
+    let rid_before = h.driver.coordinator().recovery_id();
     for buf in &h.sent {
         assert!(buf.lock().unwrap().is_empty(), "no frame left the coordinator before the record was durable");
     }
@@ -163,12 +168,19 @@ async fn a_crash_after_the_intent_is_durable_but_before_the_commit_is_sent_resum
     h.driver.step(CoordEvent::Crash).await.unwrap();
     let after = h.driver.step(CoordEvent::Restart).await.unwrap();
     assert_eq!(
-        h.driver.state(),
-        CoordState::IntentDurable,
-        "a durable intent with no completion means the attempt is still in flight (§6.5)"
+        after.wal_records,
+        vec!["BEGIN_RECOVERY"],
+        "the restart's first durable act is the fence-forward BEGIN — it does not resume the in-flight attempt (§6.5a)"
     );
-    assert_eq!(h.driver.coordinator().attempt(), attempt_before, "the SAME attempt resumes; a new one would fence the old");
-    assert_eq!(after.frames_sent, 0, "restart classification sends nothing by itself");
+    assert_eq!(
+        h.driver.state(),
+        CoordState::RecoveryStarted,
+        "a durable intent with no completion is NOT resumed: the coordinator is in a NEW recovery (§6.5a)"
+    );
+    assert_eq!(h.driver.coordinator().epoch(), epoch_before + 1, "the target epoch advances by one: the old attempt is fenced");
+    assert_eq!(h.driver.coordinator().recovery_id(), rid_before + 1, "and the recovery id with it");
+    assert_eq!(h.driver.coordinator().attempt(), 0, "the attempt space restarts under the new epoch");
+    assert_eq!(after.frames_sent, 0, "restart classification sends nothing by itself; the BEGIN is durable before any wire");
 }
 
 /// **§6.5 window 3 — all acks in, COMPLETE not yet durable: the decision may still be abandoned.**

@@ -27,6 +27,7 @@ EnableUnservable = TRUE
 ResetTruncates = TRUE
 AttemptFencing = TRUE
 AbortGuardEnabled = FALSE
+RestartDerivesByMax = TRUE
 
 INVARIANTS
 Inv

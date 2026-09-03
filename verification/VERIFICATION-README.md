@@ -22,7 +22,7 @@ liveness properties' job. Use `-checkpoint 1` + `-recover` on time-limited machi
    window is reachable.
 4. EventuallyStable is literal: crashes bounded by `MaxCrashes` and not fair; productive
    actions weakly fair.
-5. Mutations are CONSTANT flips: `EnableUnservable`, `ResetTruncates`, `AttemptFencing`,
+5. Mutations are CONSTANT flips: `EnableUnservable`, `ResetTruncates`, `AttemptFencing`, `RestartDerivesByMax` (Mut5, 2026-09-02: restart derives the target epoch by MIN — spec §6.5a),
    `AbortGuardEnabled`.
 5b. **Fairness is per-(stage, message-class)** (v0.10.1 patch): receive actions are
    parameterized over their bounded discriminators (epoch, recovery_id, attempt), with
@@ -91,6 +91,30 @@ new model; baseline-safety→fixpoint, baseline-live→clean drain, and Mut3→f
 to be reached by re-dispatching `recover=true` (which also exercises the `-recover` round-trip for
 the first time). **No certification claim beyond the paragraph above is licensed** — in particular
 "all configs conclusive on v0.10.4" is NOT yet true.
+
+### Local smoke — 2026-09-03 (spec §6.5a: restart derives from the WAL and fences forward)
+
+The model was amended per the design authority's ruling of 2026-09-02 (H10(d) → protocol
+amendment): `CoordCrash` sets the coordinator's volatile variables to ⊥ (`goal`, the durable
+commit-stream frontier, excepted), `CoordRestart` derives `DTarget/DRId/DAttempt/…` from `wal`,
+classifies in F-UNSERVABLE order and fences forward to `(epoch+1, rid+1)`; new invariant
+`IntentFence`; new mutation **Mut5** (`RestartDerivesByMax = FALSE`: the target epoch derived by
+MIN). Run through the project's own flags (`-workers auto -deadlock`, rule 18), quoted verbatim:
+
+| Config | Result (quoted) | Reading |
+|---|---|---|
+| `Mut5RestartMin.cfg` | `Error: Invariant Inv is violated.` — `Finished in 03s` | **Fires as designed** (`IntentFence`): deriving the target by MIN re-opens the old epoch, and a stale durable INTENT outranks the derived attempt. |
+| `smoke/Mut2-CaseBPure.cfg` | `Model checking completed. No error has been found.` — 890 000 distinct states, 0 left on queue — `Finished in 50s` | **⛔ ESCALATED-SUBSUMED.** Mut2's designed trace (label-only reset → Case B replay after a restart) used the restart-replay path §6.5a removes; a fenced-forward restart never replays. What Mut2 should sabotage now is the design authority's ruling — the CI smoke prints `verdict=ESCALATED-SUBSUMED` and is red by design until then (PROJECT_STATE §7.77). |
+| `smoke/Mut4-AbortFinality.cfg` | `Model checking completed. No error has been found.` — 946 195 distinct states, 0 left on queue — `Finished in 53s` | **⛔ ESCALATED-SUBSUMED.** Mut4's trace (TLC-1: the aborted attempt resurrected by the restart, then completed by stale acks) needs `CoordRestart → ACTIVATION_INTENT_DURABLE`, which no longer exists. Same status as Mut2. |
+
+**Checkpoints from every earlier long run are void** (the state space changed with the model);
+the standing bounds are unchanged. The CI `tlc.yml` smoke carries a Mut5 step and the long matrix a
+`mut5` leg (`expect: violation`); the next scheduled long run is the first on the amended model.
+**Re-measured 2026-09-03T01:54Z after the derivation repair** (the DST found `DUnserv` matching ANY completion; now `DTargetCid`-scoped, and `DecisionMonotone` strengthened to the code's form — PROJECT_STATE §7.77); the first smoke at 00:33Z read the same way on the pre-repair model. `BaselineSafetyFast.cfg` also drains clean (76 351 distinct states, 3 s).
+**Re-measured again at 03:04Z after Case A was extended** (spec §1.3 with §6.5a: a stage REBUILDING / FROZEN_READY at base — caught up for an activation that never committed because the coordinator crashed first — now takes Case A; the product restart oracle's third window found the model and the code dropping that BEGIN as Case C): Mut5 `Error: Invariant Inv is violated.` (11 s); Mut2 clean (890 000 distinct, 2 min 52 s); Mut4 clean (946 195 distinct, 2 min 09 s); BaselineSafetyFast clean (76 351 distinct, 6 s) — the same counts, because the smoke bounds do not reach a crash between reconstruction and COMMIT.
+**Re-measured a fourth time at 03:48Z after the served-fence refinement** (spec §6.5a: a durable COMPLETE re-enters finalization only while the activation has not served — `DComplete /\ servedCount = 0`; a served activation's crash is outside any transaction and fences forward, because the stages' data-plane tail beyond the durable frontier needs the BEGIN's truncation; forced by the product restart oracle's first two windows once the control-WAL codec stopped zeroing every COMPLETE's tuple): Mut5 `Error: Invariant Inv is violated.` (3 s); Mut2 clean (889 076 distinct, 54 s); Mut4 clean (945 271 distinct, 1 min 52 s); BaselineSafetyFast clean (76 279 distinct, 7 s) — the counts move by −0.1 %, the verdicts not at all.
+Rule 6 note: the model was NOT adjusted to make Mut2/Mut4 fire again — the drain-clean result is the
+finding, recorded, not repaired.
 
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),

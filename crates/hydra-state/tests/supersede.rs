@@ -190,10 +190,21 @@ fn a_crash_before_the_unservable_record_is_durable_leaves_no_unservable_fact() {
         "with no DURABLE unservable record there is no unservable fact to restart into — claiming \
          one would be the coordinator believing a write that may never have reached the platter"
     );
-    assert!(no_finalize(&effs), "restart must not emit FINALIZE for a lost participant either");
+    // §6.5a (2026-09-03): the restart is a pure function of the log. The log holds a durable
+    // COMPLETE and no UNSERVABLE, so the coordinator re-enters finalization (§6.5 branch 2) — it
+    // does not remember the loss it observed before the crash, because that observation was never
+    // made durable. (Before §6.5a the pre-crash `lost` set survived in memory, which is precisely
+    // the kind of survivor the amendment forbids.)
+    assert_eq!(c.state(), CoordState::ActivationComplete, "COMPLETE durable, UNSERVABLE lost: re-enter finalization");
+    assert!(no_finalize(&effs), "restart must not emit FINALIZE by itself");
     assert!(invariants::check(&c).is_empty(), "the state after the lost write is still legal");
 
-    // And the recourse is intact: the coordinator can record it again, and this time it lands.
+    // And the recourse is intact: finalization re-observes the loss, the coordinator records it
+    // again, and this time it lands.
+    let effs = c.step(ProceedSendFinalize);
+    assert!(!no_finalize(&effs), "re-entering finalization re-sends FINALIZE (the decision IS durable)");
+    assert_eq!(c.state(), CoordState::Finalizing);
+    c.step(StageLost { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1) });
     c.step(ProceedRecordUnservable);
     c.step(WalDurable(hydra_state::coordinator::WalKindTag::Unservable));
     assert_eq!(c.state(), CoordState::Superseding, "re-recording after the lost write converges");
