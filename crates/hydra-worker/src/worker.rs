@@ -800,7 +800,13 @@ impl Worker {
             }
             StageEffect::Finalized { attempt, .. } => Some(wire::encode_activation_finalized(fence, self.stage.epoch(), attempt)),
             StageEffect::RecoveryAck { target, recovery_id, .. } => {
-                Some(wire::encode_recovery_ack(fence, target, recovery_id, self.stage.applied()))
+                // The ack carries the WORKER's data-plane frontier after the truncation above — the
+                // real position the KV holds — not the stage SM's abstract `applied` count. The two
+                // differ exactly where it matters (2026-09-03, restart oracle window 3): a stage that
+                // had applied nothing is `-1` here and `0` in the SM, and a coordinator that trusted
+                // the SM's value skipped position 0 and was answered `ERR_GAP` for position 1. Spec
+                // §2.3d's resume rule is stated on this frontier (`applied_pos + 1`).
+                Some(wire::encode_recovery_ack(fence, target, recovery_id, self.applied_frontier))
             }
             StageEffect::ResetAck { recovery_id, .. } => {
                 Some(wire::encode_recovery_ack(fence, self.stage.epoch(), recovery_id, self.stage.applied()))

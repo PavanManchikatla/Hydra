@@ -47,9 +47,23 @@ impl ControlWal {
         let path = path.as_ref();
         // Audit M8: a control log for another session must not classify this one's restart.
         let scan = hydra_wal::reader::WalScan::open_for_session(path, cluster_id, session_id)?;
-        let mut records = Vec::new();
+        let mut records: Vec<WalRecord> = Vec::new();
         for r in &scan.records {
-            if let Some(rec) = decode_control_record(r.record_type, &r.payload) {
+            if let Some(mut rec) = decode_control_record(r.record_type, &r.payload) {
+                // A COMPLETE stores only its tuple's completion hash; the whole tuple (kind,
+                // checkpoint id) is the INTENT's, and §6.5a's derivation and H2's evidence both
+                // need it whole — resolve it from the INTENT that hashes to the same value.
+                if let WalRecord::ActivationComplete { tuple, .. } = &mut rec {
+                    if let Ok(cr) = flatbuffers::root::<wal::ActivationCompleteRec>(&r.payload) {
+                        let h = cr.tuple_hash().bytes();
+                        if let Some(t) = records.iter().rev().find_map(|x| match x {
+                            WalRecord::ActivationCommitIntent { tuple: t } if t.completion_hash().as_slice() == h => Some(t.clone()),
+                            _ => None,
+                        }) {
+                            *tuple = t;
+                        }
+                    }
+                }
                 records.push(rec);
             }
         }
@@ -73,8 +87,45 @@ impl ControlWal {
     }
 }
 
+/// The fence a record is stamped with is the record's OWN (epoch, recovery_id, attempt) — never the
+/// caller's static context. The decoder reads those three fields back from the fence (a COMPLETE
+/// stores only a tuple hash, a BEGIN stores no recovery id of its own), so a record written under
+/// a static fence read back as (0, 0, 0) after a real restart: the product's first restart oracle
+/// found every COMPLETE resurfacing as `{epoch 0, rid 0, attempt 0}` and the fence-forward BEGIN's
+/// recovery id as 0 (2026-09-03). The in-memory harness restarts never reread the disk, so none of
+/// them could see it (rule 27).
+fn record_fence(base: &WalFenceCtx, record: &WalRecord) -> WalFenceCtx {
+    let mut f = base.clone();
+    match record {
+        WalRecord::ActivationCommitIntent { tuple } | WalRecord::ActivationComplete { tuple, .. } => {
+            f.epoch = tuple.epoch;
+            f.recovery_id = tuple.recovery_id;
+            f.activation_attempt_id = tuple.attempt;
+        }
+        WalRecord::ActivationAbort { epoch, recovery_id, attempt } => {
+            f.epoch = *epoch;
+            f.recovery_id = *recovery_id;
+            f.activation_attempt_id = *attempt;
+        }
+        WalRecord::BeginRecovery { target, recovery_id, .. } => {
+            f.epoch = *target;
+            f.recovery_id = *recovery_id;
+            f.activation_attempt_id = 0;
+        }
+        WalRecord::ResetRecoveryAttempt { target, new_recovery_id, .. } => {
+            f.epoch = *target;
+            f.recovery_id = *new_recovery_id;
+            f.activation_attempt_id = 0;
+        }
+        WalRecord::ActivationUnservable { .. } | WalRecord::SessionTerminate => {}
+    }
+    f
+}
+
 fn encode_control_record(fence: &WalFenceCtx, record: &WalRecord) -> (u16, Vec<u8>) {
     let mut fbb = FlatBufferBuilder::new();
+    let stamped = record_fence(fence, record);
+    let fence = &stamped;
     match record {
         WalRecord::ActivationCommitIntent { tuple } => {
             let f = build_fence(&mut fbb, fence);
