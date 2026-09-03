@@ -293,8 +293,11 @@ pub struct AppState {
     registry: Arc<Mutex<Registry>>,
     gen_fn: GenFn,
     /// Builds a fresh [`Session`] (fresh commit stream + piece source, with its own k / emit
-    /// capacity baked in) per new session.
-    make_session: Arc<dyn Fn() -> Session + Send + Sync>,
+    /// capacity baked in) per new session. **Prompt-aware since 2026-09-02 (§7.76):** the product's
+    /// factory tokenizes the prompt and appends the `INITIAL_COMMIT` (spec §2.6a) before the first
+    /// sampled token can arrive — the prompt tokens are what a recovery replays, so a session that
+    /// does not know its prompt cannot be recovered. Prompt-agnostic factories ignore the argument.
+    make_session: Arc<dyn Fn(&str) -> Session + Send + Sync>,
     /// Required — see [`ApiAuth`]. There is no unauthenticated construction path.
     auth: ApiAuth,
 }
@@ -320,7 +323,47 @@ impl AppState {
         }
     }
 
+    /// **Adopt a session a restarted coordinator resumed (spec §6.5a, 2026-09-02).** The rebuilt
+    /// [`Session`] (its event log already carrying the durable prefix's events) becomes the active
+    /// session; `rx` feeds the continuation. A client that reconnects with `Last-Event-ID` attaches
+    /// to it (see `chat_completions`) and sees the gapless suffix. Returns the session id.
+    pub fn adopt_resumed(&self, backlog: Vec<Event>, make_session: Box<dyn FnOnce() -> Session + Send>, rx: mpsc::Receiver<SampledToken>) -> String {
+        let (id, st) = {
+            let mut reg = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            reg.seq += 1;
+            let id = format!("chatcmpl-resumed-{}", reg.seq);
+            let (tx, _rx) = broadcast::channel(256);
+            let st = Arc::new(Mutex::new(SessionState { log: backlog, tx, done: false, client_acked_through: 0 }));
+            reg.sessions.insert(id.clone(), st.clone());
+            (id, st)
+        };
+        // The session (non-`Send`: it owns the engine tokenizer) is built ON its thread, exactly as
+        // a created session is; only `Send` handles cross.
+        std::thread::spawn(move || {
+            let _guard = DoneOnDrop(st.clone());
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("hydra-coordinator: resumed session runtime failed to build: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let session = make_session();
+                pump(session, rx, st).await
+            });
+        });
+        id
+    }
+
     pub fn new(make_session: Arc<dyn Fn() -> Session + Send + Sync>, gen_fn: GenFn, auth: ApiAuth) -> AppState {
+        let make = Arc::new(move |_prompt: &str| make_session());
+        AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session: make, auth }
+    }
+
+    /// The product constructor (§7.76): the session factory receives the prompt, so it can append
+    /// the `INITIAL_COMMIT` with the real prompt tokens before generation starts.
+    pub fn with_prompt_aware_session(make_session: Arc<dyn Fn(&str) -> Session + Send + Sync>, gen_fn: GenFn, auth: ApiAuth) -> AppState {
         AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session, auth }
     }
 }
@@ -418,11 +461,14 @@ async fn chat_completions(
         Some(k) => Some(k.to_string()),
         None => None,
     };
-    let last_event_id = headers
+    // `Some` whenever the client PRESENTED a cursor — `Last-Event-ID: 0` included: a client whose
+    // stream died before its first event has a cursor of 0 and is still reconnecting, not opening
+    // a new session (the restart oracle's third window, 2026-09-03). `None` is a fresh request.
+    let last_event_hdr: Option<u64> = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let last_event_id = last_event_hdr.unwrap_or(0);
 
     // Resolve (or create) the session under the idempotency key.
     let (session_id, session, created) = {
@@ -430,6 +476,13 @@ async fn chat_completions(
         if let Some(id) = idempotency.as_ref().and_then(|k| reg.by_idempotency.get(k).cloned()) {
             let s = reg.sessions.get(&id).unwrap().clone();
             (id, s, false)
+        } else if let (Some(_), Some(active)) = (last_event_hdr, reg.active_session()) {
+            // **A reconnect after a coordinator restart (spec §6.5a).** The idempotency map is
+            // volatile and did not survive; `Last-Event-ID` is the client's durable cursor (a
+            // presented `0` is a cursor too), and the resumed session is the one active session
+            // this instance holds — attach to it.
+            let s = reg.sessions.get(&active).unwrap().clone();
+            (active, s, false)
         } else {
             // Option A (spec §1.4): one active session per model instance. A second concurrent
             // session is **refused**, never queued and never silently admitted — and the refusal
@@ -498,7 +551,7 @@ async fn chat_completions(
                 }
             };
             rt.block_on(async move {
-                let sess = make();
+                let sess = make(&prompt);
                 let rx = gen(prompt);
                 pump(sess, rx, st).await;
             });
@@ -542,7 +595,15 @@ async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<M
                     }
                 }
                 None => {
-                    if let Ok(evs) = sess.finish() { publish(&st, evs); }
+                    // A failed final flush is a lost tail of TEXT with the tokens already durable —
+                    // it must be loud (rule 12), never a silently shorter stream.
+                    match sess.finish() {
+                        Ok(evs) => {
+                            eprintln!("hydra-coordinator: generation finished: {} tail event(s), {} byte(s) of text", evs.len(), evs.iter().map(|e| e.data.len()).sum::<usize>());
+                            publish(&st, evs)
+                        }
+                        Err(e) => eprintln!("hydra-coordinator: end-of-generation flush FAILED: {e} — the stream's tail is missing"),
+                    }
                     lock_session(&st).done = true;
                     break;
                 }

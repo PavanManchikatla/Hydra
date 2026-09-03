@@ -377,8 +377,11 @@ name = "hydra-cli"
 version = "0.10.2"
 dependencies = [
  "blake3",
+ "hydra-engine-sys",
+ "hydra-state",
  "hydra-transport",
  "hydra-wire",
+ "hydra-worker",
  "ring",
  "tempfile",
  "thiserror 2.0.18",
@@ -438,6 +441,26 @@ dependencies = [
  "blake3",
  "ring",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hydra-node"
+version = "0.10.2"
+dependencies = [
+ "axum",
+ "blake3",
+ "hydra-cli",
+ "hydra-coordinator",
+ "hydra-engine-sys",
+ "hydra-state",
+ "hydra-tokenizer",
+ "hydra-transport",
+ "hydra-wire",
+ "hydra-worker",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

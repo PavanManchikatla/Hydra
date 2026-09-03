@@ -13,6 +13,11 @@ path = "src/bin/hydra-cli.rs"
 [dependencies]
 hydra-transport = { path = "../hydra-transport" }
 hydra-wire = { path = "../hydra-wire" }
+# Provisioning (2026-09-02): a worker bootstrap is `hydra-worker`'s type; the graph permits the edge
+# (nothing depends on hydra-cli), rule 21 checked before adding it.
+hydra-worker = { path = "../hydra-worker" }
+hydra-state = { path = "../hydra-state" }
+hydra-engine-sys = { path = "../hydra-engine-sys" }
 blake3.workspace = true
 thiserror.workspace = true
 ring = "0.17"

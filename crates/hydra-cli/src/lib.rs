@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 use hydra_transport::{ClusterCa, DeviceIdentity};
 
 pub mod status;
+pub mod provision;
 
 /// How long a pairing window stays open (M4·2).
 ///

@@ -159,6 +159,29 @@ impl TcpMtls {
         let tls = self.connector.connect(sni, tcp).await?;
         Ok(Conn::new(tls))
     }
+
+    /// **Dial a STAGE and mint the rank the coordinator's quorum accounting may count it under.**
+    ///
+    /// On the accept side a rank comes from the peer certificate's bound role
+    /// ([`crate::roles::BoundPeer::authenticated_rank`], audit H4). On the DIAL side the
+    /// authenticated fact is the server name TLS verified against the cluster CA — the coordinator
+    /// dialled `worker-s1` and the handshake proves it reached the device holding that
+    /// certificate. The rank is the coordinator's own placement of that device (`name → rank`,
+    /// from provisioning), bound to the connection here, BEFORE any frame is read — so H4's
+    /// concern (a rank a frame chose) does not arise: no frame is ever consulted.
+    ///
+    /// This is the only production constructor of an [`hydra_state::AuthenticatedRank`] for a
+    /// dialled peer; `hydra-node` uses it. It lives in the transport because that is where the
+    /// TLS verification it rests on lives (rule 21: the right home was reachable).
+    pub async fn connect_stage(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        rank: hydra_state::StageRank,
+    ) -> Result<(ClientConn, hydra_state::AuthenticatedRank), TransportError> {
+        let conn = self.connect(addr, server_name).await?;
+        Ok((conn, hydra_state::AuthenticatedRank::from_authenticated_peer_role(rank)))
+    }
 }
 
 impl Transport for TcpMtls {

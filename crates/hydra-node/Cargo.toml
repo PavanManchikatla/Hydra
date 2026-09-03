@@ -1,0 +1,36 @@
+[package]
+name = "hydra-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The product process: hosts the `hydra-coordinator` binary at the top of the crate graph (rule 27, 2026-09-02)"
+
+# **Why this crate exists (design authority, 2026-09-02, §7.76).** The coordinator BINARY needs two
+# things that live on opposite sides of a one-way edge: the coordinator library (`hydra-coordinator`:
+# SM driver, commit stream, API) and the stage drivers (`hydra-worker::pair`, which depends on
+# `hydra-coordinator`). A binary inside `hydra-coordinator` could not link stages without closing a
+# cycle — so for a week it shipped with a stub generation path. Moving the binary UP resolves it.
+# Extracting the drivers DOWN (below both) is the better long-term shape and is a §8 v2 item.
+
+[[bin]]
+name = "hydra-coordinator"
+path = "src/bin/hydra-coordinator.rs"
+
+[dependencies]
+hydra-coordinator = { path = "../hydra-coordinator" }
+hydra-worker = { path = "../hydra-worker" }
+hydra-transport = { path = "../hydra-transport" }
+hydra-state = { path = "../hydra-state" }
+hydra-wire = { path = "../hydra-wire" }
+hydra-tokenizer = { path = "../hydra-tokenizer" }
+hydra-engine-sys = { path = "../hydra-engine-sys" }
+hydra-cli = { path = "../hydra-cli" }
+blake3.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+axum = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

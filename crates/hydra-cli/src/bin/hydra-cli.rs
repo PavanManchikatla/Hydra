@@ -3,8 +3,13 @@
 //! ```text
 //! hydra-cli pair --out <dir>            # open a window on the coordinator; prints the PIN + QR payload
 //! hydra-cli claim --name worker-s1 --pin 123456 --out <dir>
+//! hydra-cli provision --pairing-dir <dir> --model <gguf> --stages worker-s1=127.0.0.1:9001,worker-s2=127.0.0.1:9002 [--split K] [--n-ctx N]
 //! hydra-cli status --data-dir <dir>
 //! ```
+//!
+//! `pair` also mints the **API token** (`api-token`, 0600 — item 2 of the 2026-09-02 ruling), and
+//! `provision` mints the **session fence** and writes one bootstrap per stage plus the stage table
+//! (`hydra_cli::provision`). Rotation of the token is re-pair.
 //!
 //! **The CA private key never leaves the coordinator.** `pair` writes the CA *certificate* and each
 //! device's own material; there is no flag that emits the CA key, and `hydra_cli::PairingSession`
@@ -31,6 +36,9 @@ fn main() -> Result<(), String> {
             let coord = session.provision_coordinator(&coord_dir).map_err(|e| e.to_string())?;
             write_private(&coord_dir.join("identity.cert.der"), coord.identity.cert_chain[0].as_ref())?;
             println!("coordinator provisioned into {} (CA key persisted there, 0600, and nowhere else)", coord_dir.display());
+            // Item 2 (2026-09-02): pairing mints the API token, beside the CA material, 0600.
+            let _token = hydra_cli::provision::mint_api_token(std::path::Path::new(&out)).map_err(|e| e.to_string())?;
+            println!("API token minted into {}/api-token (0600). The coordinator reads it from there; HYDRA_API_TOKEN overrides it; rotation is re-pair.", out);
             println!();
 
             println!("Pairing window open for {} seconds.", hydra_cli::PAIRING_WINDOW.as_secs());
@@ -56,6 +64,30 @@ fn main() -> Result<(), String> {
             }
             Ok(())
         }
+        Some("provision") => {
+            let dir = flag("--pairing-dir").ok_or("provision: --pairing-dir <dir> (what `pair --out` wrote) is required")?;
+            let model = flag("--model").ok_or("provision: --model <gguf> is required")?;
+            let stages_arg = flag("--stages").ok_or("provision: --stages worker-s1=127.0.0.1:9001,worker-s2=127.0.0.1:9002 is required (rank order)")?;
+            let split = flag("--split").map(|v| v.parse::<i32>().map_err(|e| format!("--split: {e}"))).transpose()?;
+            let n_ctx: i32 = flag("--n-ctx").unwrap_or_else(|| "512".into()).parse().map_err(|e| format!("--n-ctx: {e}"))?;
+            let mut stages = Vec::new();
+            for (rank, part) in stages_arg.split(',').enumerate() {
+                let (name, addr) = part.split_once('=').ok_or_else(|| format!("--stages: expected name=addr, got {part:?}"))?;
+                stages.push(hydra_cli::provision::StageSpec {
+                    name: name.trim().to_string(),
+                    rank: rank as u16,
+                    addr: addr.trim().parse().map_err(|e| format!("--stages {name}: {e}"))?,
+                });
+            }
+            let files = hydra_cli::provision::provision(std::path::Path::new(&dir), &model, &stages, split, n_ctx).map_err(|e| e.to_string())?;
+            println!("provisioned {} stages into {dir}:", files.stages.len());
+            for s in &files.stages {
+                println!("    {}  rank {}  {}  -> {dir}/{}.boot  (start with: hydra-worker {dir}/{}.boot)", s.name, s.rank, s.addr, s.name, s.name);
+            }
+            println!("session fence written to {dir}/cluster.fence (session_id minted from the system CSPRNG; the coordinator and every stage share it)");
+            println!("stage table written to {dir}/stages");
+            Ok(())
+        }
         Some("status") => {
             let dir = flag("--data-dir").unwrap_or_else(|| "./hydra-data".into());
             for line in hydra_cli::status::status_for(std::path::Path::new(&dir)) {
@@ -63,7 +95,7 @@ fn main() -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: hydra-cli <pair|status> ...".into()),
+        _ => Err("usage: hydra-cli <pair|provision|status> ...".into()),
     }
 }
 

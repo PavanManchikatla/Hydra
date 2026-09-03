@@ -87,6 +87,44 @@ impl Session {
         }
     }
 
+    /// **Reopen a session over an EXISTING ledger (spec §6.5a, 2026-09-02): the event log is a
+    /// pure function of the durable prefix, so it is rebuilt here with the SAME dense ids** — one
+    /// event per durable `GENERATION_COMMIT` whose pieces yield visible text, through a fresh
+    /// UTF-8 streamer, exactly as `commit_group` produced them. A client that reconnects with
+    /// `Last-Event-ID: k` after a coordinator restart therefore replays the identical suffix.
+    /// `commit` must be a stream opened with [`CommitStream::open`] on `path`.
+    pub fn reopen(path: &std::path::Path, commit: CommitStream, fence: WalFenceCtx, pieces: Box<dyn PieceSource>, k: usize, emit_capacity: usize) -> Result<Session, CommitError> {
+        let mut sess = Session::new(commit, fence, pieces, k, emit_capacity);
+        let events = Session::replay_events(path, sess.pieces.as_ref(), &mut sess.detok)?;
+        for ev in events {
+            sess.log.append(ev.data, ev.last_output_pos);
+        }
+        Ok(sess)
+    }
+
+    /// The durable prefix's events, replayed through a fresh (or the given) UTF-8 streamer — the
+    /// pure function the event log is. Callable without a session (a restart uses it to hand the
+    /// HTTP layer the backlog before the session thread exists).
+    pub fn replay_events(path: &std::path::Path, pieces: &dyn PieceSource, detok: &mut Utf8Streamer) -> Result<Vec<Event>, CommitError> {
+        let scan = hydra_wal::reader::WalScan::open(path).map_err(|e| CommitError::BadCheckpoint(format!("reopen scan: {e}")))?;
+        let mut log = EventLog::new();
+        for r in &scan.records {
+            if r.record_type != hydra_wal::record::rec_type::GENERATION_COMMIT {
+                continue;
+            }
+            let gc = flatbuffers::root::<hydra_proto::wal::GenerationCommit>(&r.payload)
+                .map_err(|e| CommitError::BadCheckpoint(format!("GENERATION_COMMIT at {}: {e}", r.offset)))?;
+            let mut text = String::new();
+            for te in gc.tokens().iter() {
+                text.push_str(&detok.push(&pieces.piece(te.token_id())));
+            }
+            if !text.is_empty() {
+                log.append(text, gc.last_output_pos());
+            }
+        }
+        Ok(log.all().to_vec())
+    }
+
     pub fn durable_pos(&self) -> i64 {
         self.commit.generation_durable_pos()
     }

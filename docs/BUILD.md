@@ -42,7 +42,7 @@ git apply ../../spike/llama-cpp-layer-window.patch
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON   # or -DGGML_CUDA=ON, or neither for CPU
 cmake --build build -j
 cd ../..
-cargo build --release
+cargo build --release        # `hydra-coordinator` is built from crates/hydra-node (2026-09-02), the workers from crates/hydra-worker
 ```
 
 `build.rs` checks that the patch is actually applied — it looks for `il_start` / `il_load_start` in

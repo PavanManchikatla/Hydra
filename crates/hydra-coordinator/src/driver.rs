@@ -291,8 +291,10 @@ impl<L: StageLink> ActivationDriver<L> {
         Ok(out)
     }
 
-    /// Send one frame to a specific authenticated peer (M4·0c).
-    async fn send_to(&mut self, rank: AuthenticatedRank, frame: Vec<u8>) -> Result<(), DriverError> {
+    /// Send one frame to a specific authenticated peer (M4·0c). Public since 2026-09-02 so the
+    /// product's data plane (`hydra-node`) rides the SAME authenticated links the activation used —
+    /// a data-plane frame never travels on a connection the SM did not activate.
+    pub async fn send_to(&mut self, rank: AuthenticatedRank, frame: Vec<u8>) -> Result<(), DriverError> {
         let link = self.links.get_mut(&rank.rank()).ok_or(DriverError::NoLink(rank.rank()))?;
         link.send(frame).await
     }
