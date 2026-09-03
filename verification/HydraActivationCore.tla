@@ -555,15 +555,27 @@ DUnserv   == DComplete /\ \E u \in wal : u.t = "UNSERVABLE" /\ u.cid = DTargetCi
 CoordRestart ==
     /\ cState = "CRASHED"
     \* Re-derive the volatile state from the durable log — every variable, no survivors.
-    /\ activeEpoch' = DEpoch /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
-    /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
+    \* (2026-09-03, found by the CI liveness leg in 5 s — `State 5: Stuttering` from CRASHED: the
+    \* first draft assigned recTarget'/rId'/attempt'/actKind' HERE, unconditionally, and then
+    \* re-assigned them in the fence-forward branch below, so that branch was UNSATISFIABLE and a
+    \* crash without completion evidence could never restart. Every primed variable a branch
+    \* decides is now assigned inside that branch, once.)
+    /\ activeEpoch' = DEpoch
     /\ truncateTo' = DTrunc
     /\ tupleGen' = DGens /\ tupleApplied' = DApplied         \* the tuple the durable INTENT bound
-    /\ completeDurable' = DComplete /\ unservable' = DUnserv
     /\ complId' = DComplId /\ predCompl' = 0
+    \* completeDurable / unservable are decided per branch: a branch that RESUMES the derived
+    \* target's completion carries it; a branch that fences FORWARD has moved past it — the old
+    \* completion is finished business (§6.5a), and carrying its flag into the new target made
+    \* PostDecisionLoss demand a supersession the new recovery never performs (CI liveness leg,
+    \* 2026-09-03: a 20-state trace ending in a §11 termination). The code's predicate is
+    \* epoch-scoped (`completed()` compares the tuple's epoch) and never had the carry-over.
     /\ IF DUnserv THEN
             \* §6.7: a recorded UNSERVABLE resumes the superseding recovery (F-UNSERVABLE order).
             /\ cState' = "SUPERSEDING" /\ UNCHANGED wal
+            /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
+            /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
+            /\ completeDurable' = TRUE /\ unservable' = TRUE
        ELSE IF DComplete /\ servedCount = 0 THEN
             \* The decision stands (I22): finish it. FINALIZED evidence is re-collected on the wire.
             \* Only while the activation has NOT served (spec §6.5a refinement, 2026-09-03): the
@@ -572,6 +584,9 @@ CoordRestart ==
             \* transaction and falls through to the fence — the data-plane tail beyond the durable
             \* frontier, which this model does not represent, needs the BEGIN's truncation.
             /\ cState' = "ACTIVATION_COMPLETE" /\ UNCHANGED wal
+            /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
+            /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
+            /\ completeDurable' = TRUE /\ unservable' = FALSE
        ELSE IF DTarget + 1 <= MaxEpoch /\ DRId + 1 <= MaxRId THEN
             \* FENCE FORWARD: a new recovery strictly above every durable (hence every sent) value.
             /\ Wal([t |-> "BEGIN", base |-> DTarget, tgt |-> DTarget + 1,
@@ -579,9 +594,13 @@ CoordRestart ==
             /\ cState' = "RECOVERY_STARTED"
             /\ recTarget' = DTarget + 1 /\ rId' = DRId + 1 /\ attempt' = 0
             /\ actKind' = "RECOVERY"
+            /\ completeDurable' = FALSE /\ unservable' = FALSE
        ELSE
             \* Bounds exhausted: §11 explicit termination, never an indefinite restart loop.
             /\ Wal([t |-> "TERMINAL", tgt |-> DTarget]) /\ cState' = "TERMINAL"
+            /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
+            /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
+            /\ completeDurable' = DComplete /\ unservable' = DUnserv
     /\ UNCHANGED << msgs, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
         installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
 
@@ -763,9 +782,15 @@ Serviceable == cState = "SERVICEABLE"
 Terminal    == cState = "TERMINAL"
 
 Progress          == RecoveryInProgress ~> (Serviceable \/ Terminal)
+\* 2026-09-03 (spec §6.5a): termination is an admissible outcome here exactly as in `Progress`.
+\* A served activation whose coordinator crashes fences forward; when the policy bounds on
+\* epochs / recovery ids are exhausted the restart resolves by §11 explicit termination, and the
+\* decision it leaves behind (completeDurable, a LOST participant) has no supersession or service
+\* left to reach. Before fence-forward the restart re-entered the same target and this case could
+\* not arise; the CI liveness leg produced it as a 24-state trace ending in TERMINAL.
 PostDecisionLoss  == (completeDurable /\ ~Serviceable
                         /\ \E s \in Stages : stState[s] = "LOST")
-                     ~> (unservable \/ Serviceable)
+                     ~> (unservable \/ Serviceable \/ Terminal)
 EventualService   == <>Serviceable \/ <>Terminal
 
 ========================================================================================

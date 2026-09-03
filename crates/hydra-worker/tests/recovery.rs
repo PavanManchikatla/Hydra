@@ -96,16 +96,33 @@ async fn recovery_replacement_reaches_active_final_through_the_real_stage_sm() {
 }
 
 #[tokio::test]
-async fn fresh_worker_does_not_accept_case_a() {
-    // Guard: a NON-recovery worker (FROZEN_READY) must not satisfy Case A — the recovery-start flag
-    // is load-bearing, not cosmetic. Exercised directly on the Stage to keep it engine-free.
+async fn a_frozen_ready_stage_at_base_takes_case_a_like_a_frozen_one() {
+    // Until 2026-09-03 this test asserted the OPPOSITE — "FROZEN_READY is not a Case-A entry state;
+    // the recovery-start flag is load-bearing" — a code-level refusal the model never had (its
+    // stages start FROZEN and Case A admitted {ACTIVE_FINAL, FROZEN} at base). Spec §6.5a made the
+    // refused state reachable and load-bearing the other way: a coordinator that crashes after
+    // reconstruction and before COMMIT leaves both stages FROZEN_READY at base, and its restart
+    // FENCES FORWARD with `BEGIN_RECOVERY{base, base+1}` — which these stages dropped as Case C,
+    // and the product coordinator waited forever (the restart oracle's third window). Spec §1.3
+    // Case A now admits REBUILDING / FROZEN_READY at base; the model and the stage SM likewise.
+    // What `recovery_start` still decides: a replacement boots FROZEN (it must be rebuilt before it
+    // can serve), a normal boot is FROZEN_READY (nothing to rebuild for the INITIAL activation) —
+    // a difference in what the stage needs, not in whether it can be fenced forward.
     let mut fresh = hydra_state::Stage::frozen_ready(0, 0, 0);
     let effs = fresh.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
-    assert!(effs.is_empty(), "FROZEN_READY is not a Case-A entry state (no RECOVERY_ACK)");
+    assert!(
+        effs.iter().any(|e| matches!(e, hydra_state::StageEffect::RecoveryAck { target: 1, recovery_id: 1, .. })),
+        "FROZEN_READY at base takes Case A under §6.5a (RECOVERY_ACK at the target); got {effs:?}"
+    );
 
     let mut recovering = hydra_state::Stage::frozen(0, 0, 0, 0);
     let effs = recovering.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
     assert!(!effs.is_empty(), "FROZEN accepts Case A");
+
+    // What is STILL refused: a stage not at base (Case C, nothing on the wire but ERR_TRANSITION).
+    let mut elsewhere = hydra_state::Stage::frozen_ready(0, 3, 0);
+    let effs = elsewhere.step(hydra_state::StageEvent::RecvBegin { base: 0, target: 1, recovery_id: 1, truncate_to: 0, n_ctx: 64 });
+    assert!(effs.is_empty(), "a stage at another epoch is not at base: Case C");
 }
 
 /// **Audit M13 (the auditor's second half) — `RESET_RECOVERY_ATTEMPT` had no wire decode arm.**

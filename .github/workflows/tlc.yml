@@ -52,36 +52,6 @@ jobs:
       # Mutation steps assert the SPECIFIC expected invariant fires (smoke configs check the exact
       # conjunct, not the aggregate Inv). Absence of the expected violation FAILS the job — a
       # mutation that stopped firing must never pass green (masked-failure guard).
-      - name: Mut2 must trip CaseBPure (label-only reset)
-        working-directory: verification
-        run: |
-          rc=0
-          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-            -config smoke/Mut2-CaseBPure.cfg HydraActivationCore.tla > mut2.log 2>&1 || rc=$?
-          if grep -q "Invariant CaseBPure is violated" mut2.log; then
-            echo "OK: Mut2 tripped CaseBPure (rc=$rc)"
-          else
-            # [2026-09-02, spec §6.5a] Mut2's designed trace re-sent the same BEGIN/COMMIT through a restart;
-            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
-            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
-            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
-            echo "verdict=ESCALATED-SUBSUMED (Mut2 did NOT trip CaseBPure: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut2.log; exit 1
-          fi
-      - name: Mut4 must trip AbortFinality (no abort finality — TLC-1/I25)
-        working-directory: verification
-        run: |
-          rc=0
-          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-            -config smoke/Mut4-AbortFinality.cfg HydraActivationCore.tla > mut4.log 2>&1 || rc=$?
-          if grep -q "Invariant AbortFinality is violated" mut4.log; then
-            echo "OK: Mut4 tripped AbortFinality (rc=$rc)"
-          else
-            # [2026-09-02, spec §6.5a] Mut4's designed trace re-sent the same BEGIN/COMMIT through a restart;
-            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
-            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
-            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
-            echo "verdict=ESCALATED-SUBSUMED (Mut4 did NOT trip AbortFinality: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut4.log; exit 1
-          fi
       - name: Mut5 must trip Inv (restart derives the target by MIN — spec §6.5a, 2026-09-02)
         working-directory: verification
         run: |
@@ -113,6 +83,36 @@ jobs:
           esac
 
   # ---------- long, checkpointed, manual/weekly ----------
+      - name: Mut2 must trip CaseBPure (label-only reset)
+        working-directory: verification
+        run: |
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config smoke/Mut2-CaseBPure.cfg HydraActivationCore.tla > mut2.log 2>&1 || rc=$?
+          if grep -q "Invariant CaseBPure is violated" mut2.log; then
+            echo "OK: Mut2 tripped CaseBPure (rc=$rc)"
+          else
+            # [2026-09-02, spec §6.5a] Mut2's designed trace re-sent the same BEGIN/COMMIT through a restart;
+            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
+            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
+            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
+            echo "verdict=ESCALATED-SUBSUMED (Mut2 did NOT trip CaseBPure: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut2.log; exit 1
+          fi
+      - name: Mut4 must trip AbortFinality (no abort finality — TLC-1/I25)
+        working-directory: verification
+        run: |
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config smoke/Mut4-AbortFinality.cfg HydraActivationCore.tla > mut4.log 2>&1 || rc=$?
+          if grep -q "Invariant AbortFinality is violated" mut4.log; then
+            echo "OK: Mut4 tripped AbortFinality (rc=$rc)"
+          else
+            # [2026-09-02, spec §6.5a] Mut4's designed trace re-sent the same BEGIN/COMMIT through a restart;
+            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
+            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
+            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
+            echo "verdict=ESCALATED-SUBSUMED (Mut4 did NOT trip AbortFinality: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut4.log; exit 1
+          fi
   long:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
