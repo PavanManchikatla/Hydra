@@ -127,6 +127,23 @@ the standing bounds are unchanged. The CI `tlc.yml` smoke carries a Mut5 step an
 Rule 6 note: the model was NOT adjusted to make Mut2/Mut4 fire again — the drain-clean result is the
 finding, recorded, not repaired.
 
+### Gate run — 2026-09-03 (CI run 33716962661, the corrected §6.5a model on `5fbdec2`, `tlc.yml` `long`, fresh — no checkpoint)
+
+Rule 16: every line is the classify step's own, quoted.
+
+| Config | Verdict (quoted) | Reading |
+|---|---|---|
+| Mutation 5 | `config=mut5 expect=violation violated=1 complete=0 verdict=GREEN` | Fires as designed (`IntentFence`). |
+| Mutation 1 | `config=mut1 expect=violation violated=1 complete=0 verdict=GREEN` | Fires as designed (`PostDecisionLoss`, with `Terminal` admitted). |
+| Mutation 3 | `config=mut3 expect=violation violated=1 complete=0 verdict=GREEN` | **Fires** — the leg that was INCONCLUSIVE (time-boxed at 379.7 M distinct) in 2026-07 now produces its violation. |
+| Mutation 3 (fast) | `config=mut3-fast expect=violation violated=1 complete=0 verdict=GREEN` | Fires. |
+| Baseline safety | `config=baseline-safety expect=clean violated=0 complete=1 verdict=GREEN` | **Fixpoint reached, zero violations** — time-boxed INCONCLUSIVE at 327.9 M distinct in 2026-07. |
+| Baseline safety (fast) | `config=baseline-safety-fast expect=clean violated=0 complete=1 verdict=GREEN` | Fixpoint, clean. |
+| Baseline liveness | `config=baseline-live expect=clean violated=0 complete=1 verdict=GREEN` — `6593493 states generated, 2005259 distinct states found, 0 states left on queue` | **Fixpoint reached, zero violations** — time-boxed INCONCLUSIVE (25.0 M distinct, 758 325 on queue) in 2026-07; VIOLATION in 5 s on the dead-branch model `bce1a62` (run 33714440226) — the finding that repaired this model. |
+| Smoke job | `verdict=GREEN (Mut5 fired: …)` · baseline smoke `success` · `verdict=ESCALATED-SUBSUMED (Mut2 …)` | Red by design until the design authority rules on Mut2/Mut4 (PROJECT_STATE §7.77). |
+
+Why the baselines now drain where they never did: fence-forward removed the restart-replay loops (a restart re-sending the same `BEGIN`/`COMMIT` at the same epoch) that made the pre-§6.5a state space effectively unbounded within the same constants. That is a property of the amended protocol, not of a smaller model — the constants are unchanged.
+
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),
   GENERATION_COMMIT alignment (I19), sampler rollback/installation (I15/I17),
