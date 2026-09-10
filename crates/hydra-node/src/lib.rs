@@ -328,13 +328,19 @@ impl Pipeline {
     /// **Stage loss in the product (2026-09-09, ruling item 1).** The SM's `StageLost`, then its
     /// own `ProceedBeginRecovery` (a new epoch, durable before anything is sent — the same
     /// fence-forward the restart path takes), the replacement dialled at the lost stage's address
-    /// (it is provisioned from the same bootstrap), `BEGIN_RECOVERY` to both, and the shared tail:
-    /// the survivor keeps position 0 (`truncate_to = 0`, the least the H3 bound allows), the
-    /// replacement holds nothing, the gated replay gives each what it lacks.
+    /// (it is provisioned from the same bootstrap), `BEGIN_RECOVERY` to both, and the shared tail.
     ///
-    /// What this cannot do, by the spec as it stands: rebuild a replaced FINAL stage in the relayed
-    /// D0 topology — the survivor S1 cannot re-emit position 0's activation (§2.3d), so the gate
-    /// refuses by name. Escalated (PROJECT_STATE §7.80), not invented here.
+    /// **`truncate_to` is the spec's choice (v0.10.5 §7, design authority 2026-09-10):** this binary
+    /// drives the relayed D0 topology, so
+    /// * the FIRST stage lost (the survivor S_P is downstream of the replacement): the survivor keeps
+    ///   its prefix (`truncate_to = 0` here — the least the H3 bound allows; the replacement's fresh
+    ///   forwards reach S_P for every position above what it holds), the gated replay gives each
+    ///   stage what it lacks;
+    /// * the FINAL stage lost (the lost stage is downstream of the survivor S1): the survivor cannot
+    ///   re-emit the activations of the positions it holds (§2.3d, exactly-once emission is scoped
+    ///   to (epoch, position)), so the BEGIN carries `TRUNCATE_TO_EMPTY`: S1 discards its whole KV,
+    ///   both stages acknowledge `-1`, and the ledger is replayed from position 0 — fresh emissions
+    ///   at the new epoch, forwarded to the replacement.
     pub async fn recover_stage_loss(
         &mut self,
         connector: &StageConnector,
@@ -344,8 +350,11 @@ impl Pipeline {
     ) -> Result<(), NodeError> {
         let lost_rank = if lost == self.s1.rank() { self.s1 } else { self.sp };
         self.driver.step(CoordEvent::StageLost { rank: lost_rank }).await?;
-        self.driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 0 }).await?;
-        eprintln!("hydra-coordinator: stage {lost} lost — BEGIN_RECOVERY durable at epoch {} rid {}; dialling the replacement", self.driver.coordinator().epoch(), self.driver.coordinator().recovery_id());
+        // D0 (spec §7, v0.10.5): EMPTY iff the lost stage is downstream of the survivor — here, iff
+        // the FINAL stage is the one lost. Decided before the record is written; the record carries it.
+        let truncate_to = if lost == self.sp.rank() { hydra_state::TRUNCATE_TO_EMPTY } else { 0 };
+        self.driver.step(CoordEvent::ProceedBeginRecovery { truncate_to }).await?;
+        eprintln!("hydra-coordinator: stage {lost} lost — BEGIN_RECOVERY(truncate_to = {}) durable at epoch {} rid {}; dialling the replacement", if truncate_to == hydra_state::TRUNCATE_TO_EMPTY { "EMPTY".to_string() } else { truncate_to.to_string() }, self.driver.coordinator().epoch(), self.driver.coordinator().recovery_id());
         let spec = stages.iter().find(|s| s.rank == lost).ok_or_else(|| NodeError::Config(format!("no stage spec for rank {lost}")))?;
         let (rank, link) = connector.connect_one_retry(spec, std::time::Duration::from_secs(60)).await?;
         if rank.rank() != lost {
@@ -399,10 +408,13 @@ impl Pipeline {
         }
         if !need_s1 && need_sp {
             // S1 holds the position and will not re-apply it (§2.3d: no recomputation, no cache
-            // after truncation), so S_P's activation for it cannot be sourced from a survivor. In
-            // the relayed D0 topology this is the FINAL stage replaced: escalated, not invented.
+            // after truncation), so S_P's activation for it cannot be sourced from a survivor. A
+            // FINAL-stage loss never reaches here since v0.10.5 (the BEGIN carries EMPTY and S1
+            // holds nothing); what still can is a coordinator RESTART over a pipeline whose two
+            // frontiers disagree (S_P behind S1 mid-rebuild) — owed in PROJECT_STATE §8, refused
+            // by name here rather than invented.
             return Err(NodeError::Config(format!(
-                "position {input_pos}: S1 holds it and S_P does not — the relayed rebuild cannot source S_P's activation from a survivor's KV (spec decision escalated, PROJECT_STATE §7.80)"
+                "position {input_pos}: S1 holds it and S_P does not — the relayed rebuild cannot source S_P's activation from a survivor's KV (a restart over disagreeing frontiers: PROJECT_STATE §8)"
             )));
         }
         let (s1, sp) = (self.s1, self.sp);

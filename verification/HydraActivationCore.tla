@@ -16,6 +16,9 @@
 (*     implication is equivalent to the old equality, so the faithful model is           *)
 (*     behaviourally UNCHANGED; only the mutant differs. Rule 13 still voids every prior *)
 (*     checkpoint — moot for the reasons recorded under MaxCkpt below.                   *)
+(*   2026-09-10 — spec v0.10.5 (ruling item 1): BEGIN_RECOVERY.truncate_to = EMPTY, the D0    *)
+(*                relayed branch (DurabilityD0), stFresh + RelayedSourcing (I26), Mut7          *)
+(*                (EmptyDiscards = FALSE); truncateTo = goal in the DECODING regime.            *)
 (*   2026-08-22 — MaxCkpt added (CONSTANT + `installedCkpt < MaxCkpt` guard on          *)
 (*     PrepareCandidate). Repairs F-UNBOUNDED-SEGMENT (PROJECT_STATE §7.21): the        *)
 (*     candidate-checkpoint dimension was the one unbounded-in-reality dimension        *)
@@ -62,6 +65,7 @@ CONSTANTS
     MaxCrashes,        \* bound on total crash events => EventuallyStable holds
     MaxCkpt,           \* bound on segment/sampler checkpoint ids (see the note below)
     EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled, AbortTerminal,
+    DurabilityD0, EmptyDiscards,   \* spec v0.10.5 (2026-09-10): the D0 relayed topology; Mut7 switch
     RestartDerivesByMax   \* [2026-09-02 §6.5a] FALSE = MUTATION 5: restart derives the TARGET by MIN
 
 (***************************************************************************************)
@@ -96,6 +100,7 @@ CONSTANTS
 ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 
 ASSUME EnableUnservable \in BOOLEAN /\ ResetTruncates \in BOOLEAN
+ASSUME DurabilityD0 \in BOOLEAN /\ EmptyDiscards \in BOOLEAN
        /\ AttemptFencing \in BOOLEAN /\ AbortGuardEnabled \in BOOLEAN /\ AbortTerminal \in BOOLEAN
        /\ RestartDerivesByMax \in BOOLEAN
 
@@ -122,6 +127,9 @@ VARIABLES
     stState,           \* [Stages -> {"ACTIVE_FINAL","FROZEN","REBUILDING","FROZEN_READY",
                        \*             "PREACTIVE","LOST"}]
     stEpoch, stRId, stAttempt, stGen, stApplied,
+    stFresh,           \* [Stages -> Nat]: how many of a stage's applied positions were applied AT ITS
+                       \* CURRENT epoch (fresh emissions a downstream stage may be sourced from) —
+                       \* spec v0.10.5 §2.3d: exactly-once emission is scoped to (epoch, position)
     stFinal,           \* [Stages -> BOOLEAN] : holds ACTIVATION_FINALIZED evidence
     \* ---- sampler-candidate abstraction (I24) ----
     installedCkpt,     \* Nat: id of installed sampler checkpoint
@@ -129,19 +137,51 @@ VARIABLES
     segCommitted,      \* set of durably committed candidate ids
     \* ---- bookkeeping ----
     crashes,           \* crash counter (bounded by MaxCrashes)
-    caseBviolation,    \* set TRUE if Case B's applied<=truncate_to assertion trips
+    caseBviolation, sourceViolation,    \* set TRUE if Case B's applied<=truncate_to assertion trips
+    sourceViolation,   \* set TRUE if a downstream stage applied a position its upstream never
+                       \* freshly emitted at this epoch (spec v0.10.5 I26; checked when applied)
     servedCount        \* number of ServeDataPlane events (diagnostic)
 
 vars == << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
            truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable,
-           complId, predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied,
+           complId, predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh,
            stFinal, installedCkpt, candidateCkpt, segCommitted, crashes,
-           caseBviolation, servedCount >>
+           caseBviolation, sourceViolation, servedCount >>
 
 --------------------------------------------------------------------------------------
 (* Helpers *)
 
 StateConstraint == Cardinality(msgs) <= 20
+
+(* -------- spec v0.10.5 (design authority 2026-09-10, ruling item 1): the D0 relayed topology -------- *)
+(* BEGIN_RECOVERY.truncate_to gains the distinguished sentinel EMPTY: a stage taking Case A with it   *)
+(* discards its applied/KV state ENTIRELY and rebuilds from position 0 at the target epoch. H3's     *)
+(* bound 0 <= truncate_to < n_ctx stands for every non-sentinel value. The coordinator chooses EMPTY  *)
+(* in D0 when a lost stage is DOWNSTREAM of a survivor: the survivor cannot re-emit the positions    *)
+(* it holds (spec 2.3d), so the whole pipeline rebuilds. Positions in this model are counts (a       *)
+(* stage holding n positions has stApplied = n; 0 = empty), so EMPTY is carried as its own field.    *)
+(* The relayed chain: First is the head; every other stage is downstream of it (2-stage model).      *)
+First == CHOOSE s \in Stages : TRUE
+Upstream(u, d) == u = First /\ d # First
+\* The frontier a stage will hold after BEGIN(trunc): a LOST stage rejoins empty. A downstream stage
+\* rebuilds from its frontier + 1; an upstream survivor never re-emits what it holds (§2.3d), so the
+\* pipeline can be sourced iff no downstream frontier lies BELOW an upstream survivor's. When one does,
+\* the BEGIN carries EMPTY and everyone rebuilds from 0. The ruled instance: a lost stage downstream
+\* of a survivor (frontier 0 < the survivor's). The same rule also covers a fence-forward over a
+\* pipeline whose frontiers disagree (a downstream stage still REBUILDING when the coordinator
+\* crashed) — without it the faithful D0 baseline violates RelayedSourcing there (local smoke,
+\* 2026-09-10); the product refuses that case by name (PROJECT_STATE §8), so the general rule is the
+\* model's/spec's and the product implements the loss instance.
+MinI(a, b) == IF a <= b THEN a ELSE b
+FrontierAfter(s, trunc) == IF stState[s] = "LOST" THEN 0 ELSE MinI(stApplied[s], trunc)
+NeedEmptyFor(trunc) == DurabilityD0 /\ \E u, d \in Stages :
+    Upstream(u, d) /\ stState[u] # "LOST" /\ FrontierAfter(d, trunc) < FrontierAfter(u, trunc)
+FreshStart(s) == stApplied[s] - stFresh[s]
+\* Position p of the upstream u is a FRESH emission at u's current epoch iff it lies in u's window.
+InFreshWindow(u, p) == p > FreshStart(u) /\ p <= stApplied[u]
+BeginRecs == { rec \in wal : rec.t = "BEGIN" }
+LatestBeginAt(t) == CHOOSE b \in BeginRecs : b.tgt = t /\ \A b2 \in BeginRecs : b2.tgt = t => b2.r <= b.r
+MaxI(a, b) == IF a >= b THEN a ELSE b
 
 Send(m)  == msgs' = msgs \cup {m}
 Wal(r)   == wal'  = wal  \cup {r}
@@ -184,8 +224,8 @@ Min(x,y) == IF x < y THEN x ELSE y
 (* machinery as recovery (v0.9 §6.6, activation_kind = INITIAL).                       *)
 
 Init ==
-    /\ msgs = {} /\ crashes = 0 /\ caseBviolation = FALSE /\ servedCount = 0
-    /\ wal = { [t |-> "BEGIN", base |-> -1, tgt |-> 0, r |-> 0, trunc |-> 0] }
+    /\ msgs = {} /\ crashes = 0 /\ caseBviolation = FALSE /\ sourceViolation = FALSE /\ servedCount = 0
+    /\ wal = { [t |-> "BEGIN", base |-> -1, tgt |-> 0, r |-> 0, trunc |-> 0, empty |-> FALSE] }
     /\ cState = "RECONSTRUCTING" /\ activeEpoch = -1
     /\ recTarget = 0 /\ rId = 0 /\ attempt = 0 /\ actKind = "INITIAL"
     /\ truncateTo = 0 /\ goal \in 1..MaxPos
@@ -198,6 +238,7 @@ Init ==
     /\ stAttempt= [s \in Stages |-> 0]
     /\ stGen    = [s \in Stages |-> 1]
     /\ stApplied= [s \in Stages |-> 0]
+    /\ stFresh  = [s \in Stages |-> 0]
     /\ stFinal  = [s \in Stages |-> FALSE]
     /\ installedCkpt = 1 /\ candidateCkpt = 0 /\ segCommitted = {1}
 
@@ -207,38 +248,44 @@ Init ==
 CoordBeginRecovery ==      \* new semantic recovery (failure while SERVICEABLE)
     /\ cState = "SERVICEABLE" /\ activeEpoch < MaxEpoch
     /\ \E s \in Stages : stState[s] = "LOST"           \* a reason to recover
+    \* v0.10.5: the EMPTY choice is made HERE, at WAL-write time, and carried by the durable record —
+    \* WAL-before-wire; SendBeginRecovery sends what the record says (a rejoin between the write and
+    \* the send must not change the choice).
     /\ Wal([t |-> "BEGIN", base |-> activeEpoch, tgt |-> activeEpoch + 1,
-            r |-> 0, trunc |-> truncateTo])
+            r |-> 0, trunc |-> goal, empty |-> NeedEmptyFor(goal)])
     /\ cState' = "RECOVERY_STARTED" /\ recTarget' = activeEpoch + 1
     /\ rId' = 0 /\ attempt' = 0 /\ actKind' = "RECOVERY"
     /\ completeDurable' = FALSE /\ unservable' = FALSE
-    /\ goal' = truncateTo    \* DECODING regime: goal = truncate_to (§2.3c); catch-up
-                             \* still exercises movement because replacements start at 0
-    /\ UNCHANGED << msgs, activeEpoch, truncateTo, tupleGen, tupleApplied, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+    /\ truncateTo' = goal    \* DECODING regime (§2.3c): truncate_to = goal = the durable frontier —
+                             \* a survivor KEEPS its prefix (v0.10.5; before, truncateTo was the
+                             \* constant 0 and every survivor silently rebuilt from nothing, which
+                             \* is why the model never saw the sourcing problem the product hit)
+    /\ UNCHANGED << msgs, activeEpoch, goal, tupleGen, tupleApplied, complId,
+        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CoordStartSuperseding ==   \* §6.7 step 3: supersede a decided-but-unservable activation
     /\ cState = "SUPERSEDING" /\ recTarget < MaxEpoch
     /\ Wal([t |-> "BEGIN", base |-> recTarget, tgt |-> recTarget + 1,
-            r |-> 0, trunc |-> truncateTo])
+            r |-> 0, trunc |-> goal, empty |-> NeedEmptyFor(goal)])
     /\ cState' = "RECOVERY_STARTED"
     /\ predCompl' = complId
     /\ recTarget' = recTarget + 1 /\ rId' = 0 /\ attempt' = 0 /\ actKind' = "RECOVERY"
     /\ completeDurable' = FALSE /\ unservable' = FALSE
-    /\ UNCHANGED << msgs, activeEpoch, truncateTo, goal, tupleGen, tupleApplied,
-        complId, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+    /\ truncateTo' = goal
+    /\ UNCHANGED << msgs, activeEpoch, goal, tupleGen, tupleApplied,
+        complId, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 SendBeginRecovery ==
     /\ cState = "RECOVERY_STARTED"
     /\ Send([t |-> "BEGIN", base |-> recTarget - 1, tgt |-> recTarget,
-             r |-> rId, trunc |-> truncateTo])
+             r |-> rId, trunc |-> truncateTo, empty |-> LatestBeginAt(recTarget).empty])
     /\ cState' = "RECONSTRUCTING"
     /\ UNCHANGED << wal, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvBeginAt(s, tEpoch, r0) ==
     \E m \in msgs : /\ m.t = "BEGIN" /\ m.tgt = tEpoch /\ m.r = r0
@@ -252,10 +299,13 @@ StageRecvBeginAt(s, tEpoch, r0) ==
               /\ stState'  = [stState  EXCEPT ![s] = "FROZEN"]
               /\ stEpoch'  = [stEpoch  EXCEPT ![s] = m.tgt]
               /\ stRId'    = [stRId    EXCEPT ![s] = m.r]
-              /\ stApplied'= [stApplied EXCEPT ![s] = Min(stApplied[s], m.trunc)]
+              /\ stApplied'= [stApplied EXCEPT ![s] =
+                    IF m.empty THEN (IF EmptyDiscards THEN 0 ELSE stApplied[s])   \* MUTATION 7
+                               ELSE Min(stApplied[s], m.trunc)]
+              /\ stFresh'  = [stFresh  EXCEPT ![s] = 0]
               /\ stFinal'  = [stFinal  EXCEPT ![s] = FALSE]
               /\ Send([t |-> "RACK", s |-> s, tgt |-> m.tgt, r |-> m.r])
-              /\ UNCHANGED << stAttempt, caseBviolation >>
+              /\ UNCHANGED << stAttempt, caseBviolation, sourceViolation >>
            \/ (* --- PREACTIVE revert (spec §1.3 model-fidelity, F-LIVENESS-FAIR family 3) ---
                  spec §1.3: "a stage in PREACTIVE receiving BEGIN_RECOVERY for the next
                  attempt/epoch treats it per the abort rule: PREACTIVE is reversible." Case A
@@ -268,24 +318,27 @@ StageRecvBeginAt(s, tEpoch, r0) ==
               /\ stState'  = [stState  EXCEPT ![s] = "FROZEN"]
               /\ stEpoch'  = [stEpoch  EXCEPT ![s] = m.tgt]
               /\ stRId'    = [stRId    EXCEPT ![s] = m.r]
-              /\ stApplied'= [stApplied EXCEPT ![s] = Min(stApplied[s], m.trunc)]
+              /\ stApplied'= [stApplied EXCEPT ![s] =
+                    IF m.empty THEN (IF EmptyDiscards THEN 0 ELSE stApplied[s])   \* MUTATION 7
+                               ELSE Min(stApplied[s], m.trunc)]
+              /\ stFresh'  = [stFresh  EXCEPT ![s] = 0]
               /\ stFinal'  = [stFinal  EXCEPT ![s] = FALSE]
               /\ Send([t |-> "RACK", s |-> s, tgt |-> m.tgt, r |-> m.r])
-              /\ UNCHANGED << stAttempt, caseBviolation >>
+              /\ UNCHANGED << stAttempt, caseBviolation, sourceViolation >>
            \/ (* --- Case B: PURE replay to a frozen stage of this transition --- *)
               /\ stState[s] = "FROZEN" /\ stEpoch[s] = m.tgt /\ m.r >= stRId[s]
               /\ caseBviolation' = (caseBviolation \/ stApplied[s] > m.trunc)
               /\ stRId' = [stRId EXCEPT ![s] = m.r]
               /\ Send([t |-> "RACK", s |-> s, tgt |-> m.tgt, r |-> m.r])
-              /\ UNCHANGED << stState, stEpoch, stAttempt, stApplied, stFinal >>
+              /\ UNCHANGED << stState, stEpoch, stAttempt, stApplied, stFresh, stFinal >>
            \/ (* --- Case B': locally-decidable completed activation --- *)
               /\ stState[s] = "ACTIVE_FINAL" /\ stEpoch[s] = m.tgt /\ stFinal[s]
               /\ Send([t |-> "ERR_COMPLETED", s |-> s, tgt |-> m.tgt])
-              /\ UNCHANGED << stState, stEpoch, stRId, stAttempt, stApplied, stFinal,
-                              caseBviolation >>
+              /\ UNCHANGED << stState, stEpoch, stRId, stAttempt, stApplied, stFresh, stFinal,
+                              caseBviolation, sourceViolation >>
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stGen, installedCkpt, candidateCkpt, segCommitted, crashes, servedCount >>
+        predCompl, stGen, installedCkpt, candidateCkpt, segCommitted, crashes, sourceViolation, servedCount >>
 
 StageRejoin(s) ==          \* a LOST stage joins the in-flight reconstruction: fresh
     /\ stState[s] = "LOST" \* shard (abstracts ATTACH_CONTEXT_SHARD), applied = 0
@@ -294,22 +347,32 @@ StageRejoin(s) ==          \* a LOST stage joins the in-flight reconstruction: f
     /\ stEpoch'  = [stEpoch  EXCEPT ![s] = recTarget]
     /\ stRId'    = [stRId    EXCEPT ![s] = rId]
     /\ stApplied'= [stApplied EXCEPT ![s] = 0]
+    /\ stFresh'  = [stFresh  EXCEPT ![s] = 0]
     /\ stFinal'  = [stFinal  EXCEPT ![s] = FALSE]
     /\ Send([t |-> "RACK", s |-> s, tgt |-> recTarget, r |-> rId])
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
         predCompl, stAttempt, stGen, installedCkpt, candidateCkpt, segCommitted,
-        crashes, caseBviolation, servedCount >>
+        crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRebuildStep(s) ==     \* CatchUpOrRebuild: advance toward goal, then READY-ack
     /\ stState[s] \in {"FROZEN", "REBUILDING"} /\ stEpoch[s] = recTarget
     /\ cState \in {"RECONSTRUCTING", "READY_ALL"}
     /\ IF stApplied[s] < goal
-       THEN /\ stState'   = [stState  EXCEPT ![s] = "REBUILDING"]
+       THEN \* v0.10.5, D0: the relayed data plane — a downstream stage's activation for position p
+            \* comes only from its upstream's forward of p, so it applies p after the upstream did,
+            \* at the same epoch. (Whether that forward is a FRESH emission is RelayedSourcing's
+            \* question, checked as an invariant, not assumed here — so a mutation can violate it.)
+            /\ (DurabilityD0 => \A u \in Stages : Upstream(u, s) =>
+                                    (stEpoch[u] = stEpoch[s] /\ stApplied[s] < stApplied[u]))
+            /\ stState'   = [stState  EXCEPT ![s] = "REBUILDING"]
             /\ stApplied' = [stApplied EXCEPT ![s] = stApplied[s] + 1]
+            /\ stFresh'   = [stFresh   EXCEPT ![s] = stFresh[s] + 1]
+            /\ sourceViolation' = (sourceViolation \/
+                  (DurabilityD0 /\ \E u \in Stages : Upstream(u, s) /\ ~InFreshWindow(u, stApplied[s] + 1)))
             /\ msgs' = msgs
        ELSE /\ stState'   = [stState  EXCEPT ![s] = "FROZEN_READY"]
-            /\ stApplied' = stApplied
+            /\ stApplied' = stApplied /\ stFresh' = stFresh /\ sourceViolation' = sourceViolation
             /\ Send([t |-> "READY", s |-> s, tgt |-> recTarget, r |-> stRId[s],
                      gen |-> stGen[s], ap |-> stApplied[s]])
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
@@ -329,8 +392,8 @@ CoordResetAttempt ==
     /\ rId' = rId + 1 /\ cState' = "RECONSTRUCTING"
     /\ UNCHANGED << activeEpoch, recTarget, attempt, actKind, truncateTo, goal,
         tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvResetAt(s, nr) ==
     \E m \in msgs :
@@ -341,11 +404,14 @@ StageRecvResetAt(s, nr) ==
         /\ stApplied' = [stApplied EXCEPT ![s] =
                             IF ResetTruncates THEN Min(stApplied[s], m.trunc)
                                               ELSE stApplied[s]]      \* MUTATION 2
+        /\ stFresh'   = [stFresh EXCEPT ![s] =                        \* the window follows the cut
+                            IF ResetTruncates THEN MaxI(0, Min(stApplied[s], m.trunc) - (stApplied[s] - stFresh[s]))
+                                              ELSE stFresh[s]]
         /\ Send([t |-> "RSACK", s |-> s, tgt |-> m.tgt, r |-> m.newr])
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
         predCompl, stEpoch, stAttempt, stGen, stFinal, installedCkpt, candidateCkpt,
-        segCommitted, crashes, caseBviolation, servedCount >>
+        segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 --------------------------------------------------------------------------------------
 (* -------- Activation transaction (spec §6.6) -------- *)
@@ -359,8 +425,8 @@ CoordWriteIntent ==
     /\ attempt' = attempt + 1 /\ cState' = "ACTIVATION_INTENT_DURABLE"
     /\ UNCHANGED << msgs, activeEpoch, recTarget, rId, actKind, truncateTo, goal,
         completeDurable, unservable, complId, predCompl, stState, stEpoch, stRId,
-        stAttempt, stGen, stApplied, stFinal, installedCkpt, candidateCkpt,
-        segCommitted, crashes, caseBviolation, servedCount >>
+        stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt, candidateCkpt,
+        segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CoordSendCommit ==
     /\ cState = "ACTIVATION_INTENT_DURABLE"
@@ -369,8 +435,8 @@ CoordSendCommit ==
     /\ cState' = "COMMITTING"
     /\ UNCHANGED << wal, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvCommitAt(s, a0) ==
     \E m \in msgs :
@@ -385,8 +451,8 @@ StageRecvCommitAt(s, a0) ==
         /\ Send([t |-> "COMMITTED", s |-> s, tgt |-> m.tgt, r |-> m.r, a |-> m.a])
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stEpoch, stRId, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        predCompl, stEpoch, stRId, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CoordAbortActivation ==                            \* pre-decision only (I21)
     /\ cState = "COMMITTING" /\ ~completeDurable
@@ -402,8 +468,8 @@ CoordAbortActivation ==                            \* pre-decision only (I21)
     /\ cState' = (IF AbortTerminal THEN "READY_ALL" ELSE "COMMITTING")
     /\ UNCHANGED << activeEpoch, recTarget, rId, attempt, actKind, truncateTo, goal,
         tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvAbortAt(s, a0) ==
     \E m \in msgs :
@@ -412,8 +478,8 @@ StageRecvAbortAt(s, a0) ==
         /\ stState' = [stState EXCEPT ![s] = "FROZEN_READY"]
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        predCompl, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 AttemptAborted(a) ==
     \E rec \in wal : rec.t = "ABORT" /\ rec.tgt = recTarget /\ rec.r = rId /\ rec.a = a
@@ -427,8 +493,8 @@ CoordWriteComplete ==                              \* the irrevocable decision
     /\ cState' = "ACTIVATION_COMPLETE"
     /\ UNCHANGED << msgs, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, unservable, predCompl, stState, stEpoch, stRId,
-        stAttempt, stGen, stApplied, stFinal, installedCkpt, candidateCkpt,
-        segCommitted, crashes, caseBviolation, servedCount >>
+        stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt, candidateCkpt,
+        segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CoordSendFinalize ==
     /\ cState = "ACTIVATION_COMPLETE"
@@ -437,8 +503,8 @@ CoordSendFinalize ==
     /\ cState' = "FINALIZING"
     /\ UNCHANGED << wal, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvFinalizeAt(s, a0) ==
     \E m \in msgs :
@@ -450,24 +516,24 @@ StageRecvFinalizeAt(s, a0) ==
         /\ Send([t |-> "FINALIZED", s |-> s, tgt |-> m.tgt, a |-> m.a])
     /\ UNCHANGED << wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stEpoch, stRId, stAttempt, stGen, stApplied, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        predCompl, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CoordBecomeServiceable ==
     /\ cState = "FINALIZING" /\ AllFinalized /\ ~unservable
     /\ cState' = "SERVICEABLE" /\ activeEpoch' = recTarget
     /\ UNCHANGED << msgs, wal, recTarget, rId, attempt, actKind, truncateTo, goal,
         tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 ServeDataPlane ==
     /\ cState = "SERVICEABLE"
     /\ servedCount' = servedCount + 1 /\ servedCount < 2         \* bound diagnostics
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation >>
+        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation >>
 
 --------------------------------------------------------------------------------------
 (* -------- Post-decision participant loss (spec §6.7, I22) -------- *)
@@ -481,8 +547,8 @@ CoordRecordUnservable ==
     /\ unservable' = TRUE /\ cState' = "SUPERSEDING"
     /\ UNCHANGED << msgs, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, completeDurable, complId, predCompl, stState,
-        stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 --------------------------------------------------------------------------------------
 (* -------- Crashes and restarts -------- *)
@@ -493,11 +559,12 @@ StageCrash(s) ==            \* shard loss: LOST + new stage generation
     /\ stState'   = [stState   EXCEPT ![s] = "LOST"]
     /\ stGen'     = [stGen     EXCEPT ![s] = stGen[s] + 1]
     /\ stApplied' = [stApplied EXCEPT ![s] = 0]
+    /\ stFresh'   = [stFresh   EXCEPT ![s] = 0]
     /\ stFinal'   = [stFinal   EXCEPT ![s] = FALSE]
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
         predCompl, stEpoch, stRId, stAttempt, installedCkpt, candidateCkpt,
-        segCommitted, caseBviolation, servedCount >>
+        segCommitted, caseBviolation, sourceViolation, servedCount >>
 
 (* [2026-09-02, spec §6.5a — design authority] THE COORDINATOR'S VOLATILE STATE DOES NOT       *)
 (* SURVIVE A CRASH. Until this amendment CoordCrash left activeEpoch/recTarget/rId/attempt/…     *)
@@ -514,8 +581,8 @@ CoordCrash ==
     /\ completeDurable' = FALSE /\ unservable' = FALSE /\ complId' = -1 /\ predCompl' = -1
     \* `goal` is NOT volatile: it is the input frontier the COMMIT STREAM records (prompt length /
     \* durable positions), re-read on restart from that durable log — the model keeps it.
-    /\ UNCHANGED << msgs, wal, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, segCommitted, caseBviolation, servedCount >>
+    /\ UNCHANGED << msgs, wal, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, segCommitted, caseBviolation, sourceViolation, servedCount >>
 
 (* [2026-09-02, spec §6.5a] RESTART = DERIVE FROM THE WAL, CLASSIFY, FENCE FORWARD.                *)
 (*                                                                                               *)
@@ -601,7 +668,7 @@ CoordRestart ==
        ELSE IF DTarget + 1 <= MaxEpoch /\ DRId + 1 <= MaxRId THEN
             \* FENCE FORWARD: a new recovery strictly above every durable (hence every sent) value.
             /\ Wal([t |-> "BEGIN", base |-> DTarget, tgt |-> DTarget + 1,
-                    r |-> DRId + 1, trunc |-> DTrunc])
+                    r |-> DRId + 1, trunc |-> DTrunc, empty |-> NeedEmptyFor(DTrunc)])
             /\ cState' = "RECOVERY_STARTED"
             /\ recTarget' = DTarget + 1 /\ rId' = DRId + 1 /\ attempt' = 0
             /\ actKind' = "RECOVERY"
@@ -612,8 +679,8 @@ CoordRestart ==
             /\ recTarget' = DTarget /\ rId' = DRId /\ attempt' = DAttempt
             /\ actKind' = (IF DTarget = 0 THEN "INITIAL" ELSE "RECOVERY")
             /\ completeDurable' = DComplete /\ unservable' = DUnserv
-    /\ UNCHANGED << msgs, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+    /\ UNCHANGED << msgs, goal, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 --------------------------------------------------------------------------------------
 (* -------- Candidate-checkpoint abstraction (spec §2.6b, I24) -------- *)
@@ -629,8 +696,8 @@ PrepareCandidate ==
     /\ candidateCkpt' = installedCkpt + 1
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 CommitSegmentAndInstall ==
     /\ candidateCkpt # 0
@@ -638,15 +705,15 @@ CommitSegmentAndInstall ==
     /\ installedCkpt' = candidateCkpt /\ candidateCkpt' = 0
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        crashes, caseBviolation, servedCount >>
+        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        crashes, caseBviolation, sourceViolation, servedCount >>
 
 DropCandidate ==            \* admission failure / cancellation: no trace
     /\ candidateCkpt # 0 /\ candidateCkpt' = 0
     /\ UNCHANGED << msgs, wal, cState, activeEpoch, recTarget, rId, attempt, actKind,
         truncateTo, goal, tupleGen, tupleApplied, completeDurable, unservable, complId,
-        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal,
-        installedCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        predCompl, stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal,
+        installedCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 SessionTerminate ==         \* spec SS11: no admissible placement => explicit terminal
     /\ cState \in {"RECOVERY_STARTED", "RECONSTRUCTING", "READY_ALL", "SUPERSEDING"}
@@ -664,8 +731,8 @@ SessionTerminate ==         \* spec SS11: no admissible placement => explicit te
     /\ cState' = "TERMINAL"
     /\ UNCHANGED << msgs, activeEpoch, recTarget, rId, attempt, actKind, truncateTo,
         goal, tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
-        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,
-        candidateCkpt, segCommitted, crashes, caseBviolation, servedCount >>
+        stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFresh, stFinal, installedCkpt,
+        candidateCkpt, segCommitted, crashes, caseBviolation, sourceViolation, servedCount >>
 
 StageRecvBegin(s)    == \E t0 \in 0..MaxEpoch, r0 \in 0..MaxRId : StageRecvBeginAt(s, t0, r0)
 StageRecvReset(s)    == \E nr \in 0..MaxRId : StageRecvResetAt(s, nr)
@@ -779,9 +846,20 @@ ResetPreservesAttemptSpace ==
 IntentFence == (cState # "CRASHED") =>
     \A rec \in wal : (rec.t = "INTENT" /\ rec.tgt = recTarget /\ rec.r = rId) => rec.a <= attempt
 
+(* [spec v0.10.5, design authority 2026-09-10] RelayedSourcing (I26): in the D0 relayed topology  *)
+(* every position a downstream stage applied AT ITS CURRENT EPOCH lies inside its upstream's        *)
+(* fresh-emission window at that epoch — the activation it applied was emitted, not held over.       *)
+(* A stage's fresh window is (stApplied - stFresh, stApplied]; the flag is set when a downstream stage *)
+(* applies a position outside its upstream's window (the caseBviolation pattern). Faithful EMPTY keeps *)
+(* it: the survivor   *)
+(* upstream of a lost stage discards everything and re-emits from 0. MUTATION 7 (EmptyDiscards =     *)
+(* FALSE: the survivor keeps its stale KV under an EMPTY BEGIN) leaves the upstream's window empty     *)
+(* while the replacement applies positions the upstream never re-emitted — byte identity is gone.     *)
+RelayedSourcing == ~sourceViolation      \* checked at the moment a downstream stage applies
+
 Inv == /\ ServiceSafety /\ TupleSafety /\ CaseBPure /\ NoPreactiveServe
        /\ AbortSafety   /\ CandidateIsolation /\ DecisionMonotone /\ AbortFinality
-       /\ IntentFence
+       /\ IntentFence   /\ RelayedSourcing
 
 --------------------------------------------------------------------------------------
 (* -------- Liveness (check with Fairness; smaller bounds recommended) -------- *)

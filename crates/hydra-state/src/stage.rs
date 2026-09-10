@@ -8,6 +8,14 @@
 
 use crate::{ActivationKind, ActivationTuple, AttemptId, Epoch, RecoveryId, StageRank};
 
+/// `BEGIN_RECOVERY.truncate_to = EMPTY` (spec v0.10.5 §1.3): the distinguished sentinel under which
+/// Case A discards the stage's applied/KV state entirely (`applied = -1`, the fresh-shard value) and
+/// the stage rebuilds from position 0 by `REBUILD_APPLY` at the target epoch. It is `-1` on the wire
+/// and in the WAL — never `0`, which keeps position 0 (no off-by-one against H3's `0 ≤ truncate_to <
+/// n_ctx`, which stands for every non-sentinel value). The coordinator chooses it in D0 when the
+/// lost stage is downstream of a survivor (§7): the survivor cannot re-emit what it holds (§2.3d).
+pub const TRUNCATE_TO_EMPTY: i64 = -1;
+
 /// Per-stage activation state (TLA+ `stState`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageState {
@@ -23,6 +31,7 @@ pub enum StageState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StageEvent {
     /// `BEGIN_RECOVERY{base, target, recovery_id, truncate_to}` — the three-case transition (I11).
+    /// `truncate_to` is a position in `[0, n_ctx)` or the sentinel [`TRUNCATE_TO_EMPTY`] (spec v0.10.5).
     ///
     /// **Audit H3:** `n_ctx` accompanies the message because the stage must bound `truncate_to`
     /// against *its own* context window before acting on it — see [`Stage::step`]'s `RecvBegin`
@@ -243,8 +252,14 @@ impl Stage {
                 if target != base.saturating_add(1) {
                     return refused(self.rank, RefusalCode::Transition, "BEGIN_RECOVERY target must be base + 1");
                 }
-                if truncate_to < 0 || truncate_to >= n_ctx {
-                    return refused(self.rank, RefusalCode::Transition, "BEGIN_RECOVERY truncate_to outside [0, n_ctx)");
+                // Spec v0.10.5 (design authority 2026-09-10, ruling item 1): the ONE admitted negative
+                // is the distinguished sentinel `TRUNCATE_TO_EMPTY` — "discard everything, rebuild from
+                // position 0 at the target epoch" — chosen by the coordinator in D0 when the lost stage
+                // is downstream of this survivor (it cannot re-emit what it holds, §2.3d). The H3 bound
+                // stands unchanged for every other value; `-1` is no longer "a malformed frame that
+                // happens to discard everything", it is the named request to.
+                if truncate_to != TRUNCATE_TO_EMPTY && (truncate_to < 0 || truncate_to >= n_ctx) {
+                    return refused(self.rank, RefusalCode::Transition, "BEGIN_RECOVERY truncate_to outside [0, n_ctx) and not EMPTY");
                 }
                 // Case B′: a completed activation is locally decidable — ERR_RECOVERY_COMPLETED.
                 if self.state == ActiveFinal && self.epoch == target && self.final_evidence {
@@ -265,7 +280,9 @@ impl Stage {
                     self.state = Frozen;
                     self.epoch = target;
                     self.recovery_id = r;
-                    self.applied = self.applied.min(truncate_to); // truncate applied > truncate_to
+                    // Truncate applied > truncate_to; with `TRUNCATE_TO_EMPTY` (-1) this is the
+                    // fresh-shard value: nothing held, the rebuild starts at position 0 (v0.10.5).
+                    self.applied = self.applied.min(truncate_to);
                     self.final_evidence = false;
                     return vec![StageEffect::RecoveryAck { rank: self.rank, target, recovery_id: r }];
                 }

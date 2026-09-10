@@ -1,4 +1,4 @@
-# Hydra v0.10.1 — Model-checking guide (HydraActivationCore)
+# Hydra v0.10.5 — Model-checking guide (HydraActivationCore)
 
 ## Files
 - `HydraActivationCore.tla` — action-style TLA+ model of the **v0.10** transition core
@@ -7,7 +7,12 @@
   candidate checkpoints).
 - Configs: `BaselineSafety.cfg` (symmetry, invariants), `BaselineLiveness.cfg`
   (NO symmetry — required for liveness; temporal properties), `Mut1Unservable.cfg`,
-  `Mut2Reset.cfg`, `Mut3AttemptFence.cfg`, `Mut4AbortFinality.cfg`.
+  `Mut2Reset.cfg`, `Mut3AttemptFence.cfg`, `Mut4AbortFinality.cfg`, `Mut5RestartMin.cfg`;
+  **spec v0.10.5 (2026-09-10), the D0 relayed topology — NO symmetry (the chain `First → rest` is
+  not permutation-invariant):** `BaselineSafetyD0.cfg` / `BaselineSafetyD0Fast.cfg` (must drain
+  clean, `Inv` incl. `RelayedSourcing`), `BaselineLivenessD0.cfg`, `Mut7EmptyKeepsKv.cfg` and
+  `smoke/Mut7-RelayedSourcing.cfg` (must fire). Every other config sets `DurabilityD0 = FALSE`
+  (the symmetric model, whose state space the D0 branch does not touch).
 
 Run: `java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock -config <cfg> HydraActivationCore.tla`
 (`-deadlock` because TERMINAL is deliberately absorbing; stuck-state detection is the
@@ -25,6 +30,28 @@ liveness properties' job. Use `-checkpoint 1` + `-recover` on time-limited machi
 5. Mutations are CONSTANT flips: `EnableUnservable`, `ResetTruncates`, `AttemptFencing`, `RestartDerivesByMax` (Mut5, 2026-09-02: restart derives the target epoch by MIN — spec §6.5a),
    `AbortGuardEnabled`, `AbortTerminal` (Mut4 redesigned 2026-09-09: with both FALSE the durable ABORT does not end the attempt and the stale acks complete it — the LIVE abort-finality decision, no crash needed).
    **Mut2 (`ResetTruncates = FALSE`) is RETIRED (2026-09-09, design authority item 3), by argument:** `CaseBPure` (I11/I23) says a Case-B replay of `BEGIN_RECOVERY` finds `applied ≤ truncate_to`; Mut2 sabotaged `RESET_RECOVERY_ATTEMPT` into a label-only r-bump so a later Case-B replay would find `applied > truncate_to`. Under spec §6.5a the ONLY senders of a BEGIN are `SendBeginRecovery` from `RECOVERY_STARTED` (entered by `CoordBeginRecovery` — a new recovery at `r = 0` to stages at base, Case A — or by the fence-forward `CoordRestart` at `r + 1`, again Case A), and a Case B needs `m.r ≥ stRId` at the SAME target; after a RESET (`stRId = r + 1`) no BEGIN with `r ≥ stRId` at that target is ever sent, so a label-only reset has no Case B left to poison — the sabotage is unreachable by construction. The constant stays (TRUE everywhere), the invariant STAYS in `Inv` for every baseline leg, the smoke step and the `mut2` runner entry are retired; `Mut2Reset.cfg` is kept as the historical config.
+5c. **The D0 relayed topology (spec v0.10.5, design authority 2026-09-10, ruling item 1).** Constants
+   `DurabilityD0` (the relayed data plane: a downstream stage applies position p only after its
+   upstream did, at the same epoch — `StageRebuildStep`'s D0 precondition) and `EmptyDiscards`
+   (**Mut7** = FALSE: a survivor keeps its stale KV under an `EMPTY` `BEGIN_RECOVERY`). New
+   per-stage variable `stFresh` (how many of a stage's applied positions were applied AT ITS
+   CURRENT epoch — its fresh-emission window is `(stApplied − stFresh, stApplied]`) and the flag
+   `sourceViolation`, set at the moment a downstream stage applies a position outside its
+   upstream's window (the `caseBviolation` pattern); `RelayedSourcing == ~sourceViolation` (I26)
+   joins `Inv`. `BEGIN` records and messages carry `empty`; the coordinator decides it when the
+   record is WRITTEN (`NeedEmptyFor(trunc)`: D0 and some downstream stage's post-truncation
+   frontier — 0 for a LOST one — lies below an upstream survivor's), and `SendBeginRecovery` sends
+   what the durable record says. **Two things the amendment changed for every config:** (i) the
+   DECODING regime is now `truncateTo' = goal` (a survivor keeps its prefix; before, `truncateTo`
+   was the constant 0 and every survivor silently rebuilt from nothing — which is why the model
+   never saw the sourcing problem the product hit); (ii) the `stFresh`/`sourceViolation`
+   variables, inert unless `DurabilityD0`. **Rule 13: every checkpoint predating this amendment is
+   void.** Why the general rule and not only the ruled instance ("the lost stage is downstream of
+   the survivor"): with the instance alone the faithful D0 baseline violated `RelayedSourcing` on
+   a fence-forward over a pipeline whose frontiers disagree (a downstream stage still REBUILDING
+   when the coordinator crashed) — the general rule covers it; the product implements the loss
+   instance and refuses the restart-disagreement instance by name (PROJECT_STATE §8). Flagged for
+   ratification in §7.85.
 5b. **Fairness is per-(stage, message-class)** (v0.10.1 patch): receive actions are
    parameterized over their bounded discriminators (epoch, recovery_id, attempt), with
    `WF_vars` quantified over those constant domains. Aggregate-action WF alone would allow
@@ -153,6 +180,19 @@ Why the baselines now drain where they never did: fence-forward removed the rest
 | `Mut5RestartMin.cfg` | `Error: Invariant Inv is violated.` | Fires. |
 | `BaselineSafetyFast.cfg` | `Model checking completed. No error has been found.` — 82 827 distinct — `Finished in 10s` | Clean (the same count as with the first Mut4: `AbortTerminal = TRUE` is the baseline). |
 | `smoke/Mut2-CaseBPure.cfg` | RETIRED — not run | The sabotage is unreachable by construction under spec §6.5a (argument in item 5 above); `CaseBPure` stays in `Inv` for every baseline leg. |
+
+### Local smoke — 2026-09-10 (spec v0.10.5, ruling item 1b; `-workers 1 nice -n 19`, TLC v1.7.4 / OpenJDK 26)
+
+| Config | Result (quoted) | Reading |
+|---|---|---|
+| `smoke/Mut7-RelayedSourcing.cfg` (`DurabilityD0 = TRUE`, `EmptyDiscards = FALSE`) | `Error: Invariant RelayedSourcing is violated.` — 17-state trace: Initial StageRebuildStep StageRebuildStep StageRebuildStep StageRebuildStep CoordWriteIntent CoordSendCommit StageRecvCommitAt StageRecvCommitAt CoordWriteComplete StageCrash CoordRecordUnservable CoordStartSuperseding SendBeginRecovery StageRecvBeginAt StageRejoin StageRebuildStep | **Fires as designed.** S_P (`s2`) crashes after the durable decision (§6.7 supersession), the superseding BEGIN carries `empty` (S_P is downstream of the survivor), the mutated survivor `s1` keeps `stApplied = 1` with `stFresh = 0`, the rejoined `s2` applies position 1 — one `s1` never re-emitted at this epoch. |
+| `Mut7EmptyKeepsKv.cfg` (the long-lane config, `Inv`) | `Error: Invariant Inv is violated.` | Fires. |
+| `BaselineSafetyD0Fast.cfg` (`EmptyDiscards = TRUE`, MaxCrashes = 1) | `Model checking completed. No error has been found.` — 162 316 distinct — `Finished in 13s` | **Clean** — the control at Mut7's bounds. |
+| `BaselineSafetyD0.cfg` (MaxCrashes = 2) | `Model checking completed. No error has been found.` — 2 169 797 distinct — `Finished in 03min 01s` | Clean. |
+| `BaselineSafetyFast.cfg` (`DurabilityD0 = FALSE`) | `Model checking completed. No error has been found.` — 81 285 distinct — `Finished in 07s` | Clean; 82 827 → 81 285 distinct is the `truncateTo' = goal` change (survivors keep their prefix). |
+| `smoke/Mut4-AbortFinality.cfg` | `Error: Invariant AbortFinality is violated.` | Still fires. |
+| `Mut5RestartMin.cfg` | `Error: Invariant Inv is violated.` | Still fires. |
+| `BaselineLivenessD0.cfg` | time-boxed at 900 s (rule 7: local is smoke-only): `Progress(31) … 1,838,189 states generated … 743,585 distinct states found, 148,632 states left on queue`, no violation surfaced | **INCONCLUSIVE locally** — the `baseline-live-d0` leg of the dispatched CI long matrix decides it; not green until that `verdict=` line says so. |
 
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),

@@ -451,8 +451,11 @@ impl Worker {
                 if effects.iter().any(|e| matches!(e, StageEffect::RecoveryAck { .. })) {
                     if let Some(eng) = self.engine.as_mut() {
                         // `i32::try_from`, not `as i32` (audit 1c): a wire `i64` that does not fit is
-                        // refused, never truncated into some other position. The full H3 bound
-                        // (`0 ≤ truncate_to < n_ctx`, `target == base+1`) lands in Wave 1d.
+                        // refused, never truncated into some other position. The H3 bound (`0 ≤
+                        // truncate_to < n_ctx`, `target == base+1`) is the SM's, evaluated before the ack
+                        // this branch is gated on. `TRUNCATE_TO_EMPTY` (-1, spec v0.10.5) arrives here as
+                        // an acknowledged BEGIN too: `keep = 0` drops every position — the survivor
+                        // gives up its whole KV and rebuilds from 0 at the new epoch.
                         let keep = truncate_to.saturating_add(1).max(0);
                         let keep = i32::try_from(keep).map_err(|_| WorkerError::PreFfi { what: "BEGIN_RECOVERY truncate_to", value: truncate_to, bound: i32::MAX as i64 })?;
                         eng.ctx.kv_truncate(keep)?;

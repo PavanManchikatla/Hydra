@@ -25,7 +25,7 @@ pub mod stage;
 pub use coordinator::{Coordinator, CoordEvent, CoordState};
 pub use ledger::{Ledger, TokenEntry, TokenOrigin};
 pub use segment::{SegmentCheckpoint, SegmentEffect, SegmentEvent};
-pub use stage::{Stage, StageEffect, StageEvent, StageState};
+pub use stage::{Stage, StageEffect, StageEvent, StageState, TRUNCATE_TO_EMPTY};
 
 /// Position discipline (spec I13): input/KV positions vs sampled-output positions.
 pub use hydra_proto::{InputPos, OutputPos};

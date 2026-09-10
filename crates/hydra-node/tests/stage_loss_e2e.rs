@@ -3,25 +3,28 @@
 //! mid-generation, start its replacement from the SAME bootstrap, reconnect with `Last-Event-ID`,
 //! and hold the three assertions plus the stale-epoch probe.**
 //!
-//! The lost stage is S1 — the first stage. Windows: W1 after the first event; W2 mid-stream.
-//! What happens inside the product: the dead link surfaces as `NodeError::StageLost(rank)` (the
-//! effect source), the SM takes `StageLost` → `ProceedBeginRecovery{truncate_to: 0}` (a new epoch,
-//! durable before anything is sent), the replacement is dialled at the same address, `BEGIN_RECOVERY`
-//! to both (the survivor freezes at base and keeps position 0; the replacement is empty), the ledger
-//! is replayed through the gate (each stage gets only what it lacks), catch-up, sampler checkpoint,
-//! the activation transaction at the new epoch, and the session is re-adopted so a client's
-//! `Last-Event-ID` lands on the continuation — exactly the shape a coordinator restart has.
+//! Two lost stages × two windows. **FIRST stage (S1):** W1 after the first event; W2 mid-stream —
+//! the SM takes `StageLost` → `ProceedBeginRecovery{truncate_to: 0}` (a new epoch, durable before
+//! anything is sent), the replacement is dialled at the same address, `BEGIN_RECOVERY` to both (the
+//! survivor S_P freezes at base and keeps position 0; the replacement is empty), the ledger is
+//! replayed through the gate (each stage gets only what it lacks). **FINAL stage (S_P) — spec
+//! v0.10.5, design authority 2026-09-10, ruling item 1:** the lost stage is DOWNSTREAM of the
+//! survivor, which cannot re-emit the activations of the positions it holds (§2.3d), so the BEGIN
+//! carries `truncate_to = EMPTY`: the survivor S1 discards its whole KV, both acknowledge `-1`, the
+//! ledger is replayed from position 0 as fresh emissions at the new epoch. Then, for both: catch-up,
+//! sampler checkpoint, the activation transaction at the new epoch, and the session is re-adopted so
+//! a client's `Last-Event-ID` lands on the continuation — exactly the shape a coordinator restart has.
 //!
 //! Assertions per window: (a) SSE id continuity across the reconnect; (b) prefix ⧺ suffix
 //! byte-identical to an uninterrupted run (the pair driver on a second identical pair, stopping at
 //! the model's EOS like the product); (c) disk truth — each output position exactly once, dense,
-//! the durable ids the reference's; a durable BEGIN and a durable COMPLETE at the new epoch. Plus:
-//! a frame at epoch 0 to the survivor after the fence is answered `ERR_FENCED`.
+//! the durable ids the reference's; a durable BEGIN and a durable COMPLETE at the new epoch (and,
+//! for the final stage, the durable BEGIN carries `EMPTY`). Plus: a frame at epoch 0 to the
+//! survivor after the fence is answered `ERR_FENCED` (`SAMPLE_NEXT` to S_P; `APPLY_TOKEN` to S1).
 //!
-//! Engine-gated (CI status: unavailable, not green). **Cannot see:** loss of the FINAL stage in the
-//! relayed D0 topology (the survivor cannot re-emit position 0's activation — a spec decision the
-//! session escalated, PROJECT_STATE §7.80); a second loss in the same session; a replacement whose
-//! bootstrap epoch is not the base (a later recovery — the bootstrap is static at epoch 0).
+//! Engine-gated (CI status: unavailable, not green). **Cannot see:** a second loss in the same
+//! session; a replacement whose bootstrap epoch is not the base (a later recovery — the bootstrap
+//! is static at epoch 0); a coordinator restart over disagreeing frontiers (PROJECT_STATE §8).
 
 mod common;
 use common::*;
@@ -114,6 +117,7 @@ struct Fixture {
     ca: hydra_transport::ClusterCa,
     token: String,
     fence: SessionFence,
+    s1_addr: std::net::SocketAddr,
     s2_addr: std::net::SocketAddr,
     golden_text: String,
     golden: Vec<u32>,
@@ -148,16 +152,20 @@ fn fixture() -> Option<Fixture> {
     });
     let golden_text = String::from_utf8_lossy(&tokenizer.decode_bytes(&golden).unwrap()).into_owned();
     let golden_finish = if golden.last().map(|&t| tokenizer.is_eog(t)).unwrap_or(false) { "stop" } else { "length" };
-    Some(Fixture { dir, ca, token, fence, s2_addr, golden_text, golden, golden_finish, max_tokens })
+    Some(Fixture { dir, ca, token, fence, s1_addr, s2_addr, golden_text, golden, golden_finish, max_tokens })
 }
 
-/// One window: real workers up, the coordinator up, `kill_after` events read, S1 killed −9 and
-/// replaced from the same bootstrap, the client reconnecting until it reaches the continuation.
-fn window(f: &Fixture, label: &str, kill_after: usize) {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lost { First, Final }
+
+/// One window: real workers up, the coordinator up, `kill_after` events read, the `lost` stage's
+/// process killed −9 and replaced from the same bootstrap, the client reconnecting until it reaches
+/// the continuation.
+fn window(f: &Fixture, label: &str, kill_after: usize, lost: Lost) {
     let boot1 = f.dir.path().join("worker-s1.boot");
     let boot2 = f.dir.path().join("worker-s2.boot");
     let mut w1 = spawn_worker(&boot1);
-    let _w2 = spawn_worker(&boot2);
+    let mut w2 = spawn_worker(&boot2);
     let port = free_port();
     let data = f.dir.path().join(format!("data-{label}"));
     let args = [
@@ -171,13 +179,14 @@ fn window(f: &Fixture, label: &str, kill_after: usize) {
     assert!(wait_listening(&rx, 60), "[{label}] the binary never listened");
     let ca_der = f.ca.ca_cert_der();
 
-    // ---- the pre-kill prefix, then kill −9 the FIRST stage's real process ----
+    // ---- the pre-kill prefix, then kill −9 the lost stage's real process ----
     let (prefix, _) = stream(port, &ca_der, &f.token, None, Some(kill_after));
     assert!(prefix.len() >= kill_after, "[{label}] wanted {kill_after} events before the kill, got {}", prefix.len());
-    w1.0.kill().expect("kill -9 worker-s1");
-    let _ = w1.0.wait();
+    let (victim, boot) = match lost { Lost::First => (&mut w1, &boot1), Lost::Final => (&mut w2, &boot2) };
+    victim.0.kill().expect("kill -9 the lost stage");
+    let _ = victim.0.wait();
     // ---- the replacement, from the SAME bootstrap ----
-    let _w1b = spawn_worker(&boot1);
+    let _replacement = spawn_worker(boot);
 
     // ---- reconnect with Last-Event-ID until the continuation is reached ----
     // The coordinator notices the dead link at its next data-plane frame, ends the old stream with
@@ -217,14 +226,22 @@ fn window(f: &Fixture, label: &str, kill_after: usize) {
     let (_w, records) = hydra_coordinator::control_wal::ControlWal::open(&control, &f.fence.cluster_id, &f.fence.session_id).expect("control wal");
     assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::BeginRecovery { target: 1, .. })), "[{label}] BEGIN_RECOVERY at epoch 1 is durable: {records:?}");
     assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::ActivationComplete { tuple, .. } if tuple.epoch == 1)), "[{label}] the re-activation at epoch 1 is durable: {records:?}");
+    // The spec's choice is on disk (v0.10.5 §7): EMPTY iff the lost stage is downstream of the survivor.
+    let want = match lost { Lost::First => 0, Lost::Final => hydra_state::TRUNCATE_TO_EMPTY };
+    assert!(records.iter().any(|r| matches!(r, hydra_state::WalRecord::BeginRecovery { target: 1, truncate_to, .. } if *truncate_to == want)),
+        "[{label}] the durable BEGIN at epoch 1 carries truncate_to = {want} ({lost:?} stage lost): {records:?}");
 
-    // ---- the stale-epoch probe: the SURVIVOR (S_P, now at epoch 1) refuses a frame at epoch 0 ----
+    // ---- the stale-epoch probe: the SURVIVOR (now at epoch 1) refuses a frame at epoch 0 ----
     let id = f.ca.issue("coordinator").unwrap();
     let connector = hydra_transport::tcp_mtls::TcpMtls::from_config(f.ca.client_config(&id).unwrap()).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        let mut c = connector.connect(f.s2_addr, "worker-s2").await.expect("dial the survivor S_P");
-        c.send(0, &hydra_wire::encode_sample_next(&f.fence, 0, 0, &SamplingConfig::greedy().hash(), hydra_worker::worker::INITIAL_CHECKPOINT_ID)).await.unwrap();
+        let (addr, name, frame) = match lost {
+            Lost::First => (f.s2_addr, "worker-s2", hydra_wire::encode_sample_next(&f.fence, 0, 0, &SamplingConfig::greedy().hash(), hydra_worker::worker::INITIAL_CHECKPOINT_ID)),
+            Lost::Final => (f.s1_addr, "worker-s1", hydra_wire::encode_apply_token(&f.fence, 0, 0, f.golden[0], true)),
+        };
+        let mut c = connector.connect(addr, name).await.expect("dial the survivor");
+        c.send(0, &frame).await.unwrap();
         let reply = c.recv().await.expect("a reply, not silence (audit M10)");
         match hydra_wire::decode(&reply.payload, &f.fence).unwrap().1 {
             hydra_wire::Msg::Err { code } => assert_eq!(code, 1, "[{label}] a stale epoch is refused as ERR_FENCED (1), got code {code}"),
@@ -236,11 +253,23 @@ fn window(f: &Fixture, label: &str, kill_after: usize) {
 #[test]
 fn w1_first_stage_killed_after_the_first_event_is_replaced_and_the_stream_resumes_byte_identical() {
     let Some(f) = fixture() else { eprintln!("SKIP: no engine/model (CI status: unavailable)"); return; };
-    window(&f, "sl-w1", 1);
+    window(&f, "sl-w1", 1, Lost::First);
 }
 
 #[test]
 fn w2_first_stage_killed_mid_stream_is_replaced_and_the_stream_resumes_byte_identical() {
     let Some(f) = fixture() else { eprintln!("SKIP: no engine/model (CI status: unavailable)"); return; };
-    window(&f, "sl-w2", 4);
+    window(&f, "sl-w2", 4, Lost::First);
+}
+
+#[test]
+fn w1_final_stage_killed_after_the_first_event_is_replaced_under_empty_and_the_stream_resumes_byte_identical() {
+    let Some(f) = fixture() else { eprintln!("SKIP: no engine/model (CI status: unavailable)"); return; };
+    window(&f, "sl-final-w1", 1, Lost::Final);
+}
+
+#[test]
+fn w2_final_stage_killed_mid_stream_is_replaced_under_empty_and_the_stream_resumes_byte_identical() {
+    let Some(f) = fixture() else { eprintln!("SKIP: no engine/model (CI status: unavailable)"); return; };
+    window(&f, "sl-final-w2", 4, Lost::Final);
 }

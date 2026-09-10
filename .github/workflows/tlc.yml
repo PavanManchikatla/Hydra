@@ -4,7 +4,8 @@ name: TLC
 # fixpoint is thermally infeasible on the owner's laptop (PROJECT_STATE §9).
 #
 #  - `smoke`  : fast, required on every push/PR touching the model or hydra-state — parse +
-#               the two invariant mutations (Mut2, Mut4) + a bounded baseline-safety smoke. < 10 min.
+#               the invariant mutations (Mut4, Mut5, Mut7) + bounded baseline-safety smokes (the
+#               symmetric model and the D0 relayed one, spec v0.10.5). < 10 min.
 #  - `long`   : manual / weekly — baseline-safety→fixpoint, baseline-liveness, Mut1, Mut3, each
 #               checkpointed; the checkpoint dir is uploaded at the ~6h job boundary and resumed
 #               via `-recover` on the next dispatch (set input `recover=true`) until complete.
@@ -98,6 +99,35 @@ jobs:
           else
             echo "verdict=RED (Mut4 did NOT trip AbortFinality — the redesigned mutation (AbortTerminal = FALSE, AbortGuardEnabled = FALSE) must fire on the live abort decision; see PROJECT_STATE §7.80)"; tail -5 mut4.log; exit 1
           fi
+      # spec v0.10.5 (design authority 2026-09-10, ruling item 1): the D0 relayed topology. Mut7 (a
+      # survivor keeps its stale KV under an EMPTY BEGIN_RECOVERY) must trip RelayedSourcing (I26)
+      # specifically; the D0 baseline at the SAME bounds must drain clean (the control that makes
+      # the fire mutation-induced). Local smoke 2026-09-10: Mut7 17-state trace; D0Fast 162 316 distinct.
+      - name: "Mut7 must trip RelayedSourcing (spec v0.10.5 — a survivor keeps stale KV under EMPTY)"
+        working-directory: verification
+        run: |
+          rc=0
+          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config smoke/Mut7-RelayedSourcing.cfg HydraActivationCore.tla > mut7.log 2>&1 || rc=$?
+          if grep -q "Invariant RelayedSourcing is violated" mut7.log; then
+            echo "verdict=GREEN (Mut7 tripped RelayedSourcing; rc=$rc)"
+          else
+            echo "verdict=RED (Mut7 did NOT trip RelayedSourcing — EmptyDiscards = FALSE must let a replacement apply a position its upstream never re-emitted; see PROJECT_STATE §7.85)"; tail -5 mut7.log; exit 1
+          fi
+      - name: "Baseline-safety D0 (relayed, no symmetry) must drain CLEAN at the Mut7 bounds"
+        working-directory: verification
+        run: |
+          rc=0
+          timeout 240 java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+            -config BaselineSafetyD0Fast.cfg HydraActivationCore.tla > based0.log 2>&1 || rc=$?
+          if grep -qE "is violated|Temporal properties were violated|^Error:" based0.log; then
+            echo "verdict=VIOLATION (the D0 baseline violates — the sourcing rule or the invariant is wrong)"; tail -60 based0.log; exit 1
+          fi
+          if grep -q "Model checking completed. No error" based0.log; then
+            echo "verdict=GREEN (D0 baseline drained clean: $(grep -E 'distinct states found' based0.log | tail -1))"
+          else
+            echo "verdict=INCONCLUSIVE (D0 baseline time-boxed at 240s without a violation, rc=$rc)"; tail -5 based0.log
+          fi
   long:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -121,6 +151,11 @@ jobs:
           # These drain fast (well under the 320m box); no -recover needed.
           - { name: mut3-fast,          cfg: Mut3Fast.cfg,          expect: violation }
           - { name: baseline-safety-fast, cfg: BaselineSafetyFast.cfg, expect: clean }
+          # spec v0.10.5 (2026-09-10): the D0 relayed topology — its own baselines (no symmetry: the
+          # chain First -> rest is not permutation-invariant) and Mut7 at the fast bounds.
+          - { name: baseline-safety-d0, cfg: BaselineSafetyD0.cfg,   expect: clean }
+          - { name: baseline-live-d0,   cfg: BaselineLivenessD0.cfg, expect: clean }
+          - { name: mut7,               cfg: Mut7EmptyKeepsKv.cfg,   expect: violation }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
