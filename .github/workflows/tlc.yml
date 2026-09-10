@@ -87,7 +87,7 @@ jobs:
       # its sabotage is unreachable by construction under spec §6.5a (no BEGIN is ever sent at a
       # recovery id a RESET has advanced past), so no smoke step can observe it. CaseBPure STAYS in
       # the baseline invariant set (every baseline leg checks it). The argument: VERIFICATION-README.
-      - name: Mut4 must trip AbortFinality (redesigned 2026-09-09: abort not terminal + I25 guard off)
+      - name: "Mut4 must trip AbortFinality (redesigned 2026-09-09 — abort not terminal + I25 guard off)"
         working-directory: verification
         run: |
           rc=0
