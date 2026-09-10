@@ -35,6 +35,12 @@ impl Tokenizer {
         Tokenizer { n_vocab: model.n_vocab(), model }
     }
 
+    /// True iff `token` is in the model's end-of-generation set (EOS / EOT). The generation loops
+    /// stop after such a token; the reference the byte-identity oracles compare against does too.
+    pub fn is_eog(&self, token: u32) -> bool {
+        self.model.is_eog(token as i32)
+    }
+
     pub fn n_vocab(&self) -> i32 {
         self.n_vocab
     }

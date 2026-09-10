@@ -24,6 +24,37 @@ pub trait PieceSource {
     /// The vocabulary size — the bound every network-derived `token_id` is held to **before it
     /// becomes durable** (audit M5). The tokenizer knows it; a stub states it.
     fn n_vocab(&self) -> u32;
+    /// End-of-generation (the model's EOS/EOT set). Default `false`: a source without a vocabulary
+    /// never ends a stream early. (2026-09-09, ruling item 2.)
+    fn is_eog(&self, _token: u32) -> bool {
+        false
+    }
+}
+
+/// Why a stream ended (SSE `event: finish`). `Stop`: the model produced an end-of-generation token.
+/// `Length`: the `--max-tokens` ceiling. `StageLost`: a stage died mid-generation; the coordinator
+/// recovers the session in place and a client reconnects with `Last-Event-ID`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+    StageLost,
+}
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+            FinishReason::StageLost => "stage_lost",
+        }
+    }
+}
+
+/// What the generation thread hands the session: sampled tokens, then the reason it stopped.
+#[derive(Clone, Debug)]
+pub enum GenEvent {
+    Token(SampledToken),
+    Finish(FinishReason),
 }
 
 /// [`PieceSource`] over the real llama.cpp-delegated tokenizer.
@@ -35,6 +66,9 @@ impl PieceSource for TokenizerPieces {
     }
     fn n_vocab(&self) -> u32 {
         u32::try_from(self.0.n_vocab()).unwrap_or(0)
+    }
+    fn is_eog(&self, token: u32) -> bool {
+        self.0.is_eog(token)
     }
 }
 
@@ -95,7 +129,7 @@ impl Session {
     /// `commit` must be a stream opened with [`CommitStream::open`] on `path`.
     pub fn reopen(path: &std::path::Path, commit: CommitStream, fence: WalFenceCtx, pieces: Box<dyn PieceSource>, k: usize, emit_capacity: usize) -> Result<Session, CommitError> {
         let mut sess = Session::new(commit, fence, pieces, k, emit_capacity);
-        let events = Session::replay_events(path, sess.pieces.as_ref(), &mut sess.detok)?;
+        let events = Session::replay_events(path, sess.pieces.as_ref(), &mut sess.detok, None)?;
         for ev in events {
             sess.log.append(ev.data, ev.last_output_pos);
         }
@@ -105,9 +139,13 @@ impl Session {
     /// The durable prefix's events, replayed through a fresh (or the given) UTF-8 streamer — the
     /// pure function the event log is. Callable without a session (a restart uses it to hand the
     /// HTTP layer the backlog before the session thread exists).
-    pub fn replay_events(path: &std::path::Path, pieces: &dyn PieceSource, detok: &mut Utf8Streamer) -> Result<Vec<Event>, CommitError> {
+    /// `max_tokens`: the session's ceiling, so a durable stream that ended at it (with no EOS)
+    /// replays its `length` finish event; a durable EOS replays `stop`; anything else replays no
+    /// finish event — the stream is being resumed.
+    pub fn replay_events(path: &std::path::Path, pieces: &dyn PieceSource, detok: &mut Utf8Streamer, max_tokens: Option<usize>) -> Result<Vec<Event>, CommitError> {
         let scan = hydra_wal::reader::WalScan::open(path).map_err(|e| CommitError::BadCheckpoint(format!("reopen scan: {e}")))?;
         let mut log = EventLog::new();
+        let (mut n_generated, mut last_eog, mut last_pos) = (0usize, false, -1i64);
         for r in &scan.records {
             if r.record_type != hydra_wal::record::rec_type::GENERATION_COMMIT {
                 continue;
@@ -117,12 +155,28 @@ impl Session {
             let mut text = String::new();
             for te in gc.tokens().iter() {
                 text.push_str(&detok.push(&pieces.piece(te.token_id())));
+                n_generated += 1;
+                last_eog = pieces.is_eog(te.token_id());
             }
             if !text.is_empty() {
                 log.append(text, gc.last_output_pos());
             }
+            last_pos = gc.last_output_pos();
+        }
+        if last_eog {
+            log.append_finish(FinishReason::Stop.as_str(), last_pos);
+        } else if max_tokens.map(|m| n_generated >= m).unwrap_or(false) {
+            log.append_finish(FinishReason::Length.as_str(), last_pos);
         }
         Ok(log.all().to_vec())
+    }
+
+    /// Append the finish event after the final flush (the pump calls this on `GenEvent::Finish`).
+    pub fn finish_with(&mut self, reason: FinishReason) -> Event {
+        let pos = self.durable_pos();
+        let ev = self.log.append_finish(reason.as_str(), pos);
+        self.pending_emit += 1;
+        ev
     }
 
     pub fn durable_pos(&self) -> i64 {

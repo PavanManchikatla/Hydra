@@ -209,6 +209,14 @@ int32_t hydra_tokenize_ex(const HydraModel* m, const char* text, int32_t text_le
     HYDRA_GUARD_END(-HYDRA_E_TOKENIZE)
 }
 
+int32_t hydra_token_is_eog(const HydraModel* m, int32_t token) {
+    HYDRA_GUARD_BEGIN
+    if (!m || !m->vocab) return -HYDRA_E_NULL;
+    if (token < 0 || token >= m->n_vocab) return -HYDRA_E_TOKENIZE;
+    return llama_vocab_is_eog(m->vocab, (llama_token) token) ? 1 : 0;
+    HYDRA_GUARD_END(-HYDRA_E_TOKENIZE)
+}
+
 int32_t hydra_token_to_piece(const HydraModel* m, int32_t token, int32_t special,
                              uint8_t* out, int32_t cap) {
     HYDRA_GUARD_BEGIN

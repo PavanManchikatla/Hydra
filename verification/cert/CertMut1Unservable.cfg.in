@@ -26,6 +26,7 @@ EnableUnservable = FALSE
 ResetTruncates = TRUE
 AttemptFencing = TRUE
 AbortGuardEnabled = TRUE
+AbortTerminal = TRUE
 RestartDerivesByMax = TRUE
 
 INVARIANTS

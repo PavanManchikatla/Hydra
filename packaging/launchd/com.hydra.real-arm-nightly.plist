@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The nightly full real-arm workspace run (design authority, 2026-09-09, item 5).
+     Install (the owner's machine, once):
+       cp packaging/launchd/com.hydra.real-arm-nightly.plist ~/Library/LaunchAgents/
+       sed -i '' "s|__HYDRA__|$PWD|g" ~/Library/LaunchAgents/com.hydra.real-arm-nightly.plist
+       launchctl load ~/Library/LaunchAgents/com.hydra.real-arm-nightly.plist
+     It runs scripts/real-arm-nightly.sh at 03:00 local, under nice, refusing to overlap cargo/TLC; the
+     receipt lands in verification/ci-results/real-arm-<date>.md for the next session to commit and quote. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hydra.real-arm-nightly</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>__HYDRA__/scripts/real-arm-nightly.sh</string></array>
+  <key>WorkingDirectory</key><string>__HYDRA__</string>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+  <key>Nice</key><integer>15</integer>
+  <key>StandardOutPath</key><string>/tmp/hydra-real-arm-nightly.log</string>
+  <key>StandardErrorPath</key><string>/tmp/hydra-real-arm-nightly.log</string>
+</dict>
+</plist>

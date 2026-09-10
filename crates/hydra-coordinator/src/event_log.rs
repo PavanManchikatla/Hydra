@@ -11,6 +11,11 @@ pub struct Event {
     pub id: u64,
     pub data: String,
     pub last_output_pos: i64,
+    /// A finish event (SSE `event: finish`, `data:` = the reason: `stop` at the model's EOS/EOT,
+    /// `length` at the `--max-tokens` ceiling, `stage_lost` when the stream ended because a stage
+    /// died and the session is being recovered). Carries no text; its id is dense like every
+    /// other event so a reconnect replays it in order. (2026-09-09, ruling item 2.)
+    pub finish: bool,
 }
 
 /// Append-only log of emitted events. Built by [`Session`](crate::session::Session) from durable
@@ -29,9 +34,22 @@ impl EventLog {
     /// appended (an event carries visible bytes).
     pub fn append(&mut self, data: String, last_output_pos: i64) -> Event {
         let id = self.events.len() as u64 + 1;
-        let ev = Event { id, data, last_output_pos };
+        let ev = Event { id, data, last_output_pos, finish: false };
         self.events.push(ev.clone());
         ev
+    }
+
+    /// Append the finish event (see [`Event::finish`]); `reason` is `stop` / `length` / `stage_lost`.
+    pub fn append_finish(&mut self, reason: &str, last_output_pos: i64) -> Event {
+        let id = self.events.len() as u64 + 1;
+        let ev = Event { id, data: reason.to_string(), last_output_pos, finish: true };
+        self.events.push(ev.clone());
+        ev
+    }
+
+    /// The finish reason, if the stream has finished.
+    pub fn finish_reason(&self) -> Option<&str> {
+        self.events.last().filter(|e| e.finish).map(|e| e.data.as_str())
     }
 
     /// Events strictly after `last_event_id` (the resume replay). `0` yields the whole stream.
@@ -50,7 +68,7 @@ impl EventLog {
 
     /// The full emitted text so far (concatenation of all event data).
     pub fn full_text(&self) -> String {
-        self.events.iter().map(|e| e.data.as_str()).collect()
+        self.events.iter().filter(|e| !e.finish).map(|e| e.data.as_str()).collect()
     }
 }
 

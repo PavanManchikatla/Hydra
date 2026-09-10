@@ -73,6 +73,10 @@ int32_t hydra_tokenize_ex(const HydraModel* m, const char* text, int32_t text_le
 /* Render token `token` to its raw display bytes (llama_token_to_piece; `special`=0 => special
  * tokens render empty). Writes up to `cap` bytes into `out`; returns the byte count, or the
  * NEGATED required count if `cap` was too small. */
+/* 1 if `token` is an end-of-generation token of the model's vocabulary (EOS / EOT — llama.cpp's
+ * `llama_vocab_is_eog`), 0 if not, negative on error. The generation loops stop AFTER such a token
+ * (2026-09-09 ruling item 2: the reference is unsplit greedy up to the model's EOS/EOT set). */
+int32_t hydra_token_is_eog(const HydraModel* m, int32_t token);
 int32_t hydra_token_to_piece(const HydraModel* m, int32_t token, int32_t special,
                              uint8_t* out, int32_t cap);
 

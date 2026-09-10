@@ -55,6 +55,8 @@ fn disabled_events_are_noops() {
     assert!(c.wal().is_empty());
 }
 
+// Under Mut4 (redesigned 2026-09-09) the abort deliberately does NOT return to READY_ALL.
+#[cfg(not(feature = "mutation_no_abort_finality"))]
 #[test]
 fn abort_returns_to_ready_at_next_attempt() {
     let mut c = Coordinator::new_initial(sid(), 2, 1);
@@ -134,41 +136,36 @@ fn tlc1_crash_after_abort_never_completes_aborted_attempt() {
     assert!(invariants::check(&c).is_empty());
 }
 
-// ---- mutation parity (Mut4 = no abort finality); run with `--features mutation_no_abort_finality` ----
-// ⛔ ESCALATED-SUBSUMED (2026-09-03, PROJECT_STATE §7.77). Mut4's designed trace needed S10 to
-// RESUME the aborted attempt (CoordRestart → ACTIVATION_INTENT_DURABLE) so that a replayed COMMIT
-// and the stale acks could reach CoordWriteComplete. Spec §6.5a removed that restart: a restart
-// derives from the WAL and fences forward, so with the I25 guard OFF the sequence still cannot
-// complete attempt 1 — there is no state after S10 that accepts an attempt-1 ack. TLC reports the
-// same (`Mut4RestartMin` drains clean: `verdict=ESCALATED-SUBSUMED`). This test therefore asserts
-// the SUBSUMPTION — the mutation is unreachable, not "caught" — so a reader running the feature
-// build sees the fact rather than a green "caught by checker" the checker never earned. What the
-// mutation should sabotage instead is the design authority's ruling; until then this is the record.
+// ---- mutation parity (Mut4, REDESIGNED 2026-09-09 — ruling item 3); run with `--features mutation_no_abort_finality` ----
+// The first Mut4 (the I25 write-guard off) bit only through the restart-replay path spec §6.5a
+// removed, and drained clean after it (§7.77). Abort finality's LIVE decision — "a durable ABORT
+// ends the attempt; the coordinator leaves COMMITTING, so the stale ACTIVATION_COMMITTED acks still
+// in flight can never complete it" — has a non-crash path, and the redesigned mutation sabotages
+// THAT: under the feature the abort is durable and sent but the coordinator stays in COMMITTING
+// with its acks kept, and (guard off) the lingering acks reach COMPLETE. The checker's I25 must fire
+// with no crash anywhere in the sequence. The model's Mut4 (`AbortTerminal = FALSE`,
+// `AbortGuardEnabled = FALSE`) is the same sabotage; `smoke/Mut4-AbortFinality.cfg` must violate.
 #[cfg(feature = "mutation_no_abort_finality")]
 #[test]
-fn mut4_is_unreachable_under_fence_forward_escalated_subsumed() {
+fn mut4_completion_after_abort_is_caught_by_checker_without_a_crash() {
     let mut c = Coordinator::new_initial(sid(), 2, 1);
-    c.step(StagesReconstructed); // S2–S5
-    c.step(ProceedWriteIntent); // S6: attempt 1
+    c.step(StagesReconstructed);
+    c.step(ProceedWriteIntent); // attempt 1
     c.step(WalDurable(Intent));
-    c.step(ProceedSendCommit); // S7
+    c.step(ProceedSendCommit);
+    // one ack in, the other lingering in the network
     c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 });
-    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
-    c.step(ProceedAbort); // S8
+    c.step(ProceedAbort); // durably ABORT attempt 1 …
     c.step(WalDurable(Abort));
-    c.step(Crash); // S9
-    c.step(Restart); // S10: guard off — and STILL a fence-forward, not a resurrection
-    assert_eq!(c.state(), CoordState::RecoveryStartedPending, "ESCALATED-SUBSUMED: with the guard off the restart still fences forward (§6.5a)");
-    c.step(WalDurable(BeginRecovery));
-    assert_eq!((c.epoch(), c.attempt()), (1, 0), "attempt 1 is fenced behind epoch 1 — it cannot be resurrected");
-    // S11–S14 as designed: nothing is accepted, nothing completes.
-    assert!(c.step(ProceedSendCommit).is_empty(), "S11 unreachable");
-    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(0), attempt: 1 }).is_empty());
-    assert!(c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 }).is_empty());
-    assert!(c.step(ProceedWriteComplete).is_empty(), "S14 unreachable");
-    assert!(!c.completed(), "no COMPLETE for the aborted attempt — the mutation had nothing to sabotage");
-    assert!(invariants::check(&c).is_empty(), "and the checker sees a legal state, because it IS one: the I25 hole is closed by the fence, not the guard");
-    // Red by design (rule 25: a verdict token must express failure), exactly as the TLC smoke is,
-    // until the design authority rules what Mut4 should sabotage under fence-forward.
-    panic!("verdict=ESCALATED-SUBSUMED (Mut4 is unreachable under spec §6.5a fence-forward: the facts above hold, the mutation had nothing to sabotage — PROJECT_STATE §7.77)");
+    assert_eq!(c.state(), CoordState::Committing, "MUTATION: the abort did not end the attempt — still COMMITTING");
+    // … and the lingering ack arrives
+    c.step(StageCommitted { rank: hydra_state::AuthenticatedRank::for_test_harness_asserting_identity(1), attempt: 1 });
+    let effs = c.step(ProceedWriteComplete); // guard off → allowed
+    assert!(!effs.is_empty(), "MUTATION: COMPLETE written for an aborted attempt");
+    c.step(WalDurable(Complete));
+    let v = invariants::check(&c);
+    assert!(
+        v.iter().any(|x| x.invariant == "I25 AbortFinality"),
+        "mutation parity: the checker must catch the redesigned Mut4's I25 violation; got {v:?}"
+    );
 }

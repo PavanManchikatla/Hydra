@@ -83,22 +83,11 @@ jobs:
           esac
 
   # ---------- long, checkpointed, manual/weekly ----------
-      - name: Mut2 must trip CaseBPure (label-only reset)
-        working-directory: verification
-        run: |
-          rc=0
-          java -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-            -config smoke/Mut2-CaseBPure.cfg HydraActivationCore.tla > mut2.log 2>&1 || rc=$?
-          if grep -q "Invariant CaseBPure is violated" mut2.log; then
-            echo "OK: Mut2 tripped CaseBPure (rc=$rc)"
-          else
-            # [2026-09-02, spec §6.5a] Mut2's designed trace re-sent the same BEGIN/COMMIT through a restart;
-            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
-            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
-            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
-            echo "verdict=ESCALATED-SUBSUMED (Mut2 did NOT trip CaseBPure: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut2.log; exit 1
-          fi
-      - name: Mut4 must trip AbortFinality (no abort finality — TLC-1/I25)
+      # Mut2 (label-only RESET → Case B replay) RETIRED 2026-09-09 by the design authority's item 3:
+      # its sabotage is unreachable by construction under spec §6.5a (no BEGIN is ever sent at a
+      # recovery id a RESET has advanced past), so no smoke step can observe it. CaseBPure STAYS in
+      # the baseline invariant set (every baseline leg checks it). The argument: VERIFICATION-README.
+      - name: Mut4 must trip AbortFinality (redesigned 2026-09-09: abort not terminal + I25 guard off)
         working-directory: verification
         run: |
           rc=0
@@ -107,11 +96,7 @@ jobs:
           if grep -q "Invariant AbortFinality is violated" mut4.log; then
             echo "OK: Mut4 tripped AbortFinality (rc=$rc)"
           else
-            # [2026-09-02, spec §6.5a] Mut4's designed trace re-sent the same BEGIN/COMMIT through a restart;
-            # fence-forward makes that unreachable by construction, so this mutation drains CLEAN. That is
-            # the F-MUT3 shape (§7.22): a sabotage the model can no longer express. NOT green, NOT masked —
-            # escalated to the design authority (PROJECT_STATE §7.77) and red until ruled.
-            echo "verdict=ESCALATED-SUBSUMED (Mut4 did NOT trip AbortFinality: drained clean under spec §6.5a fence-forward — see PROJECT_STATE §7.77)"; tail -5 mut4.log; exit 1
+            echo "verdict=RED (Mut4 did NOT trip AbortFinality — the redesigned mutation (AbortTerminal = FALSE, AbortGuardEnabled = FALSE) must fire on the live abort decision; see PROJECT_STATE §7.80)"; tail -5 mut4.log; exit 1
           fi
   long:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

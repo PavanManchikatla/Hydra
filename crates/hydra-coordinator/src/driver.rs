@@ -200,11 +200,6 @@ impl<L: StageLink> ActivationDriver<L> {
         self.links.insert(link.rank().rank(), link);
     }
 
-    /// Receive one frame from the link belonging to `rank`.
-    ///
-    /// Paired with [`Self::on_frame`] so the rank a reply is attributed to is **the rank of the
-    /// link it arrived on** — the driver never has an opportunity to read one out of the frame,
-    /// which is the whole of audit H4.
     pub async fn recv_from(&mut self, rank: AuthenticatedRank) -> Result<Vec<u8>, DriverError>
     where
         L: Receivable,

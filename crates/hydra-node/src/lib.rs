@@ -35,7 +35,7 @@ use std::path::Path;
 
 use hydra_coordinator::driver::{ActivationDriver, MtlsStageLink};
 use hydra_coordinator::control_wal::ControlWal;
-use hydra_coordinator::{SampledToken, WalFenceCtx};
+use hydra_coordinator::{FinishReason, SampledToken, WalFenceCtx};
 use hydra_state::coordinator::{CoordEvent, CoordState, Coordinator};
 use hydra_state::{AuthenticatedRank, SessionId};
 use hydra_transport::tcp_mtls::TcpMtls;
@@ -55,6 +55,10 @@ pub enum NodeError {
     Wire(String),
     #[error("protocol: expected {expected}, got {got}")]
     Unexpected { expected: &'static str, got: String },
+    /// A stage's link died (connection reset / EOF / no link): the effect source spec §6.4's
+    /// `StageLost` event needs, named by rank (2026-09-09, ruling item 1).
+    #[error("stage {0} lost: its link died")]
+    StageLost(u16),
     #[error("sampler error code {0} at step {1}")]
     Sampler(u16, usize),
     #[error("{0}")]
@@ -84,6 +88,23 @@ impl StageConnector {
 
     /// Dial every stage in rank order; each link carries the rank the transport minted for the
     /// TLS-verified name it dialled (`TcpMtls::connect_stage`).
+    /// Dial ONE stage, retrying until `deadline`: the replacement of a lost stage is provisioned
+    /// from the same bootstrap and comes up at the same address a moment after the kill.
+    pub async fn connect_one_retry(&self, s: &StageSpec, deadline: std::time::Duration) -> Result<(AuthenticatedRank, MtlsStageLink), NodeError> {
+        let until = std::time::Instant::now() + deadline;
+        let mut last = String::new();
+        while std::time::Instant::now() < until {
+            match self.connector.connect_stage(s.addr, &s.name, s.rank as hydra_state::StageRank).await {
+                Ok((conn, rank)) => return Ok((rank, MtlsStageLink::new(rank, conn))),
+                Err(e) => {
+                    last = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        Err(NodeError::Transport(format!("reconnect {} at {}: no replacement answered within {:?} (last: {last})", s.name, s.addr, deadline)))
+    }
+
     pub async fn connect_all(&self, stages: &[StageSpec]) -> Result<Vec<(AuthenticatedRank, MtlsStageLink)>, NodeError> {
         let mut links = Vec::with_capacity(stages.len());
         for s in stages {
@@ -104,6 +125,11 @@ pub struct Pipeline {
     fence: SessionFence,
     s1: AuthenticatedRank,
     sp: AuthenticatedRank,
+    /// The input positions each stage already holds (`RECOVERY_ACK{applied_input_pos}` after a
+    /// BEGIN; −1 = nothing). The relayed replay skips a stage for positions it holds (§2.3d
+    /// refuses re-application below a stage's frontier). Outside a recovery both are −1 and the
+    /// gate is inert.
+    held: [i64; 2],
 }
 
 /// **Rule-19 crash-injection points for the restart oracle (spec §6.5a's adversarial window).**
@@ -133,7 +159,7 @@ impl Pipeline {
         let wal = ControlWal::create(control_wal_path, fence.cluster_id, fence.session_id).map_err(|e| NodeError::Config(format!("control wal: {e}")))?;
         let coord = Coordinator::new_initial(SessionId(fence.session_id), 2, INITIAL_CHECKPOINT_ID);
         let driver = ActivationDriver::new(coord, wal, wal_fence(fence), fence.clone(), links.into_iter().map(|(_, l)| l).collect());
-        let mut p = Pipeline { driver, fence: fence.clone(), s1, sp };
+        let mut p = Pipeline { driver, fence: fence.clone(), s1, sp, held: [-1, -1] };
         p.activation_transaction().await?;
         Ok(p)
     }
@@ -172,6 +198,24 @@ impl Pipeline {
     /// A bounded wait on a stage during recovery: a stage that DROPS a control frame (the stage
     /// SM's Case C answers nothing on the wire) must surface as a named failure, not a process
     /// that waits forever — the third restart-oracle window found exactly that hang (2026-09-03).
+    /// A dead link is a NAMED stage loss, not a transport string: `Transport` (reset / EOF) and
+    /// `NoLink` from the driver become `NodeError::StageLost(rank)`, the event source for the
+    /// state machine's `StageLost` (2026-09-09, ruling item 1: detection is an effect source
+    /// feeding an event the SM already handles).
+    fn lost_or(rank: AuthenticatedRank, e: hydra_coordinator::driver::DriverError) -> NodeError {
+        use hydra_coordinator::driver::DriverError as D;
+        match e {
+            D::Transport(_) | D::NoLink(_) => NodeError::StageLost(rank.rank()),
+            other => NodeError::Driver(other),
+        }
+    }
+    async fn tx(&mut self, rank: AuthenticatedRank, frame: Vec<u8>) -> Result<(), NodeError> {
+        self.driver.send_to(rank, frame).await.map_err(|e| Self::lost_or(rank, e))
+    }
+    async fn rx(&mut self, rank: AuthenticatedRank) -> Result<Vec<u8>, NodeError> {
+        self.driver.recv_from(rank).await.map_err(|e| Self::lost_or(rank, e))
+    }
+
     async fn recv_bounded(driver: &mut ActivationDriver<MtlsStageLink>, rank: AuthenticatedRank, what: &'static str) -> Result<Vec<u8>, NodeError> {
         match tokio::time::timeout(std::time::Duration::from_secs(60), driver.recv_from(rank)).await {
             Ok(r) => r.map_err(NodeError::from),
@@ -209,7 +253,7 @@ impl Pipeline {
         let served = ledger.generation_durable_pos >= 0;
         let coord = Coordinator::restart_from(SessionId(fence.session_id), 2, INITIAL_CHECKPOINT_ID, records, served);
         let driver = ActivationDriver::new(coord, wal, wal_fence(fence), fence.clone(), links.into_iter().map(|(_, l)| l).collect());
-        let mut p = Pipeline { driver, fence: fence.clone(), s1, sp };
+        let mut p = Pipeline { driver, fence: fence.clone(), s1, sp, held: [-1, -1] };
 
         // 1. The SM classifies and (normally) fences forward: BEGIN written, made durable.
         p.driver.step(CoordEvent::Restart).await?;
@@ -244,18 +288,23 @@ impl Pipeline {
         //    rebuild can only source an activation for S_P from S1's forward, so the two frontiers
         //    must agree; a pair that disagrees (one stage replaced, one intact) needs the partial
         //    rebuild this seam does not wire — refused by name, recorded in PROJECT_STATE §8.
+        p.held = applied;
+        eprintln!("hydra-coordinator: restart — stages hold applied frontiers S1 {} / S_P {}; replaying the ledger through the gate", applied[0], applied[1]);
+        p.rebuild_and_activate(ledger).await?;
+        Ok(p)
+    }
+
+    /// The tail every recovery shares once the BEGIN is acknowledged: Strategy B through the
+    /// relayed topology from the acknowledged frontiers (`held`), catch-up, the sampler
+    /// checkpoint, the activation transaction at the new epoch.
+    async fn rebuild_and_activate(&mut self, ledger: &hydra_coordinator::RecoveryState) -> Result<(), NodeError> {
         let tokens = ledger.replay_tokens();
-        if applied[0] != applied[1] {
-            return Err(NodeError::Config(format!(
-                "the stages acknowledge different applied frontiers (S1 {}, S_P {}): a partial relayed rebuild is not wired in this seam — recorded in PROJECT_STATE §8",
-                applied[0], applied[1]
-            )));
+        for (pos, &tok) in tokens.iter().enumerate() {
+            self.apply_relayed(pos as i64, tok, true).await?;
         }
-        let from = (applied[0] + 1).max(0) as usize;
-        eprintln!("hydra-coordinator: restart — both stages hold applied frontier {}; replaying {} of {} ledger tokens", applied[0], tokens.len().saturating_sub(from), tokens.len());
-        for (pos, &tok) in tokens.iter().enumerate().skip(from) {
-            p.apply_relayed(pos as i64, tok, true).await?;
-        }
+        self.held = [-1, -1];
+        let (s1, sp) = (self.s1, self.sp);
+        let p = self;
         // 4. Catch-up frontier, then the sampler checkpoint (I17), then
         let epoch = p.epoch();
         let goal = ledger.input_frontier();
@@ -273,44 +322,64 @@ impl Pipeline {
         }
         // 5. the activation transaction at the new epoch.
         p.activation_transaction().await?;
-        Ok(p)
+        Ok(())
     }
 
-    /// Continue a generation after a restart: sample from `next_output_pos` with the input frontier
-    /// at `input_pos`, for at most `remaining` steps. `checkpoint_id` is the installed checkpoint
-    /// the ledger names (the fence `SAMPLE_NEXT` carries).
+    /// **Stage loss in the product (2026-09-09, ruling item 1).** The SM's `StageLost`, then its
+    /// own `ProceedBeginRecovery` (a new epoch, durable before anything is sent — the same
+    /// fence-forward the restart path takes), the replacement dialled at the lost stage's address
+    /// (it is provisioned from the same bootstrap), `BEGIN_RECOVERY` to both, and the shared tail:
+    /// the survivor keeps position 0 (`truncate_to = 0`, the least the H3 bound allows), the
+    /// replacement holds nothing, the gated replay gives each what it lacks.
+    ///
+    /// What this cannot do, by the spec as it stands: rebuild a replaced FINAL stage in the relayed
+    /// D0 topology — the survivor S1 cannot re-emit position 0's activation (§2.3d), so the gate
+    /// refuses by name. Escalated (PROJECT_STATE §7.80), not invented here.
+    pub async fn recover_stage_loss(
+        &mut self,
+        connector: &StageConnector,
+        stages: &[StageSpec],
+        ledger: &hydra_coordinator::RecoveryState,
+        lost: u16,
+    ) -> Result<(), NodeError> {
+        let lost_rank = if lost == self.s1.rank() { self.s1 } else { self.sp };
+        self.driver.step(CoordEvent::StageLost { rank: lost_rank }).await?;
+        self.driver.step(CoordEvent::ProceedBeginRecovery { truncate_to: 0 }).await?;
+        eprintln!("hydra-coordinator: stage {lost} lost — BEGIN_RECOVERY durable at epoch {} rid {}; dialling the replacement", self.driver.coordinator().epoch(), self.driver.coordinator().recovery_id());
+        let spec = stages.iter().find(|s| s.rank == lost).ok_or_else(|| NodeError::Config(format!("no stage spec for rank {lost}")))?;
+        let (rank, link) = connector.connect_one_retry(spec, std::time::Duration::from_secs(60)).await?;
+        if rank.rank() != lost {
+            return Err(NodeError::Config(format!("the replacement at {} authenticated as rank {}, expected {lost}", spec.addr, rank.rank())));
+        }
+        self.driver.replace_link(link);
+        self.driver.step(CoordEvent::ProceedSendBeginRecovery).await?;
+        let mut applied = [-1i64; 2];
+        for (i, r) in [self.s1, self.sp].into_iter().enumerate() {
+            let reply = Self::recv_bounded(&mut self.driver, r, "RECOVERY_ACK").await?;
+            match decode(&reply, &self.fence)? {
+                Msg::RecoveryAck { applied_input_pos } => applied[i] = applied_input_pos,
+                other => return Err(NodeError::Unexpected { expected: "RECOVERY_ACK", got: format!("{other:?}") }),
+            }
+        }
+        self.held = applied;
+        eprintln!("hydra-coordinator: stage loss — stages hold applied frontiers S1 {} / S_P {}; replaying the ledger through the gate", applied[0], applied[1]);
+        self.rebuild_and_activate(ledger).await
+    }
+
+    /// Continue a generation after a restart or a stage loss: sample from `next_output_pos` with
+    /// the input frontier at `input_pos`, for at most `remaining` steps, stopping at EOS.
+    #[allow(clippy::too_many_arguments)] // the ledger's four coordinates, the config, the ceiling, the EOS set, the sink
     pub async fn resume_generate(
         &mut self,
         next_output_pos: i64,
-        mut input_pos: i64,
-        checkpoint_id: u64,
+        input_pos: i64,
+        _checkpoint_id: u64,
         config: &SamplingConfig,
         remaining: usize,
+        is_eog: &dyn Fn(u32) -> bool,
         mut emit: impl FnMut(&SampledToken) -> bool,
-    ) -> Result<Vec<u32>, NodeError> {
-        let mut out = Vec::new();
-        for i in 0..remaining {
-            let output_pos = next_output_pos + i as i64;
-            let epoch = self.epoch();
-            self.driver
-                .send_to(self.sp, hydra_wire::encode_sample_next(&self.fence, epoch, output_pos, &config.hash(), checkpoint_id))
-                .await?;
-            let reply = self.driver.recv_from(self.sp).await?;
-            let s = match decode(&reply, &self.fence)? {
-                Msg::Sampled { output_pos, token_id, post_sample_snapshot, .. } => SampledToken { output_pos, token_id, snapshot: post_sample_snapshot },
-                Msg::Err { code } => return Err(NodeError::Sampler(code, output_pos as usize)),
-                other => return Err(NodeError::Unexpected { expected: "SAMPLED from S_P", got: format!("{other:?}") }),
-            };
-            out.push(s.token_id);
-            if !emit(&s) {
-                break;
-            }
-            if i + 1 < remaining {
-                self.feed_back(input_pos, s.token_id).await?;
-                input_pos += 1;
-            }
-        }
-        Ok(out)
+    ) -> Result<(Vec<u32>, FinishReason), NodeError> {
+        self.generate_from(next_output_pos, input_pos, config, remaining, is_eog, &mut emit).await
     }
 
     pub fn state(&self) -> CoordState {
@@ -324,14 +393,30 @@ impl Pipeline {
     /// One relayed apply: `APPLY_TOKEN` to S1, its boundary forwarded to S_P, S_P's ack drained.
     async fn apply_relayed(&mut self, input_pos: i64, token: u32, no_sample: bool) -> Result<(), NodeError> {
         let epoch = self.epoch();
-        self.driver.send_to(self.s1, hydra_wire::encode_apply_token(&self.fence, epoch, input_pos, token, no_sample)).await?;
-        let fwd = self.driver.recv_from(self.s1).await?;
+        let (need_s1, need_sp) = (input_pos > self.held[0], input_pos > self.held[1]);
+        if !need_s1 && !need_sp {
+            return Ok(()); // both stages hold this position (a survivor's kept prefix)
+        }
+        if !need_s1 && need_sp {
+            // S1 holds the position and will not re-apply it (§2.3d: no recomputation, no cache
+            // after truncation), so S_P's activation for it cannot be sourced from a survivor. In
+            // the relayed D0 topology this is the FINAL stage replaced: escalated, not invented.
+            return Err(NodeError::Config(format!(
+                "position {input_pos}: S1 holds it and S_P does not — the relayed rebuild cannot source S_P's activation from a survivor's KV (spec decision escalated, PROJECT_STATE §7.80)"
+            )));
+        }
+        let (s1, sp) = (self.s1, self.sp);
+        self.tx(s1, hydra_wire::encode_apply_token(&self.fence, epoch, input_pos, token, no_sample)).await?;
+        let fwd = self.rx(s1).await?;
         let activations = match decode(&fwd, &self.fence)? {
             Msg::Fwd { activations, .. } => activations,
             other => return Err(NodeError::Unexpected { expected: "FWD from S1", got: format!("{other:?}") }),
         };
-        self.driver.send_to(self.sp, hydra_wire::encode_fwd(&self.fence, epoch, input_pos, no_sample, &activations)).await?;
-        let ack = self.driver.recv_from(self.sp).await?;
+        if !need_sp {
+            return Ok(()); // S_P holds it already; S1's forward is discarded
+        }
+        self.tx(sp, hydra_wire::encode_fwd(&self.fence, epoch, input_pos, no_sample, &activations)).await?;
+        let ack = self.rx(sp).await?;
         match decode(&ack, &self.fence)? {
             Msg::AppliedAck { .. } => Ok(()),
             other => Err(NodeError::Unexpected { expected: "APPLIED_ACK from S_P", got: format!("{other:?}") }),
@@ -350,10 +435,9 @@ impl Pipeline {
     /// and every snapshot live on S_P, spec §1.4).
     pub async fn sample_next(&mut self, output_pos: i64, config: &SamplingConfig) -> Result<SampledToken, NodeError> {
         let epoch = self.epoch();
-        self.driver
-            .send_to(self.sp, hydra_wire::encode_sample_next(&self.fence, epoch, output_pos, &config.hash(), INITIAL_CHECKPOINT_ID))
-            .await?;
-        let reply = self.driver.recv_from(self.sp).await?;
+        let sp = self.sp;
+        self.tx(sp, hydra_wire::encode_sample_next(&self.fence, epoch, output_pos, &config.hash(), INITIAL_CHECKPOINT_ID)).await?;
+        let reply = self.rx(sp).await?;
         match decode(&reply, &self.fence)? {
             Msg::Sampled { output_pos, token_id, post_sample_snapshot, .. } => Ok(SampledToken { output_pos, token_id, snapshot: post_sample_snapshot }),
             Msg::Err { code } => Err(NodeError::Sampler(code, output_pos as usize)),
@@ -369,28 +453,49 @@ impl Pipeline {
     /// The whole generation: prefill, then `max_steps` sample/feed-back rounds, each token handed
     /// to `emit` as it is sampled (the API's session commits and streams it). Stops early if
     /// `emit` reports the consumer is gone. Returns the sampled tokens.
+    /// Generate until the model's end-of-generation token (`FinishReason::Stop`, the token is
+    /// emitted and nothing is sampled past it) or the ceiling (`FinishReason::Length`). The
+    /// reference the byte-identity oracle compares against (`pair::run_generation` with the model
+    /// named) stops at exactly the same place. (2026-09-09, ruling item 2.)
     pub async fn generate(
         &mut self,
         prompt_tokens: &[u32],
         config: &SamplingConfig,
         max_steps: usize,
+        is_eog: &dyn Fn(u32) -> bool,
         mut emit: impl FnMut(&SampledToken) -> bool,
-    ) -> Result<Vec<u32>, NodeError> {
+    ) -> Result<(Vec<u32>, FinishReason), NodeError> {
         self.prefill(prompt_tokens, 0).await?;
-        let mut out = Vec::with_capacity(max_steps);
-        let mut input_pos = prompt_tokens.len() as i64;
-        for step in 0..max_steps {
-            let s = self.sample_next(step as i64, config).await?;
+        let input_pos = prompt_tokens.len() as i64;
+        self.generate_from(0, input_pos, config, max_steps, is_eog, &mut emit).await
+    }
+
+    async fn generate_from(
+        &mut self,
+        next_output_pos: i64,
+        mut input_pos: i64,
+        config: &SamplingConfig,
+        remaining: usize,
+        is_eog: &dyn Fn(u32) -> bool,
+        emit: &mut impl FnMut(&SampledToken) -> bool,
+    ) -> Result<(Vec<u32>, FinishReason), NodeError> {
+        let mut out = Vec::with_capacity(remaining);
+        for i in 0..remaining {
+            let s = self.sample_next(next_output_pos + i as i64, config).await?;
             out.push(s.token_id);
-            if !emit(&s) {
+            let keep_going = emit(&s);
+            if is_eog(s.token_id) {
+                return Ok((out, FinishReason::Stop));
+            }
+            if !keep_going {
                 break;
             }
-            if step + 1 < max_steps {
+            if i + 1 < remaining {
                 self.feed_back(input_pos, s.token_id).await?;
                 input_pos += 1;
             }
         }
-        Ok(out)
+        Ok((out, FinishReason::Length))
     }
 }
 

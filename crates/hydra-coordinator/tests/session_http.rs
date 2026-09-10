@@ -19,7 +19,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use flatbuffers::FlatBufferBuilder;
 use hydra_coordinator::{
-    router, AppState, CommitOutcome, CommitStream, Durability, PieceSource, SampledToken, Session, WalFenceCtx,
+    router, AppState, CommitOutcome, CommitStream, Durability, GenEvent, PieceSource, SampledToken, Session, WalFenceCtx,
 };
 use hydra_proto::wal;
 use http_body_util::BodyExt;
@@ -170,8 +170,9 @@ fn make_app(gen_calls: Arc<AtomicUsize>) -> axum::Router {
         let toks = tokens.clone();
         tokio::spawn(async move {
             for (pos, tok) in toks {
-                let _ = tx.send(SampledToken { output_pos: pos, token_id: tok, snapshot: snapshot(pos) }).await;
+                let _ = tx.send(GenEvent::Token(SampledToken { output_pos: pos, token_id: tok, snapshot: snapshot(pos) })).await;
             }
+            let _ = tx.send(GenEvent::Finish(hydra_coordinator::FinishReason::Length)).await;
         });
         rx
     });
@@ -210,19 +211,31 @@ fn with_auth<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
 }
 
 /// Parse an SSE body into (id, data) pairs.
+/// Text events only; the `event: finish` block (2026-09-09, finish_reason on the stream) is
+/// returned by [`parse_finish`] instead — it carries no text.
 fn parse_sse(body: &str) -> Vec<(u64, String)> {
+    parse_blocks(body).into_iter().filter(|(_, ev, _)| ev.as_deref() != Some("finish")).map(|(id, _, d)| (id, d)).collect()
+}
+
+fn parse_finish(body: &str) -> Option<(u64, String)> {
+    parse_blocks(body).into_iter().find(|(_, ev, _)| ev.as_deref() == Some("finish")).map(|(id, _, d)| (id, d))
+}
+
+fn parse_blocks(body: &str) -> Vec<(u64, Option<String>, String)> {
     let mut out = Vec::new();
     for block in body.split("\n\n") {
-        let (mut id, mut data) = (None, None);
+        let (mut id, mut ev, mut data) = (None, None, None);
         for line in block.lines() {
             if let Some(v) = line.strip_prefix("id:") {
                 id = v.trim().parse::<u64>().ok();
+            } else if let Some(v) = line.strip_prefix("event:") {
+                ev = Some(v.trim().to_string());
             } else if let Some(v) = line.strip_prefix("data:") {
                 data = Some(v.strip_prefix(' ').unwrap_or(v).to_string());
             }
         }
         if let (Some(id), Some(data)) = (id, data) {
-            out.push((id, data));
+            out.push((id, ev, data));
         }
     }
     out
@@ -247,6 +260,8 @@ async fn sse_stream_has_dense_ids_and_emit_after_commit_text() {
     assert_eq!(events.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5], "dense ids");
     let text: String = events.iter().map(|(_, d)| d.as_str()).collect();
     assert_eq!(text, "Hello", "emitted text is the durable generation");
+    // The stream says why it ended, with the next dense id (2026-09-09, ruling item 2).
+    assert_eq!(parse_finish(&body), Some((6, "length".to_string())), "the finish event follows the last text event with a dense id");
 }
 
 #[tokio::test]
@@ -294,8 +309,9 @@ fn make_blocking_app(started: Arc<AtomicUsize>, release: Arc<tokio::sync::Notify
         tokio::spawn(async move {
             release.notified().await;
             for (pos, b) in "Hello".bytes().enumerate() {
-                let _ = tx.send(SampledToken { output_pos: pos as i64, token_id: b as u32, snapshot: snapshot(pos as i64) }).await;
+                let _ = tx.send(GenEvent::Token(SampledToken { output_pos: pos as i64, token_id: b as u32, snapshot: snapshot(pos as i64) })).await;
             }
+            let _ = tx.send(GenEvent::Finish(hydra_coordinator::FinishReason::Length)).await;
         });
         rx
     });

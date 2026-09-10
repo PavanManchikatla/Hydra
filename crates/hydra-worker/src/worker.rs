@@ -726,6 +726,14 @@ impl Worker {
         expected_checkpoint_id: u64,
     ) -> Result<Vec<Vec<u8>>, WorkerError> {
         let fence = &self.cfg.fence;
+        // F2 on the SAMPLER plane (2026-09-10, found by the stage-loss oracle's probe): a
+        // `SAMPLE_NEXT` at a stale epoch was EXECUTED against live sampler state — the frame's
+        // epoch was never compared to the stage's here (the apply path has `data_plane_fence`;
+        // this path had none), and the reply even echoed the stale epoch. A fenced-forward
+        // survivor must answer `ERR_FENCED`, exactly as it does for `APPLY_TOKEN`.
+        if epoch != self.stage.epoch() {
+            return Ok(vec![wire::encode_error(fence, self.stage.epoch(), self.stage.attempt(), ERR_FENCED)]);
+        }
         let Some(sampler) = self.sampler.as_mut() else {
             return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);
         };
@@ -769,6 +777,10 @@ impl Worker {
         checkpoint_id: u64,
         snapshot: &[u8],
     ) -> Result<Vec<Vec<u8>>, WorkerError> {
+        // The same F2 fence as `on_sample_next`: a checkpoint install at a stale epoch is refused.
+        if epoch != self.stage.epoch() {
+            return Ok(vec![wire::encode_error(&self.cfg.fence, self.stage.epoch(), self.stage.attempt(), ERR_FENCED)]);
+        }
         let fence = &self.cfg.fence;
         let Some(sampler) = self.sampler.as_mut() else {
             return Ok(vec![wire::encode_error(fence, epoch, 0, ERR_CHECKPOINT_MISMATCH)]);

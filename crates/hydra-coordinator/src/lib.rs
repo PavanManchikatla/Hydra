@@ -24,4 +24,4 @@ pub use commit_stream::{CommitError, CommitStream, Durability, GroupBatch, Group
 pub use event_log::{Event, EventLog};
 pub use recovery::{CommitStreamStats, RecoveryError, RecoveryState};
 pub use server::{AuthConfigError, MAX_REQUEST_BODY_BYTES, MIN_API_TOKEN_LEN, router, ApiAuth, AppState, GenFn};
-pub use session::{CommitOutcome, PieceSource, SampledToken, Session, TokenizerPieces};
+pub use session::{CommitOutcome, PieceSource, SampledToken, Session, TokenizerPieces, FinishReason, GenEvent};

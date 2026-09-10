@@ -21,6 +21,7 @@ pub struct Violation {
 pub fn check(c: &Coordinator) -> Vec<Violation> {
     let mut v = Vec::new();
     abort_finality(c, &mut v);
+    supersede_evidence(c, &mut v);
     decision_monotone(c, &mut v);
     service_safety(c, &mut v);
     v
@@ -126,6 +127,18 @@ fn abort_finality(c: &Coordinator, out: &mut Vec<Violation>) {
 
 /// **DecisionMonotone (I10a/WAL):** any post-decision coordinator state is backed by a durable
 /// COMPLETE for the current epoch — a decision is never claimed without its WAL evidence.
+/// **SupersedeEvidence (F-UNSERVABLE / spec §6.7):** the SUPERSEDING state rests on a durable
+/// `ACTIVATION_UNSERVABLE` record — the model writes the record and enters SUPERSEDING in one
+/// action (`CoordRecordUnservable`), so the state without the record is a state the model cannot
+/// reach. Added 2026-09-09 (ruling item 3): the code-level Mut5 omits exactly that record from the
+/// SM's durable log, and after spec §6.5a a restart rebuilds from the disk, so the omission no
+/// longer reaches any restart — this invariant is what now catches it, immediately.
+fn supersede_evidence(c: &Coordinator, out: &mut Vec<Violation>) {
+    if c.state() == CoordState::Superseding && !c.wal().iter().any(|r| matches!(r, WalRecord::ActivationUnservable { .. })) {
+        out.push(Violation { invariant: "SupersedeEvidence", detail: "SUPERSEDING without a durable ACTIVATION_UNSERVABLE in the SM's log".to_string() });
+    }
+}
+
 fn decision_monotone(c: &Coordinator, out: &mut Vec<Violation>) {
     let post_decision = matches!(
         c.state(),

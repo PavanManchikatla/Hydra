@@ -50,6 +50,11 @@ fn stage_cfg(fence: &SessionFence, path: &str, k: i32, n_ctx: i32, rank: u16) ->
     }
 }
 
+thread_local! {
+    /// The finish reason of the last stream `stream_until` read (None if the stream carried none).
+    static LAST_FINISH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Open a streaming POST and read SSE events until `stop_after` events have arrived (or the stream
 /// ends); returns the events seen. The connection is dropped on return.
 fn stream_until(port: u16, ca: &tokio_rustls::rustls::pki_types::CertificateDer<'static>, token: &str, last_event_id: Option<u64>, stop_after: Option<usize>) -> Vec<(u64, String)> {
@@ -101,6 +106,7 @@ fn stream_until(port: u16, ca: &tokio_rustls::rustls::pki_types::CertificateDer<
         }
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
+    LAST_FINISH.with(|f| *f.borrow_mut() = parse_sse_finish(text.split("\r\n\r\n").nth(1).unwrap_or("")));
     let tail_from = text.len().saturating_sub(600);
     eprintln!("[oracle] stream tail (last {} bytes): {:?}", text.len() - tail_from, &text[tail_from..]);
     assert!(text.lines().next().unwrap_or("").contains(" 200 "), "expected 200: {text}");
@@ -119,6 +125,12 @@ struct Fixture {
     k: i32,
     n_ctx: i32,
     max_tokens: usize,
+}
+
+impl Fixture {
+    fn is_eog(&self, t: u32) -> bool {
+        hydra_tokenizer::Tokenizer::load_vocab_only(&self.model).unwrap().is_eog(t)
+    }
 }
 
 fn fixture() -> Option<Fixture> {
@@ -147,7 +159,7 @@ fn fixture() -> Option<Fixture> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let golden: Vec<u32> = rt.block_on(async {
         let connector = ref_cluster.coordinator_connector().unwrap();
-        run_generation(&connector, &Endpoints::new(r1, "worker-s1", r2, "worker-s2"), &fence, &SamplingConfig::greedy(), &admission.prompt_tokens, max_tokens).await.expect("reference")
+        run_generation(&connector, &Endpoints::new(r1, "worker-s1", r2, "worker-s2").with_model(&model), &fence, &SamplingConfig::greedy(), &admission.prompt_tokens, max_tokens).await.expect("reference")
     });
     let golden_text = String::from_utf8_lossy(&tokenizer.decode_bytes(&golden).unwrap()).into_owned();
     Some(Fixture { dir, ca, token, fence, stages_arg: format!("worker-s1={s1},worker-s2={s2}"), golden_text, golden, model, k, n_ctx, max_tokens })
@@ -206,6 +218,10 @@ fn window(f: &Fixture, label: &str, kill_after: Option<usize>, crash_at: Option<
     let (_proc2, rx2) = spawn_coordinator(&argv2, &[]);
     assert!(wait_listening(&rx2, 30), "[{label}] the restarted binary never listened");
     let suffix = stream_until(port2, &ca_der, &f.token, Some(last_seen), None);
+    // The resumed stream says why it ended, and it ended where the reference did (2026-09-09, item 2).
+    let finish = LAST_FINISH.with(|f| f.borrow().clone());
+    let expected = if f.golden.last().map(|&t| f.is_eog(t)).unwrap_or(false) { "stop" } else { "length" };
+    assert_eq!(finish.as_deref(), Some(expected), "[{label}] the resumed stream's finish_reason must be present and match where the reference stopped");
 
     // ---- (a) SSE id continuity across the reconnect ----
     let all: Vec<(u64, String)> = prefix.iter().cloned().chain(suffix.iter().cloned()).collect();

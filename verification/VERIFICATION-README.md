@@ -23,7 +23,8 @@ liveness properties' job. Use `-checkpoint 1` + `-recover` on time-limited machi
 4. EventuallyStable is literal: crashes bounded by `MaxCrashes` and not fair; productive
    actions weakly fair.
 5. Mutations are CONSTANT flips: `EnableUnservable`, `ResetTruncates`, `AttemptFencing`, `RestartDerivesByMax` (Mut5, 2026-09-02: restart derives the target epoch by MIN — spec §6.5a),
-   `AbortGuardEnabled`.
+   `AbortGuardEnabled`, `AbortTerminal` (Mut4 redesigned 2026-09-09: with both FALSE the durable ABORT does not end the attempt and the stale acks complete it — the LIVE abort-finality decision, no crash needed).
+   **Mut2 (`ResetTruncates = FALSE`) is RETIRED (2026-09-09, design authority item 3), by argument:** `CaseBPure` (I11/I23) says a Case-B replay of `BEGIN_RECOVERY` finds `applied ≤ truncate_to`; Mut2 sabotaged `RESET_RECOVERY_ATTEMPT` into a label-only r-bump so a later Case-B replay would find `applied > truncate_to`. Under spec §6.5a the ONLY senders of a BEGIN are `SendBeginRecovery` from `RECOVERY_STARTED` (entered by `CoordBeginRecovery` — a new recovery at `r = 0` to stages at base, Case A — or by the fence-forward `CoordRestart` at `r + 1`, again Case A), and a Case B needs `m.r ≥ stRId` at the SAME target; after a RESET (`stRId = r + 1`) no BEGIN with `r ≥ stRId` at that target is ever sent, so a label-only reset has no Case B left to poison — the sabotage is unreachable by construction. The constant stays (TRUE everywhere), the invariant STAYS in `Inv` for every baseline leg, the smoke step and the `mut2` runner entry are retired; `Mut2Reset.cfg` is kept as the historical config.
 5b. **Fairness is per-(stage, message-class)** (v0.10.1 patch): receive actions are
    parameterized over their bounded discriminators (epoch, recovery_id, attempt), with
    `WF_vars` quantified over those constant domains. Aggregate-action WF alone would allow
@@ -143,6 +144,15 @@ Rule 16: every line is the classify step's own, quoted.
 | Smoke job | `verdict=GREEN (Mut5 fired: …)` · baseline smoke `success` · `verdict=ESCALATED-SUBSUMED (Mut2 …)` | Red by design until the design authority rules on Mut2/Mut4 (PROJECT_STATE §7.77). |
 
 Why the baselines now drain where they never did: fence-forward removed the restart-replay loops (a restart re-sending the same `BEGIN`/`COMMIT` at the same epoch) that made the pre-§6.5a state space effectively unbounded within the same constants. That is a property of the amended protocol, not of a smaller model — the constants are unchanged.
+
+### Local smoke — 2026-09-10 (ruling 2026-09-09, item 3: Mut4 redesigned, Mut2 retired; `-workers 1 nice -n 19`, rule 7 as restated)
+
+| Config | Result (quoted) | Reading |
+|---|---|---|
+| `smoke/Mut4-AbortFinality.cfg` (`AbortTerminal = FALSE`, `AbortGuardEnabled = FALSE`) | `Error: Invariant AbortFinality is violated.` — trace `StageRebuildStep` ×4 → `CoordWriteIntent` → … (no `CoordCrash` anywhere in it) | **Fires as designed, on the LIVE decision:** with the abort not ending the attempt and the write-guard off, the lingering acks complete an aborted attempt — I25 without a crash. |
+| `Mut5RestartMin.cfg` | `Error: Invariant Inv is violated.` | Fires. |
+| `BaselineSafetyFast.cfg` | `Model checking completed. No error has been found.` — 82 827 distinct — `Finished in 10s` | Clean (the same count as with the first Mut4: `AbortTerminal = TRUE` is the baseline). |
+| `smoke/Mut2-CaseBPure.cfg` | RETIRED — not run | The sabotage is unreachable by construction under spec §6.5a (argument in item 5 above); `CaseBPure` stays in `Inv` for every baseline leg. |
 
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),

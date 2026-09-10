@@ -33,11 +33,11 @@ use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::event_log::Event;
-use crate::session::{CommitOutcome, Session, SampledToken};
+use crate::session::{CommitOutcome, GenEvent, Session};
 
 /// A generation source: given a rendered prompt, start producing sampled tokens on the returned
 /// channel (the real two-worker pipeline in sub-slice C; a canned list in tests).
-pub type GenFn = Arc<dyn Fn(String) -> mpsc::Receiver<SampledToken> + Send + Sync>;
+pub type GenFn = Arc<dyn Fn(String) -> mpsc::Receiver<GenEvent> + Send + Sync>;
 
 /// Per-session shared state the HTTP layer needs for live-tail + resume.
 struct SessionState {
@@ -127,6 +127,10 @@ struct Registry {
     last_checkpoint_id: u64,
     coordinator_state: String,
     by_idempotency: HashMap<String, String>, // Idempotency-Key -> session_id
+    /// A stage was lost and the session is being recovered in place (2026-09-09, ruling item 1):
+    /// between the old stream's `stage_lost` and the re-adoption there is no active session, and a
+    /// reconnect must be told to come back (503 `session_recovering`), never handed a new session.
+    recovering: bool,
     sessions: HashMap<String, Arc<Mutex<SessionState>>>,
     seq: u64,
 }
@@ -145,6 +149,13 @@ impl Registry {
             .iter()
             .find(|(_, st)| !lock_session(st).done)
             .map(|(id, _)| id.clone())
+    }
+    /// The most recently created or adopted session, finished or not — what a reconnect with a
+    /// presented cursor attaches to when nothing is active (audit M16 retains finished sessions
+    /// for exactly this; found by the stage-loss oracle 2026-09-09: the recovered session finished
+    /// before the client's next retry and the reconnect fell into the creation branch).
+    fn latest_session(&self) -> Option<String> {
+        self.sessions.keys().max_by_key(|id| id.rsplit('-').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)).cloned()
     }
 }
 
@@ -300,6 +311,9 @@ pub struct AppState {
     make_session: Arc<dyn Fn(&str) -> Session + Send + Sync>,
     /// Required — see [`ApiAuth`]. There is no unauthenticated construction path.
     auth: ApiAuth,
+    /// Refuses a NEW session before the factory runs (the product binary's one-session limit);
+    /// the library default always allows.
+    creation_gate: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 impl AppState {
@@ -327,9 +341,22 @@ impl AppState {
     /// [`Session`] (its event log already carrying the durable prefix's events) becomes the active
     /// session; `rx` feeds the continuation. A client that reconnects with `Last-Event-ID` attaches
     /// to it (see `chat_completions`) and sees the gapless suffix. Returns the session id.
-    pub fn adopt_resumed(&self, backlog: Vec<Event>, make_session: Box<dyn FnOnce() -> Session + Send>, rx: mpsc::Receiver<SampledToken>) -> String {
+    /// Install the creation gate (see `creation_gate`): consulted before a NEW session is created.
+    pub fn with_creation_gate(mut self, gate: Arc<dyn Fn() -> Result<(), String> + Send + Sync>) -> AppState {
+        self.creation_gate = gate;
+        self
+    }
+
+    /// The session is being recovered in place after a stage loss: a reconnect is told to come
+    /// back (503) until `adopt_resumed` lands. (2026-09-09, ruling item 1.)
+    pub fn set_recovering(&self, on: bool) {
+        self.registry.lock().unwrap_or_else(|p| p.into_inner()).recovering = on;
+    }
+
+    pub fn adopt_resumed(&self, backlog: Vec<Event>, make_session: Box<dyn FnOnce() -> Session + Send>, rx: mpsc::Receiver<GenEvent>) -> String {
         let (id, st) = {
             let mut reg = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            reg.recovering = false;
             reg.seq += 1;
             let id = format!("chatcmpl-resumed-{}", reg.seq);
             let (tx, _rx) = broadcast::channel(256);
@@ -358,13 +385,13 @@ impl AppState {
 
     pub fn new(make_session: Arc<dyn Fn() -> Session + Send + Sync>, gen_fn: GenFn, auth: ApiAuth) -> AppState {
         let make = Arc::new(move |_prompt: &str| make_session());
-        AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session: make, auth }
+        AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session: make, auth, creation_gate: Arc::new(|| Ok(())) }
     }
 
     /// The product constructor (§7.76): the session factory receives the prompt, so it can append
     /// the `INITIAL_COMMIT` with the real prompt tokens before generation starts.
     pub fn with_prompt_aware_session(make_session: Arc<dyn Fn(&str) -> Session + Send + Sync>, gen_fn: GenFn, auth: ApiAuth) -> AppState {
-        AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session, auth }
+        AppState { registry: Arc::new(Mutex::new(Registry::default())), gen_fn, make_session, auth, creation_gate: Arc::new(|| Ok(())) }
     }
 }
 
@@ -476,7 +503,7 @@ async fn chat_completions(
         if let Some(id) = idempotency.as_ref().and_then(|k| reg.by_idempotency.get(k).cloned()) {
             let s = reg.sessions.get(&id).unwrap().clone();
             (id, s, false)
-        } else if let (Some(_), Some(active)) = (last_event_hdr, reg.active_session()) {
+        } else if let (Some(_), Some(active)) = (last_event_hdr, reg.active_session().or_else(|| if reg.recovering { None } else { reg.latest_session() })) {
             // **A reconnect after a coordinator restart (spec §6.5a).** The idempotency map is
             // volatile and did not survive; `Last-Event-ID` is the client's durable cursor (a
             // presented `0` is a cursor too), and the resumed session is the one active session
@@ -509,6 +536,26 @@ async fn chat_completions(
             // every token of every generation it had ever served. Finished sessions are dropped
             // here, oldest first, keeping a bounded tail so `Last-Event-ID` resume still works for
             // a client that reconnects shortly after a generation ends.
+            if reg.recovering {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("content-type", "application/json"), ("retry-after", "2")],
+                    "{\"error\":{\"type\":\"session_recovering\",\"code\":\"stage_lost_recovery_in_progress\",\"message\":\"a stage was lost mid-generation and the session is being recovered in place; reconnect with Last-Event-ID in a moment\"}}".to_string(),
+                )
+                    .into_response();
+            }
+            if let Err(why) = (state.creation_gate)() {
+                // The product binary serves ONE session per process (its commit stream is consumed
+                // by the first); a later prompt used to reach the session factory and PANIC on the
+                // consumed stream (found by the stage-loss oracle, 2026-09-09). The library keeps
+                // allowing sequential sessions; the binary installs a gate that refuses by name.
+                return (
+                    StatusCode::CONFLICT,
+                    [("content-type", "application/json")],
+                    format!("{{\"error\":{{\"type\":\"session_conflict\",\"code\":\"session_creation_refused\",\"message\":\"{why}\"}}}}"),
+                )
+                    .into_response();
+            }
             prune_finished(&mut reg);
             reg.seq += 1;
             let id = format!("chatcmpl-{}", reg.seq);
@@ -564,7 +611,7 @@ async fn chat_completions(
 
 /// The generation pump (runs on the dedicated session thread): consume sampled tokens, commit under
 /// the count-or-50ms-deadline policy (spec §3), and publish only durable events (emit-after-commit).
-async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<Mutex<SessionState>>) {
+async fn pump(mut sess: Session, mut rx: mpsc::Receiver<GenEvent>, st: Arc<Mutex<SessionState>>) {
     let mut deadline = tokio::time::interval(std::time::Duration::from_millis(50));
     deadline.tick().await; // consume the immediate first tick
     // Audit M16: how far the pump has already credited the session for client consumption.
@@ -581,7 +628,22 @@ async fn pump(mut sess: Session, mut rx: mpsc::Receiver<SampledToken>, st: Arc<M
         }
         tokio::select! {
             maybe = rx.recv() => match maybe {
-                Some(tok) => {
+                Some(GenEvent::Finish(reason)) => {
+                    // The generation thread said why it stopped. Flush the final group, then the
+                    // finish event — a client that reads `event: finish` knows the stream ended at
+                    // EOS (`stop`), at the ceiling (`length`), or because a stage died and the
+                    // session is being recovered (`stage_lost`; reconnect with Last-Event-ID).
+                    match sess.finish() {
+                        Ok(evs) => publish(&st, evs),
+                        Err(e) => eprintln!("hydra-coordinator: end-of-generation flush FAILED: {e} — the stream's tail is missing"),
+                    }
+                    let fin = sess.finish_with(reason);
+                    eprintln!("hydra-coordinator: generation finished: finish_reason={}", reason.as_str());
+                    publish(&st, vec![fin]);
+                    lock_session(&st).done = true;
+                    break;
+                }
+                Some(GenEvent::Token(tok)) => {
                     // Audit M5: an out-of-vocabulary token from S_P is an accident under the
                     // honest-worker assumption, and an accident must not become durable. The
                     // generation ends here — loudly, with nothing committed for this token.
@@ -692,7 +754,8 @@ fn async_stream_impl(
 }
 
 fn sse(ev: &Event) -> Result<SseEvent, std::convert::Infallible> {
-    Ok(SseEvent::default().id(ev.id.to_string()).data(ev.data.clone()))
+    let e = SseEvent::default().id(ev.id.to_string()).data(ev.data.clone());
+    Ok(if ev.finish { e.event("finish") } else { e })
 }
 
 // ---- a tiny local async-stream generator (no async-stream crate) ----

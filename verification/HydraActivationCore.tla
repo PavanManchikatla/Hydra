@@ -43,6 +43,10 @@
 (*   EnableUnservable : FALSE removes the ACTIVATION_UNSERVABLE/supersession path      *)
 (*                      (expect: liveness violation / deadlock on post-decision loss)  *)
 (*   ResetTruncates   : FALSE turns RESET_RECOVERY_ATTEMPT into a label-only r-bump    *)
+(*                      (Mut2 — RETIRED 2026-09-09: its sabotage is unreachable by construction *)
+(*                      under spec §6.5a; CaseBPure stays in Inv. See VERIFICATION-README.)     *)
+(*   AbortTerminal    : FALSE keeps the coordinator in COMMITTING after a durable ABORT      *)
+(*                      (Mut4, redesigned 2026-09-09 — with AbortGuardEnabled = FALSE)        *)
 (*                      (expect: CaseBPure invariant violation after catch-up)         *)
 (*   AttemptFencing   : FALSE disables activation_attempt_id fencing                   *)
 (*                      (expect: ServiceSafety violation from a stale INITIAL commit)  *)
@@ -57,7 +61,7 @@ CONSTANTS
     MaxPos,            \* bound on abstract applied positions (e.g. 2)
     MaxCrashes,        \* bound on total crash events => EventuallyStable holds
     MaxCkpt,           \* bound on segment/sampler checkpoint ids (see the note below)
-    EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled,
+    EnableUnservable, ResetTruncates, AttemptFencing, AbortGuardEnabled, AbortTerminal,
     RestartDerivesByMax   \* [2026-09-02 §6.5a] FALSE = MUTATION 5: restart derives the TARGET by MIN
 
 (***************************************************************************************)
@@ -92,7 +96,7 @@ CONSTANTS
 ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 
 ASSUME EnableUnservable \in BOOLEAN /\ ResetTruncates \in BOOLEAN
-       /\ AttemptFencing \in BOOLEAN /\ AbortGuardEnabled \in BOOLEAN
+       /\ AttemptFencing \in BOOLEAN /\ AbortGuardEnabled \in BOOLEAN /\ AbortTerminal \in BOOLEAN
        /\ RestartDerivesByMax \in BOOLEAN
 
 NoGen == 0
@@ -388,7 +392,14 @@ CoordAbortActivation ==                            \* pre-decision only (I21)
     /\ cState = "COMMITTING" /\ ~completeDurable
     /\ Wal([t |-> "ABORT", tgt |-> recTarget, r |-> rId, a |-> attempt])
     /\ Send([t |-> "ABORT", tgt |-> recTarget, r |-> rId, a |-> attempt])
-    /\ cState' = "READY_ALL"
+    \* MUTATION 4, redesigned 2026-09-09 (design authority, item 3): abort finality's LIVE decision
+    \* is "a durable ABORT ends the attempt" — the coordinator leaves COMMITTING, so the stale
+    \* ACTIVATION_COMMITTED acks still in the network can never complete it. The first Mut4 (the
+    \* I25 write-guard off) only bit through the restart-replay path spec §6.5a removed; the
+    \* redesign sabotages the decision itself: with AbortTerminal = FALSE the abort is written and
+    \* sent but the coordinator STAYS in COMMITTING, and (with the write-guard also off) the
+    \* lingering acks reach CoordWriteComplete — AbortFinality (I25) must fire without any crash.
+    /\ cState' = (IF AbortTerminal THEN "READY_ALL" ELSE "COMMITTING")
     /\ UNCHANGED << activeEpoch, recTarget, rId, attempt, actKind, truncateTo, goal,
         tupleGen, tupleApplied, completeDurable, unservable, complId, predCompl,
         stState, stEpoch, stRId, stAttempt, stGen, stApplied, stFinal, installedCkpt,

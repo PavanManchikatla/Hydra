@@ -610,8 +610,18 @@ impl Coordinator {
                     let (e, r, a) = (self.epoch, self.recovery_id, self.attempt);
                     self.wal.push(WalRecord::ActivationAbort { epoch: e, recovery_id: r, attempt: a });
                     // abort ⇒ FROZEN_READY, retry activation at attempt+1, same recovery_id (I21)
-                    self.committed.clear();
-                    self.state = CoordState::ReadyAll;
+                    // Mut4, redesigned 2026-09-09 (ruling item 3): the LIVE abort-finality decision
+                    // is "a durable ABORT ends the attempt" — the coordinator leaves COMMITTING so
+                    // the stale ACTIVATION_COMMITTED acks still in flight can never complete it.
+                    // Under `mutation_no_abort_finality` the abort is durable and sent but the
+                    // coordinator STAYS in COMMITTING with its acks kept (and the I25 write-guard
+                    // is off): the lingering acks then reach COMPLETE and the checker's I25 fires.
+                    if cfg!(feature = "mutation_no_abort_finality") {
+                        self.state = CoordState::Committing;
+                    } else {
+                        self.committed.clear();
+                        self.state = CoordState::ReadyAll;
+                    }
                 }
             }
         }

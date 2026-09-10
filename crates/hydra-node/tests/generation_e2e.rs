@@ -75,7 +75,7 @@ fn the_shipped_binary_generates_the_pair_drivers_tokens_byte_for_byte() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let golden: Vec<u32> = rt.block_on(async {
         let connector = ref_cluster.coordinator_connector().unwrap();
-        run_generation(&connector, &Endpoints::new(r1, "worker-s1", r2, "worker-s2"), &fence, &SamplingConfig::greedy(), &admission.prompt_tokens, max_tokens).await.expect("reference generation")
+        run_generation(&connector, &Endpoints::new(r1, "worker-s1", r2, "worker-s2").with_model(&model), &fence, &SamplingConfig::greedy(), &admission.prompt_tokens, max_tokens).await.expect("reference generation")
     });
     let golden_text = String::from_utf8_lossy(&tokenizer.decode_bytes(&golden).expect("detok")).into_owned();
     assert!(!golden.is_empty());
@@ -99,6 +99,10 @@ fn the_shipped_binary_generates_the_pair_drivers_tokens_byte_for_byte() {
     assert_eq!(ids, (1..=ids.len() as u64).collect::<Vec<_>>(), "SSE ids must be dense and stable");
     let text: String = events.iter().map(|(_, d)| d.as_str()).collect();
     assert_eq!(text, golden_text, "the binary's stream must be the pair driver's tokens byte for byte");
+    // The stream says why it ended (2026-09-09, item 2): `stop` at the model's EOS, `length` at
+    // the ceiling — and the reference stopped at the same place, so the two agree on which.
+    let expected = if golden.last().map(|&t| tokenizer.is_eog(t)).unwrap_or(false) { "stop" } else { "length" };
+    assert_eq!(parse_sse_finish(&resp).as_deref(), Some(expected), "finish_reason must be present and match where the reference stopped");
 
     // ---- disk truth: the ledger holds the prompt and each sampled position exactly once ----
     let ledger = hydra_coordinator::recovery::read(data.join("commits.wal")).expect("the ledger reads back");

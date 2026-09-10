@@ -318,11 +318,22 @@ pub struct Endpoints {
     pub s1_name: String,
     pub s2_addr: SocketAddr,
     pub s2_name: String,
+    /// The model whose vocabulary decides end-of-generation. When set, `run_generation` stops
+    /// AFTER the first EOS/EOT token (2026-09-09 ruling item 2: the reference is unsplit greedy up
+    /// to the model's EOS/EOT set, and the product must stop where the reference stops). When
+    /// unset, the loop runs to `n_steps` as before — the shape the product's own oracles must NOT
+    /// use, and the shape that let the quickstart stream run past `<|im_end|>` into a "Human:" turn.
+    pub model: Option<String>,
 }
 
 impl Endpoints {
     pub fn new(s1_addr: SocketAddr, s1_name: &str, s2_addr: SocketAddr, s2_name: &str) -> Self {
-        Endpoints { s1_addr, s1_name: s1_name.to_string(), s2_addr, s2_name: s2_name.to_string() }
+        Endpoints { s1_addr, s1_name: s1_name.to_string(), s2_addr, s2_name: s2_name.to_string(), model: None }
+    }
+    /// Stop at the model's end-of-generation set (see the field).
+    pub fn with_model(mut self, path: impl Into<String>) -> Self {
+        self.model = Some(path.into());
+        self
     }
 }
 
@@ -614,6 +625,12 @@ pub async fn run_generation(
 
     prefill(&mut c1, &mut c2, fence, prompt_tokens).await?;
 
+    // End-of-generation: the vocabulary decides, when the caller named the model. Loaded
+    // vocab-only (no weights) — the coordinator-side tokenizer path.
+    let eog = match &ep.model {
+        Some(path) => Some(hydra_tokenizer::Tokenizer::load_vocab_only(path).map_err(|e| format!("tokenizer for EOS: {e}"))?),
+        None => None,
+    };
     let mut out = Vec::with_capacity(n_steps);
     let mut input_pos = prompt_tokens.len() as i64;
     for step in 0..n_steps {
@@ -627,6 +644,11 @@ pub async fn run_generation(
             other => return Err(format!("step {step}: expected SAMPLED, got {other:?}")),
         };
         out.push(token);
+        // The reference stops AFTER an end-of-generation token: the token is part of the output
+        // (its piece is empty), nothing is sampled past it.
+        if eog.as_ref().map(|t| t.is_eog(token)).unwrap_or(false) {
+            break;
+        }
 
         // Feed the sampled token back autoregressively (except after the final step).
         if step + 1 < n_steps {

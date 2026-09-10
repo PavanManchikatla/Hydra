@@ -73,6 +73,7 @@ mod ffi {
             out: *mut i32,
             cap: i32,
         ) -> i32;
+        pub fn hydra_token_is_eog(m: *const HydraModel, token: i32) -> i32;
         pub fn hydra_token_to_piece(
             m: *const HydraModel,
             token: i32,
@@ -273,6 +274,11 @@ mod imp {
 
         /// Render one token to its raw display bytes (`special=false` renders special tokens empty).
         /// The detokenizer substrate: pieces are **bytes**, not strings (I6 UTF-8 safety).
+        /// End-of-generation token (EOS / EOT set of the vocabulary — `llama_vocab_is_eog`). An
+        /// out-of-range id is `false`, never an error: the caller already refused it (audit M5).
+        pub fn is_eog(&self, token: i32) -> bool {
+            unsafe { ffi::hydra_token_is_eog(self.raw, token) == 1 }
+        }
         pub fn token_to_piece(&self, token: i32, special: bool) -> Result<Vec<u8>, EngineError> {
             let need = unsafe { ffi::hydra_token_to_piece(self.raw, token, special as i32, std::ptr::null_mut(), 0) };
             let cap = if need < 0 { -need } else { need };
@@ -510,6 +516,10 @@ mod imp {
         }
         pub fn token_to_piece(&self, _token: i32, _special: bool) -> Result<Vec<u8>, EngineError> {
             Err(EngineError::unavailable())
+        }
+        /// Stub arm: no vocabulary, so nothing is end-of-generation; a stub never stops early.
+        pub fn is_eog(&self, _token: i32) -> bool {
+            false
         }
         pub fn context(
             &self,
