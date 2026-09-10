@@ -194,6 +194,23 @@ Why the baselines now drain where they never did: fence-forward removed the rest
 | `Mut5RestartMin.cfg` | `Error: Invariant Inv is violated.` | Still fires. |
 | `BaselineLivenessD0.cfg` | time-boxed at 900 s (rule 7: local is smoke-only): `Progress(31) … 1,838,189 states generated … 743,585 distinct states found, 148,632 states left on queue`, no violation surfaced | **INCONCLUSIVE locally** — the `baseline-live-d0` leg of the dispatched CI long matrix decides it; not green until that `verdict=` line says so. |
 
+### Gate run — 2026-09-10 (CI run 34516440553, the v0.10.5 model on `4a3f3b0`, `tlc.yml` `long`, dispatched fresh — every pre-amendment checkpoint void, rule 13)
+
+**success, 10/10 legs, 18:47 → 19:20Z.** Every `verdict=` line as classified by the workflow (rule 12):
+
+| Leg | Verdict line (quoted) | Reading |
+|---|---|---|
+| baseline-safety | `config=baseline-safety expect=clean violated=0 complete=1 verdict=GREEN` | Fixpoint, clean. |
+| baseline-safety-fast | `config=baseline-safety-fast expect=clean violated=0 complete=1 verdict=GREEN` | Fixpoint, clean. |
+| **baseline-safety-d0** | `config=baseline-safety-d0 expect=clean violated=0 complete=1 verdict=GREEN` | **The D0 relayed model at the standing bounds: fixpoint, clean (2 169 797 distinct).** |
+| baseline-live | `config=baseline-live expect=clean violated=0 complete=1 verdict=GREEN` — `2094109 distinct … Finished in 32min 31s` | Liveness holds. |
+| **baseline-live-d0** | `config=baseline-live-d0 expect=clean violated=0 complete=1 verdict=GREEN` — `2169797 distinct states found, 0 states left on queue. Finished in 32min 26s` | **Progress / PostDecisionLoss / EventualService hold with the D0 relay ON — the downstream-after-upstream rebuild precondition deadlocks nothing.** Supersedes the local 900 s time-box above. |
+| mut1 | `config=mut1 expect=violation violated=1 complete=0 verdict=GREEN` | Fires. |
+| mut3 / mut3-fast | `config=mut3 expect=violation violated=1 complete=0 verdict=GREEN` · `config=mut3-fast … violated=1 … verdict=GREEN` | Fire. |
+| mut5 | `config=mut5 expect=violation violated=1 complete=0 verdict=GREEN` | Fires. |
+| **mut7** | `config=mut7 expect=violation violated=1 complete=0 verdict=GREEN` | **Fires as designed (RelayedSourcing).** |
+| smoke job (push 34516404773) | `verdict=GREEN (Mut7 tripped RelayedSourcing; rc=12)` · `verdict=GREEN (D0 baseline drained clean: 552471 states generated, 162316 distinct states found, 0 states left on queue.)` · `OK: Mut4 tripped AbortFinality (rc=12)` · `verdict=GREEN (Mut5 fired: …)` | All four smoke checks green on the push. |
+
 ## Roadmap after the core certifies
 - **Model v2 (positions & sampler):** input/output position discipline (I13),
   GENERATION_COMMIT alignment (I19), sampler rollback/installation (I15/I17),
