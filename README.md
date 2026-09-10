@@ -76,10 +76,11 @@ test harness is a *library* claim and says so.
 Every recovery demonstration is held to a three-assertion bar: **SSE id continuity**, **byte-identical
 to an uninterrupted seeded run**, and **disk truth** (no output position committed twice).
 
-**Not yet in the product (stated, not implied):** stage-loss recovery is driven by the harnesses'
-coordinator, not yet by `hydra-coordinator`'s own loss detection; the direct-FWD / D1 topology
-(boundary durability) is the demo binaries' shape, and the shipped coordinator drives the relayed
-two-stage topology only.
+**Not yet in the product (stated, not implied):** loss of the FINAL stage in the relayed topology
+(escalated — PROJECT_STATE §7.80); a second stage loss in the same session (reported, not recovered);
+a loss after a first recovery (the replacement's bootstrap is static at epoch 0); the direct-FWD / D1
+topology (boundary durability) is the demo binaries' shape, and the shipped coordinator drives the
+relayed two-stage topology only (item 8 — the owner's letter).
 
 ---
 
@@ -226,7 +227,7 @@ Certificate verification is real here — no `-k`. Without the token you get `40
 you get a TLS failure, not a warning. **The stream carries tokens the two stages produced**, sampled
 greedily at the final stage and committed to the coordinator's ledger before each one is sent.
 
-> **Status of this quickstart, precisely.** Re-executed as written by `scripts/quickstart-check.sh` — which asserts the observable, not the status code: text events > 0, an `event: finish`, `finish_reason = stop` (the stream ended at the model's EOS), 401 without the token. Result on the committed HEAD: QUICKSTART_RESULT_PLACEHOLDER. The 30-minute DoD is still NOT claimed: no non-author has run it (M4-GATE row 1).
+> **Status of this quickstart, precisely.** Re-executed as written by `scripts/quickstart-check.sh` — which asserts the observable, not the status code: text events > 0, an `event: finish`, `finish_reason = stop` (the stream ended at the model's EOS), 401 without the token. Result on the committed HEAD: `verdict=GREEN (quickstart: HTTP 200, 6 text events, finish_reason=stop, 401 without the token)` on `ece9544`, 2026-09-10T17:18Z, by `scripts/quickstart-check.sh`; the text was `Hello! How can I assist you today?`. The 30-minute DoD is still NOT claimed: no non-author has run it (M4-GATE row 1).
 >
 > **What is still unverified is the DoD itself:** M4 requires that a *non-author* complete this in
 > under 30 minutes on a *fresh account*. That has not happened yet, so the 30-minute claim is an
