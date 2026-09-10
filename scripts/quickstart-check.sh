@@ -35,13 +35,16 @@ HTTP=$(grep -E '^HTTP [0-9]+$' "$OUT/curl.out" | tail -1 | awk '{print $2}')
 python3 - "$OUT/curl.out" > "$OUT/sse.json" <<'PY'
 import sys, json
 raw=open(sys.argv[1], errors='replace').read().replace('\r\n','\n')
-body=raw.split('\n\n',1)[1] if '\n\n' in raw else raw
+# curl writes the bare SSE body (no -i): every blank-line-separated block is one event; the
+# trailing 'HTTP <code>' line is the -w footer. The first block is an event, not a header.
+body=raw.rsplit('\nHTTP ',1)[0] if '\nHTTP ' in raw else raw
 text_events=0; finish=None; text=''
-for block in body.split('\n\n'):
+for block in body.replace('\r\n','\n').split('\n\n'):
     ev=None; data=[]
     for line in block.split('\n'):
         if line.startswith('event:'): ev=line[6:].strip()
-        elif line.startswith('data:'): data.append(line[5:].lstrip(' ') if line.startswith('data: ') else line[5:])
+        elif line.startswith('data:'):
+            v=line[5:]; data.append(v[1:] if v.startswith(' ') else v)   # ONE space after the colon is the SSE separator, not text
     if not data and ev is None: continue
     if ev=='finish': finish='\n'.join(data)
     elif data: text_events+=1; text+='\n'.join(data)

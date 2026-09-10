@@ -298,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for b in boundaries.iter().take(input_pos as usize) { rebuild_apply(&mut rcp, &fence, b.first_input_pos, &b.activations).await?; }
     rcp.send(0, &wire::encode_catch_up_context(&fence, 0, 1, input_pos)).await?;
     match wire::decode(&rcp.recv().await?.payload, &fence)?.1 { Msg::CatchUpReady { .. } => {} o => return Err(format!("expected CATCH_UP_READY, got {o:?}").into()) }
-    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await?;
+    rcp.send(0, &wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy()))).await?;
     match wire::decode(&rcp.recv().await?.payload, &fence)?.1 { Msg::SamplerCheckpointInstalled { .. } => {} o => return Err(format!("expected INSTALLED, got {o:?}").into()) }
     activate(&mut rcp, &fence, ActivationKind::Recovery, 1, 1).await?;
     let detect_to_resumed = t_detect.elapsed();

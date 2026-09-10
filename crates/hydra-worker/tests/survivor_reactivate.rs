@@ -96,7 +96,7 @@ async fn active_survivor_freeze_reinstall_reactivate_converges() {
         o => panic!("expected CATCH_UP_READY, got {o:?}"),
     }
     // Re-install the sampler checkpoint (I17: install before activation).
-    match send_recv(&mut c, &fence, wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy())), "INSTALL_SAMPLER_CHECKPOINT").await {
+    match send_recv(&mut c, &fence, wire::encode_install_sampler_checkpoint(&fence, 1, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy())), "INSTALL_SAMPLER_CHECKPOINT").await {
         Msg::SamplerCheckpointInstalled { .. } => {}
         o => panic!("expected SAMPLER_CHECKPOINT_INSTALLED, got {o:?}"),
     }
@@ -125,7 +125,7 @@ async fn active_survivor_reactivation_converges_100x() {
             Msg::CatchUpReady { .. } => {}
             o => panic!("iter {i}: expected CATCH_UP_READY, got {o:?}"),
         }
-        match send_recv(&mut c, &fence, wire::encode_install_sampler_checkpoint(&fence, 0, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy())), "INSTALL").await {
+        match send_recv(&mut c, &fence, wire::encode_install_sampler_checkpoint(&fence, i, INITIAL_CHECKPOINT_ID, &initial_checkpoint_bytes(INITIAL_CHECKPOINT_ID, &greedy())), "INSTALL").await {
             Msg::SamplerCheckpointInstalled { .. } => {}
             o => panic!("iter {i}: expected INSTALLED, got {o:?}"),
         }
