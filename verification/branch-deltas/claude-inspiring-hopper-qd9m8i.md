@@ -50,3 +50,38 @@
   ```
   The engine-gated product oracles and the real arm themselves: **NOT RUN HERE** (no model in a cloud
   container). The CI run's verdicts are quoted in the next entry.
+
+## 2026-09-24 — lane C: first CI run read (INCONCLUSIVE by design: unpinned); model hash pinned; pipefail
+
+- **Commits:** `378ddcc` (previous entry); this commit
+- **What changed in reality:**
+  - The first run of the workflow ([run 36073107311](https://github.com/PavanManchikatla/Hydra/actions/runs/36073107311),
+    `pull_request` on `378ddcc`, merge ref `026748f`) ran on `ubuntu-24.04` image `20260920.314.1`,
+    **Linux x86_64**, `nproc=4`, `MemTotal: 16373452 kB`, `SwapTotal: 3145724 kB`, 86 G free disk;
+    `stable` = `rustc 1.98.1 (48a229cea 2026-09-01)`; engine pin `c00bcebf…` restored from fuzz.yml's
+    cache key. Both scopes ended INCONCLUSIVE at the model step, as the unpinned commit required; no
+    test ran. The helper self-tests (all three) printed `selftest verdict=GREEN` on the runner.
+  - **The model is pinned:** `MODEL_SHA256=8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc`
+    (1 266 425 696 bytes) at HF revision `12145bd1d629190a4d44254073650877954d02c9`. Basis: the hash the
+    runner measured equals the hash HF advertised for that revision (`x-linked-etag`), in both jobs.
+    One origin, two readings, so not independent evidence. **Identity with the owner's local model is
+    still unestablished**; the owner can settle it with one `shasum -a 256`.
+  - **Workflow defect found in the log and fixed:** `run:` steps executed as `bash -e {0}` (no pipefail),
+    so the classify step's `… | tee classify.log || rc=1` could never fail the job. `defaults.run.shell:
+    bash` now gives `-eo pipefail`. No verdict line was wrong; only the job status could have
+    contradicted it.
+- **Lands in:** §0(b), §6 (the workflow's "cannot see" line), §12.
+- **Receipts (verbatim, from the job logs):**
+  ```
+  runner.os=Linux runner.arch=X64
+  Linux runnervmtr4k5 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+  nproc=4
+  MemTotal:       16373452 kB
+  model: advertised x-repo-commit: 12145bd1d629190a4d44254073650877954d02c9
+  model: advertised x-linked-size: 1266425696
+  model: advertised x-linked-etag: "8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc"
+  observed-sha256=8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc bytes=1266425696
+  verdict=INCONCLUSIVE (no pinned SHA-256 — expected 'UNPINNED' is not 64 hex digits; the file was deleted unused)
+  scope=oracles verdict=INCONCLUSIVE (the model was not VERIFIED — see the model verdict above; no test was run)
+  scope=targeted verdict=INCONCLUSIVE (the model was not VERIFIED — see the model verdict above; no test was run)
+  ```

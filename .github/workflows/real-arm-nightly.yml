@@ -46,12 +46,25 @@ on:
 permissions:
   contents: read
 
+# `shell: bash` makes every `run:` step `bash --noprofile --norc -eo pipefail {0}`. Without it the
+# steps ran as `bash -e {0}` (run 36073107311's log), so `classify | tee … || rc=1` could never set
+# rc=1 — the job would have exited 0 on an INCONCLUSIVE scope. The job status is not evidence
+# (rule 16), but it must not contradict the verdict line either.
+defaults:
+  run:
+    shell: bash
+
 env:
   # Qwen2.5-0.5B-Instruct, fp16 GGUF — the dev model every engine-gated test defaults to
   # (`models/qwen2.5-0.5b-instruct-fp16.gguf`, hydra-worker::pair::dev_model_path). The URL is pinned
   # to a repository REVISION, not `main`; the bytes are pinned by SHA-256 and verified before use.
   MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/12145bd1d629190a4d44254073650877954d02c9/qwen2.5-0.5b-instruct-fp16.gguf
-  MODEL_SHA256: UNPINNED
+  # Pinned 2026-09-24 from run 36073107311 (pull_request, the first run of this workflow): the hash
+  # the runner MEASURED (`observed-sha256=8e0ae260…cf3fc bytes=1266425696`) equals the hash Hugging
+  # Face ADVERTISED for the same revision (`x-linked-etag`, `x-linked-size: 1266425696`,
+  # `x-repo-commit: 12145bd1…`). Two readings from one origin, not an independent source: the owner
+  # can confirm against the Mac's copy with `shasum -a 256 models/qwen2.5-0.5b-instruct-fp16.gguf`.
+  MODEL_SHA256: 8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc
   MODEL_PATH: models/qwen2.5-0.5b-instruct-fp16.gguf
 
 jobs:
