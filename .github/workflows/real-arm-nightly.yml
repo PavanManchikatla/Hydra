@@ -1,0 +1,228 @@
+name: real-arm-nightly
+
+# **The real arm in CI (lane C, 2026-09-24).** Until this workflow, the engine-gated tests and the
+# three product oracles ran ONLY on the owner's Mac; `scripts/real-arm-nightly.sh` + its launchd
+# plist (packaging/launchd/) were written for that and never installed (PROJECT_STATE §0(b)). Both
+# stay untouched: the ruling retires the plist only after three consecutive nightly GREEN receipts
+# from THIS workflow, quoted.
+#
+# WHAT A RESULT HERE IS A CLAIM ABOUT — say it every time one is quoted:
+#   - OS/arch: Linux x86_64 on a GitHub-hosted `ubuntu-latest` runner (the job prints `uname -a`,
+#     `nproc`, MemTotal). **A Linux result is not a macOS claim** — Metal, the Mac's allocator and the
+#     8 GB machine's paging are all outside it.
+#   - Engine: the pinned fork (`vendor/llama.cpp`), built CPU-ONLY (no GPU backend is configured;
+#     the tests themselves set n_gpu_layers 0) — M4-GATE row 4's CPU-only evidence, nothing more.
+#   - Model: the file at MODEL_URL whose SHA-256 is MODEL_SHA256. That it is byte-identical to the
+#     owner's local `models/qwen2.5-0.5b-instruct-fp16.gguf` is NOT established by this workflow.
+#
+# RECEIPTS come ONLY from scripts/test-receipt.sh (rule 16), one per scope (the matrix below), and
+# scripts/real-arm-classify.sh quotes its `arm=`/`verdict=` lines unchanged and adds the one thing
+# the receipt cannot express: an engine-gated test that finds no model prints `SKIP:` and is
+# COUNTED AS PASSED by libtest (observed 2026-09-24: passed=8 verdict=GREEN with 8 skips). A skip is
+# INCONCLUSIVE here, as is a zero-test run (rule 25) and a stub engine build.
+#
+# RULE-19 ORACLE FOR THIS WORKFLOW: dispatch with `corrupt_model_hash: true`. The pin is altered
+# (last hex digit flipped) before the fetch, so every scope MUST print
+#   verdict=INCONCLUSIVE (model SHA-256 mismatch: expected …, observed … — the file was deleted unused)
+#   scope=<scope> verdict=INCONCLUSIVE (the model was not VERIFIED …)
+# and run NO test. Anything else — above all any GREEN — means the guard is broken. Independently,
+# every normal run re-checks the guard against the REAL verified file (hard link + flipped pin),
+# and both helper scripts' `--selftest`s run first.
+
+on:
+  schedule:
+    - cron: '23 2 * * *'   # nightly 02:23 UTC
+  workflow_dispatch:
+    inputs:
+      corrupt_model_hash:
+        description: 'RULE-19 SELF-TEST ONLY: flip the last hex digit of the pinned model SHA-256. Every scope must print verdict=INCONCLUSIVE (model SHA-256 mismatch) and run no test. Leave false for a real run.'
+        type: boolean
+        required: false
+        default: false
+  pull_request:
+    paths:
+      - '.github/workflows/real-arm-nightly.yml'
+
+permissions:
+  contents: read
+
+env:
+  # Qwen2.5-0.5B-Instruct, fp16 GGUF — the dev model every engine-gated test defaults to
+  # (`models/qwen2.5-0.5b-instruct-fp16.gguf`, hydra-worker::pair::dev_model_path). The URL is pinned
+  # to a repository REVISION, not `main`; the bytes are pinned by SHA-256 and verified before use.
+  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/12145bd1d629190a4d44254073650877954d02c9/qwen2.5-0.5b-instruct-fp16.gguf
+  MODEL_SHA256: UNPINNED
+  MODEL_PATH: models/qwen2.5-0.5b-instruct-fp16.gguf
+
+jobs:
+  real-arm:
+    name: real arm — ${{ matrix.scope }} (Linux x86_64, CPU-only)
+    runs-on: ubuntu-latest
+    # The Actions job limit on GitHub-hosted runners is 6 h; each scope is its own job so neither
+    # has to fit beside the other. 330 min leaves the receipt time to be written if a suite hangs.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # (a) The three product oracles against the SHIPPED binaries (rule 27): hydra-coordinator
+          #     (crate hydra-node) and hydra-worker, spawned as OS processes and kill -9'd.
+          - scope: oracles
+            cargo: -p hydra-node --test generation_e2e --test restart_e2e --test stage_loss_e2e
+          # (b) The targeted real arm: hydra-state's suites, hydra-node's non-oracle binary suites,
+          #     and the hydra-worker recovery suites. The owner's Mac-side selection (10 suites,
+          #     2026-09-10) is not recorded in the tree, so this list is NAMED here and its counts are
+          #     not comparable with that receipt's.
+          - scope: targeted
+            cargo: -p hydra-state -p hydra-node -p hydra-worker --test coordinator --test ledger --test recovery --test stage --test stage_case_a_guard --test supersede --test binary_auth --test binary_restart --test token_file --test d1_recovery --test three_node_recovery --test survivor_reactivate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Record the machine (every result names its OS/arch)
+        run: |
+          echo "runner.os=${{ runner.os }} runner.arch=${{ runner.arch }}"
+          uname -a
+          echo "nproc=$(nproc)"
+          grep -E '^(MemTotal|MemAvailable|SwapTotal):' /proc/meminfo
+          df -h . | tail -1
+
+      - name: Self-tests of the helper scripts (their oracles run before they are trusted)
+        run: |
+          scripts/real-arm-model.sh --selftest
+          scripts/real-arm-classify.sh --selftest
+          scripts/test-receipt.sh --selftest
+
+      # ---- engine: the same steps as fuzz.yml, the same cache key (so the two share a build) ----
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Record the engine pin (the receipt names it; the cache is keyed on it)
+        id: pin
+        run: |
+          sha=$(git -C vendor/llama.cpp rev-parse HEAD)
+          echo "engine-pin=$sha"
+          echo "engine-pin-status=$(git -C vendor/llama.cpp status --porcelain | wc -l | tr -d ' ') modified files (must be 0)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the engine build tree
+        id: engine-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/llama.cpp/build
+          key: engine-build-v1-${{ runner.os }}-${{ steps.pin.outputs.sha }}-cpu-shared-nonative
+
+      - name: Build the vendored engine (llama + ggml-cpu, shared, CPU only)
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S vendor/llama.cpp -B vendor/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build vendor/llama.cpp/build --target llama -j"$(nproc)"
+          ls -la vendor/llama.cpp/build/bin/ | grep -E 'libllama|libggml' || { echo "engine libs missing after build"; exit 1; }
+
+      # ---- model: pinned URL, SHA-256 verified before use, cached on the hash ----
+      - name: Resolve the model pin (and the rule-19 corruption, if dispatched)
+        id: model
+        env:
+          CORRUPT: ${{ github.event.inputs.corrupt_model_hash == 'true' && '1' || '' }}
+        run: |
+          want="$MODEL_SHA256"
+          if [ -n "$CORRUPT" ]; then
+            last="${want: -1}"; if [ "$last" = "0" ]; then flip=1; else flip=0; fi
+            want="${want%?}$flip"
+            echo "corrupt_model_hash=true — RULE-19 SELF-TEST: the pin is altered to $want; every scope MUST end INCONCLUSIVE and run no test"
+          fi
+          echo "pinned-sha256=$want"
+          echo "sha=$want" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the model (keyed on its pinned hash)
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: real-arm-model-v1-${{ steps.model.outputs.sha }}
+
+      - name: Fetch and verify the model (a mismatch or a failed fetch is INCONCLUSIVE, never a skip)
+        id: verify
+        run: |
+          set -o pipefail
+          scripts/real-arm-model.sh "$MODEL_PATH" "$MODEL_URL" "${{ steps.model.outputs.sha }}" 2>&1 | tee model-verify.log
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save the model cache (only a VERIFIED file is ever cached)
+        if: steps.verify.outputs.verified == 'true' && steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: real-arm-model-v1-${{ steps.model.outputs.sha }}
+
+      - name: Live check of the hash guard on the real file (must refuse a flipped pin)
+        if: steps.verify.outputs.verified == 'true'
+        run: |
+          want="${{ steps.model.outputs.sha }}"; last="${want: -1}"; if [ "$last" = "0" ]; then flip=1; else flip=0; fi
+          ln "$MODEL_PATH" "$MODEL_PATH.guard-check"
+          if scripts/real-arm-model.sh "$MODEL_PATH.guard-check" "$MODEL_URL" "${want%?}$flip" > guard.log 2>&1; then
+            cat guard.log; echo "verdict=RED (the hash guard ACCEPTED a flipped pin on the real file — nothing it verified can be trusted)"; exit 1
+          fi
+          cat guard.log
+          grep -q '^verdict=INCONCLUSIVE (model SHA-256 mismatch' guard.log || { echo "verdict=RED (the guard refused, but not as a mismatch)"; exit 1; }
+          test -f "$MODEL_PATH" || { echo "verdict=RED (the guard deleted the verified file)"; exit 1; }
+          echo "hash-guard=OK (flipped pin refused as a mismatch on the real file; the verified file is intact)"
+
+      # ---- the receipt: scripts/test-receipt.sh, real arm only, one scope ----
+      - name: Receipt (${{ matrix.scope }}) — scripts/test-receipt.sh
+        if: steps.verify.outputs.verified == 'true'
+        env:
+          HYDRA_TEST_ENV: HYDRA_TEST_MODEL=${{ github.workspace }}/${{ env.MODEL_PATH }}
+          # libtest --show-output: a PASSING test's captured `SKIP:` line reaches the stdout log, so
+          # the classify step can tell a skip from a pass (test-receipt.sh appends this after --).
+          HYDRA_TEST_FILTER: --show-output
+        run: |
+          scripts/test-receipt.sh --arms real --out receipt -- ${{ matrix.cargo }} 2>&1 | tee receipt.log || true
+
+      - name: Classify (rule 16 — the verdict lines, never the job status)
+        if: always()
+        run: |
+          {
+            echo "### real arm — ${{ matrix.scope }}"
+            echo
+            echo "machine: runner.os=${{ runner.os }} runner.arch=${{ runner.arch }} · $(uname -srm) · nproc=$(nproc) · $(grep MemTotal /proc/meminfo | tr -s ' ') · engine CPU-only @ ${{ steps.pin.outputs.sha }} · trigger=${{ github.event_name }} · commit=${{ github.sha }}"
+            echo
+            echo '```'
+            grep -E '^(observed-sha256=|verdict=|model: advertised)' model-verify.log 2>/dev/null || echo "(no model-verify log)"
+            grep -E '^hash-guard=' guard.log 2>/dev/null || true
+          } > summary.md
+          if [ "${{ steps.verify.outputs.verified }}" != "true" ]; then
+            v="scope=${{ matrix.scope }} verdict=INCONCLUSIVE (the model was not VERIFIED — see the model verdict above; no test was run)"
+            echo "$v"; { echo "$v"; echo '```'; } >> summary.md
+            cat summary.md >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+          grep -E '^test-receipt: ' receipt.log | head -2 >> summary.md || true
+          rc=0; scripts/real-arm-classify.sh "${{ matrix.scope }}" receipt.log receipt | tee classify.log || rc=1
+          grep -E '^scope=' classify.log >> summary.md
+          if grep -qE '^test result:' receipt/real.stdout 2>/dev/null; then
+            echo "test-result sums per suite:" >> summary.md
+            grep -E '^test result:' receipt/real.stdout >> summary.md
+          fi
+          if grep -qE '^test .* FAILED$' receipt/real.stdout 2>/dev/null; then grep -E '^test .* FAILED$' receipt/real.stdout >> summary.md; fi
+          echo '```' >> summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload the logs (the receipt's raw source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-arm-${{ matrix.scope }}
+          path: |
+            summary.md
+            model-verify.log
+            guard.log
+            receipt.log
+            classify.log
+            receipt/
+          if-no-files-found: ignore
+          retention-days: 90
