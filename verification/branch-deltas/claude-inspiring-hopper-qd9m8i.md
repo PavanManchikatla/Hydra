@@ -110,3 +110,79 @@
   ```
   (The mismatch line above is the **live hash-guard check** on the real file, with a deliberately
   flipped pin. The real verification in that job passed.)
+
+## 2026-09-25 — lane C: first GREEN receipts of the real arm in CI (Linux x86_64, CPU-only), with evidence
+
+- **Commits:** `223de2c` (previous entry); this commit (the session report)
+- **What changed in reality:** Run [36076105524](https://github.com/PavanManchikatla/Hydra/actions/runs/36076105524)
+  (`pull_request`, head `223de2c`; the targeted job's summary line names merge commit `436e882`) produced both scopes
+  GREEN **on Linux x86_64, CPU-only engine `c00bcebf`, rustc 1.98.1, model sha256 `8e0ae260…cf3fc`
+  re-hashed after a cache restore**, with the evidence in the job log. **This is the first time the
+  three product oracles and the engine-gated worker recovery suites have run anywhere except the
+  owner's Mac.** It is **not a macOS claim** (no Metal, not the 8 GB machine), and it covers two
+  scopes, not the full real arm. The generation oracle's stream on this runner is `Hello! How can I
+  assist you today?` with `finish: stop`, the same text §0(b) quotes from the Mac quickstart.
+  **Counts toward the plist retirement:** this is a `pull_request` run, not a nightly. The ruling asks
+  for three consecutive **nightly** GREEN receipts, so the count is **0 / 3** until the workflow is on
+  `main` and the schedule fires.
+  **Not run:** the dispatched `corrupt_model_hash: true` oracle, because `workflow_dispatch` only
+  exists for a workflow on the default branch. Its required outcome (every scope
+  `verdict=INCONCLUSIVE (model SHA-256 mismatch …)` then `scope=… verdict=INCONCLUSIVE (the model was
+  not VERIFIED …)`, no test run) is **NOT RUN HERE** and is owed after merge. The same guard was
+  observed refusing a flipped pin on the real file in every job (`hash-guard=OK`).
+- **Lands in:** §0(b) (nightly real arm: in CI, pending three nightly receipts), §0(d) (receipt
+  discipline: sessions quote this workflow's receipts), §6 / §6.R (the three oracle rows gain a
+  Linux/CPU CI receipt; "cannot see": macOS/Metal, GPU layers, model identity with the Mac's file,
+  the untargeted real-arm suites), §7 (the SKIP-as-passed finding), §8 (test-receipt SKIP counting;
+  the dispatch oracle after merge; three nightly receipts, then retire the plist), §12.
+- **Receipts (verbatim, run 36076105524):**
+  ```
+  # oracles job 107887535516
+  hash-guard=OK (flipped pin refused as a mismatch on the real file; the verified file is intact)
+  scope=oracles receipt: arm=real exit=0 running=3 readable=3 mangled=0 passed=8 failed=0 ignored=0 ggml_assert=0 stub_msgs=0 wall=1m33s verdict=GREEN
+  scope=oracles receipt: verdict=GREEN (every arm GREEN; counts cross-checked: running == readable on each)
+  scope=oracles verdict=GREEN (receipt GREEN, skipped=0, stub_msgs=0)
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 28.97s
+  test the_shipped_binary_generates_the_pair_drivers_tokens_byte_for_byte ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.65s
+  test w1_killed_after_the_first_event_resumes_gapless_and_byte_identical ... ok
+  test w2_killed_mid_stream_resumes_gapless_and_byte_identical ... ok
+  test w3_intent_durable_commit_unsent_fences_forward_and_a_stale_epoch_is_refused ... ok
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.42s
+  test w1_final_stage_killed_after_the_first_event_is_replaced_under_empty_and_the_stream_resumes_byte_identical ... ok
+  test w1_first_stage_killed_after_the_first_event_is_replaced_and_the_stream_resumes_byte_identical ... ok
+  test w2_final_stage_killed_mid_stream_is_replaced_under_empty_and_the_stream_resumes_byte_identical ... ok
+  test w2_first_stage_killed_mid_stream_is_replaced_and_the_stream_resumes_byte_identical ... ok
+  [sl-final-w1] reached the continuation after 2 reconnect(s); finish=Some("stop")
+  [sl-w1] reached the continuation after 2 reconnect(s); finish=Some("stop")
+  [sl-final-w2] reached the continuation after 2 reconnect(s); finish=Some("stop")
+  [sl-w2] reached the continuation after 2 reconnect(s); finish=Some("stop")
+  test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.61s
+
+  # targeted job 107887535834
+  model: models/qwen2.5-0.5b-instruct-fp16.gguf already present (cache restore) — re-hashing, not trusting
+  observed-sha256=8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc bytes=1266425696
+  verdict=VERIFIED (sha256=8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc bytes=1266425696)
+  hash-guard=OK (flipped pin refused as a mismatch on the real file; the verified file is intact)
+  scope=targeted receipt: arm=real exit=0 running=13 readable=13 mangled=0 passed=52 failed=0 ignored=0 ggml_assert=0 stub_msgs=0 wall=0m54s verdict=GREEN
+  scope=targeted receipt: verdict=GREEN (every arm GREEN; counts cross-checked: running == readable on each)
+  scope=targeted verdict=GREEN (receipt GREEN, skipped=0, stub_msgs=0)
+      Finished `test` profile [unoptimized + debuginfo] target(s) in 33.23s
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s   (hydra-node binary_auth)
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s   (hydra-node binary_restart)
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s   (hydra-node token_file)
+  test result: ok. 4 passed; … finished in 0.00s · 6 passed · 5 passed · 9 passed · 11 passed      (hydra-state coordinator/ledger/recovery/stage/stage_case_a_guard)
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s   (hydra-state supersede)
+  test d1_recovery_three_kill_windows_are_byte_identical_to_an_uninterrupted_seeded_run ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.88s  (hydra-worker d1_recovery)
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s   (hydra-worker recovery)
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s   (hydra-worker survivor_reactivate)
+  test three_node_kill_middle_s2_rebuilds_from_upstream_durable_boundaries_byte_identical ... ok
+  test three_node_kill_middle_with_sampled_ahead_survivor_truncates_byte_identical ... ok
+  test three_node_kill_s_p_rebuilds_from_durable_boundaries_and_relinks_byte_identical ... ok
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.88s   (hydra-worker three_node_recovery)
+  ```
+  (Per-suite labels in parentheses are the session's reading of the `Running` order; the log lines
+  themselves are unlabelled. The four hydra-state lines on one row are condensed for width; each is
+  `ok … 0 failed; 0 ignored` in the log.) Sums: (a) 1+3+4 = 8; (b) 2+1+2+4+6+5+9+11+3+1+3+2+3 = 52,
+  equal to the receipts' `passed=`.
