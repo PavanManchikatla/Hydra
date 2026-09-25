@@ -223,6 +223,14 @@ jobs:
           if grep -qE '^test .* FAILED$' receipt/real.stdout 2>/dev/null; then grep -E '^test .* FAILED$' receipt/real.stdout >> summary.md; fi
           echo '```' >> summary.md
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          # The EVIDENCE behind the verdict, in the job log itself (a reader who cannot fetch the
+          # artifact — a cloud session behind an egress proxy, run 36074016299 — must still be able
+          # to see WHAT ran, not only the counts): cargo's compile line, every test line with each
+          # suite's wall time, and the oracles' own success statements.
+          echo "--- evidence (from receipt/real.stderr and receipt/real.stdout) ---"
+          grep -E '^\s+Finished ' receipt/real.stderr 2>/dev/null || true
+          grep -E '^test .* \.\.\. |^test result:|^running [0-9]+ tests?$|reached the continuation|\[oracle\] stream tail|SKIP:' receipt/real.stdout 2>/dev/null || true
+          echo "--- end evidence ---"
           exit $rc
 
       - name: Upload the logs (the receipt's raw source)

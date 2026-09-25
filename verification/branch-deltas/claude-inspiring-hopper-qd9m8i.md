@@ -85,3 +85,28 @@
   scope=oracles verdict=INCONCLUSIVE (the model was not VERIFIED — see the model verdict above; no test was run)
   scope=targeted verdict=INCONCLUSIVE (the model was not VERIFIED — see the model verdict above; no test was run)
   ```
+
+## 2026-09-25 — lane C: the second run's GREEN is not yet banked; the evidence goes into the job log
+
+- **Commits:** `56f1208` (previous entry); this commit
+- **What changed in reality:** Run [36074016299](https://github.com/PavanManchikatla/Hydra/actions/runs/36074016299)
+  (`pull_request`, head `56f1208`, merge `9f70b23`) printed a GREEN for the oracle scope. That
+  result is **held, not banked**, because its `wall=1m32s` would have to cover a cold compile plus 8
+  model-loading tests, including the four stage-loss windows that took `wall=7m11s` on the Mac. The
+  raw stdout exists only as a run artifact, and this container cannot download it (the blob host
+  gets proxy 403). Under rule 12 the classifier's GREEN gets no presumption until the evidence behind
+  it can be read. The classify step now copies cargo's `Finished` line, every `test … ...` line,
+  each suite's `finished in` time and the oracles' own success lines (`reached the continuation`,
+  `[oracle] stream tail`) into the job log.
+- **Lands in:** §0(b), §12.
+- **Receipts (verbatim, run 36074016299, oracles job):**
+  ```
+  observed-sha256=8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc bytes=1266425696
+  verdict=INCONCLUSIVE (model SHA-256 mismatch: expected 8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3f0, observed 8e0ae26000627ed62de0e78e41860af70094558b9d2913385c842a6aa06cf3fc — the file was deleted unused)
+  hash-guard=OK (flipped pin refused as a mismatch on the real file; the verified file is intact)
+  test-receipt: 2026-09-24T23:42:26Z · toolchain=rustc 1.98.1 (48a229cea 2026-09-01) (default) · cargo 1.98.1 (797e8a9bc 2026-08-05)
+  arm=real exit=0 running=3 readable=3 mangled=0 passed=8 failed=0 ignored=0 ggml_assert=0 stub_msgs=0 wall=1m32s verdict=GREEN
+  scope=oracles verdict=GREEN (receipt GREEN, skipped=0, stub_msgs=0)
+  ```
+  (The mismatch line above is the **live hash-guard check** on the real file, with a deliberately
+  flipped pin. The real verification in that job passed.)
